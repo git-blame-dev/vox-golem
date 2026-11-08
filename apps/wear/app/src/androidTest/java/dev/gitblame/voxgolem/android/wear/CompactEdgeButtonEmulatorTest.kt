@@ -83,47 +83,48 @@ class CompactEdgeButtonEmulatorTest {
         }
     }
 
-    @Test(timeout = 90_000) fun scaffoldReservesCompactHeightAndLongSyntheticTextStaysClearThenEdgeCollapsesAndReturns() {
+    @Test(timeout = 90_000) fun persistentTargetStaysReachableWithReadingClearanceAtBeginningMiddleAndEnd() {
         launch().use { scenario ->
             val rest = awaitRest(scenario, CompactFixtureAction.MIC)
-            assertFootprint(rest)
-            assertFalse("The long synthetic answer reaches its actual end", rest.canScrollForward)
-            assertTrue("Terminal text is measured, not a clipped/offscreen semantics assertion", rest.textBounds.height() > 0)
-            assertTrue("Text stays above the painted wrapper rather than its expanded accessible target",
-                rest.textBounds.bottom <= rest.edgeBounds.top + 1)
-            assertTrue("Scaffold reservation includes the measured compact footprint",
-                rest.bottomPaddingPx >= rest.edgeBounds.height() - 1)
-            assertTrue("Reservation must not silently retain the old 52dp footprint",
-                rest.bottomPaddingPx <= (41.6f + 3f) * density + 2)
+            assertFalse("Long synthetic answer reaches its actual end", rest.canScrollForward)
+            assertTrue("Terminal text has measured bounds", rest.textBounds.height() > 0)
+            assertTrue("Final text fits inside the reading viewport", rest.textBounds.bottom <= rest.viewportBounds.bottom + 1)
             assertTrue("Long content is actually scrollable", nodes().any { it.scrollable })
-
-            scenario.onActivity { it.readBeginning() }
-            await("Native scaffold collapses the edge when reading away from latest") {
+            listOf<(CompactEdgeButtonFixtureActivity) -> Unit>(
+                { it.readBeginning() }, { it.readMiddle() }, { it.readLatest() },
+            ).forEachIndexed { index, navigate ->
+                scenario.onActivity { navigate(it) }
+                await("Requested reading position settles") {
+                    val value = snapshot(scenario)
+                    !value.scrolling && when (index) {
+                        0 -> value.firstVisibleItem == 0
+                        1 -> value.firstVisibleItem == 16
+                        else -> !value.canScrollForward
+                    }
+                }
+                instrumentation.waitForIdleSync()
                 val value = snapshot(scenario)
-                value.canScrollForward && !value.scrolling && value.edgeBounds.height() <= 1
+                assertFootprint(value)
+                assertGlyphPaint(value)
+                assertEquals("Measured viewport excludes 48dp target, 6dp inset and 3dp gap", 57f * density,
+                    context.resources.displayMetrics.heightPixels - value.viewportBounds.bottom.toFloat(), 2f)
+                assertTrue("Reading viewport stays above measured action wrapper", value.viewportBounds.bottom <= value.edgeBounds.top - 3f * density + 2)
+                assertTrue("Persistent native action remains reachable while reading", clickAction(value.action.description))
+                await("Each reading position permits one callback") { snapshot(scenario).clicks == index + 1 }
             }
-            assertTrue("No floating glyph remains accessible while collapsed", nodes().none {
-                it.description == CompactEdgeButtonFixtureActivity.DECORATIVE_DESCRIPTION
-            })
-            val collapsedBitmap = requireNotNull(automation.takeScreenshot())
-            try {
-                assertFalse("Native compact container is no longer painted at its resting location",
-                    nearColor(collapsedBitmap.getPixel(rest.glyphBounds.centerX() + (12f * density).toInt(),
-                        rest.glyphBounds.centerY()), rest.expectedContainerColor))
-            } finally { collapsedBitmap.recycle() }
-            scenario.onActivity { it.readLatest() }
-            val returned = awaitRest(scenario, CompactFixtureAction.MIC)
-            assertFootprint(returned)
-            assertGlyphPaint(returned)
-            assertEquals("Scrolling itself never invokes the button", 0, returned.clicks)
         }
     }
 
     private fun assertFootprint(value: CompactEdgeFixtureSnapshot) {
-        assertEquals("Actual helper wrapper is 41.6dp, not graphics-only scaling", 41.6f * density,
+        assertEquals("Measured wrapper includes 48dp target plus 6dp bottom inset", 54f * density,
             value.edgeBounds.height().toFloat(), 1.5f)
+        val target = nodes().single { it.description == value.action.description }.bounds
+        assertEquals("Native semantic target is 48dp wide", 48f * density, target.width().toFloat(), 1.5f)
+        assertEquals("Native semantic target is 48dp high", 48f * density, target.height().toFloat(), 1.5f)
+        assertEquals("Native semantic target clears the bottom bezel by 6dp", 6f * density,
+            context.resources.displayMetrics.heightPixels - target.bottom.toFloat(), 2f)
         assertEquals("Actual glyph is 19.2dp", 19.2f * density, value.glyphBounds.height().toFloat(), 1.5f)
-        assertTrue("Compact adapter keeps the full-width scaffold constraint",
+        assertTrue("Persistent wrapper keeps the full-width constraint",
             value.edgeBounds.width() >= context.resources.displayMetrics.widthPixels - 2)
         assertEquals("Wrapper stays bottom-aligned", context.resources.displayMetrics.heightPixels.toFloat(),
             value.edgeBounds.bottom.toFloat(), 2f)
@@ -179,7 +180,7 @@ class CompactEdgeButtonEmulatorTest {
         await("Actual compact helper settles at latest with requested action and palette") {
             val value = snapshot(scenario)
             value.action == action && value.enabled && !value.canScrollForward && !value.scrolling &&
-                abs(value.edgeBounds.height() - 41.6f * density) <= 1.5f &&
+                abs(value.edgeBounds.height() - 54f * density) <= 1.5f &&
                 value.suppliedContentColor == value.expectedContentColor &&
                 nodes().any { it.description == action.description && it.enabled }
         }
@@ -187,12 +188,12 @@ class CompactEdgeButtonEmulatorTest {
         return snapshot(scenario)
     }
 
-    private data class Node(val description: String?, val clickable: Boolean, val enabled: Boolean, val scrollable: Boolean)
+    private data class Node(val description: String?, val clickable: Boolean, val enabled: Boolean, val scrollable: Boolean, val bounds: Rect)
 
     private fun nodes(): List<Node> {
         val result = mutableListOf<Node>()
         fun visit(node: AccessibilityNodeInfo) {
-            if (node.isVisibleToUser) result += Node(node.contentDescription?.toString(), node.isClickable, node.isEnabled, node.isScrollable)
+            if (node.isVisibleToUser) result += Node(node.contentDescription?.toString(), node.isClickable, node.isEnabled, node.isScrollable, Rect().also { node.getBoundsInScreen(it) })
             for (index in 0 until node.childCount) node.getChild(index)?.let {
                 try { visit(it) } finally { it.recycle() }
             }

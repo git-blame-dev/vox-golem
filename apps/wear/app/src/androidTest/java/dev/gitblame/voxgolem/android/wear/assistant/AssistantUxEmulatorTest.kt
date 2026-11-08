@@ -15,7 +15,6 @@ import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import dev.gitblame.voxgolem.android.wear.CompactEdgeButtonDefaults
 import dev.gitblame.voxgolem.assistant.recognition.DictationPhase
 import dev.gitblame.voxgolem.assistant.speech.LoopPhase
 import dev.gitblame.voxgolem.assistant.speech.SpeechPhase
@@ -97,7 +96,8 @@ class AssistantUxEmulatorTest {
             assertPolarControls(SEND)
             val primary = controlBounds(SEND)
             val viewport = visibleNodes().first { it.scrollable }.bounds
-            assertEquals("Scaffold padding belongs to list content, not a top-32dp clipped viewport", 0, viewport.top)
+            assertEquals("Measured reading viewport keeps the native 10% top inset",
+                geometry.heightPixels * .10f, viewport.top.toFloat(), 2f)
             assertDockClearance(primary)
             val prompt = visibleNodes().first { it.text == SETTINGS_DRAFT }.bounds
             assertTrue("Native wrapping can use the wider framework margins", prompt.width() >= geometry.widthPixels * .89f)
@@ -825,8 +825,7 @@ class AssistantUxEmulatorTest {
             awaitDescription(LATEST)
             assertTrue("Latest replaces idle Ask, not a second primary target", visibleNodes().none { it.description == MIC })
             assertLatestGeometry()
-            assertTrue("Floating Latest restores the primary dock area to the reading viewport",
-                readingViewport().bottom > initialViewport.bottom)
+            assertEquals("Latest preserves the same safe reading viewport", initialViewport.bottom, readingViewport().bottom)
             tap(LATEST)
             awaitText("Synthetic answer 16. This fixture has no provider or private history.")
             await("Latest action must restore follow-latest") { visibleNodes().none { it.description == LATEST } }
@@ -840,7 +839,7 @@ class AssistantUxEmulatorTest {
     @Test(timeout = 180_000) fun longAnswerBeginningMiddleAndEndUseTransparentLatestAndPrimaryClearance() =
         assertLongAnswerReading(fontScale = 1f)
 
-    @Test(timeout = 180_000) fun enlargedFontLongAnswerReadsBehindLatestAndEndsAbovePrimary() =
+    @Test(timeout = 180_000) fun enlargedFontLongAnswerStaysClearOfLatestAndPrimary() =
         assertLongAnswerReading(fontScale = 1.3f)
 
     @Test(timeout = 120_000) fun activeStopWinsWhileReadingOlderAndLatestReturnsAfterReplySettlement() {
@@ -868,8 +867,7 @@ class AssistantUxEmulatorTest {
             scenario.onActivity { it.completePlayback() }
             awaitDescription(LATEST)
             assertLatestGeometry()
-            assertTrue("Settled Latest removes Stop's viewport exclusion, not the reader's scroll state",
-                readingViewport().bottom > olderViewport.bottom)
+            assertEquals("Settled Latest preserves Stop's safe reading viewport", olderViewport.bottom, readingViewport().bottom)
             tap(LATEST)
             awaitDescription(MIC)
             assertPolarControls(MIC)
@@ -1055,10 +1053,11 @@ class AssistantUxEmulatorTest {
 
     private fun assertDockClearance(control: Rect) {
         val viewport = readingViewport()
-        assertEquals("Only the primary reserves its reachable action height plus the 3dp reading gap",
-            maxOf(48f, CompactEdgeButtonDefaults.Height.value) + 3f,
+        assertEquals("Reading viewport excludes the 48dp target, 6dp bezel inset and 3dp gap",
+            57f,
             (geometry.heightPixels - viewport.bottom) / geometry.density, 1f)
-        assertTrue("Text viewport never intersects the action's touch target", viewport.bottom < control.top)
+        assertTrue("Measured text viewport clears the actual touch target by 3dp",
+            viewport.bottom <= control.top - 3f * geometry.density + 2f)
     }
 
     private fun assertLatestGeometry() {
@@ -1073,9 +1072,7 @@ class AssistantUxEmulatorTest {
         assertEquals("Latest exposes the native Button role", "android.widget.Button",
             visibleNodes().single { it.description == LATEST }.className)
         assertTrue("Latest is a glyph rather than a padded text footer", visibleNodes().none { it.text == "Latest" })
-        assertEquals("Latest floats inside the full-height scrollable viewport; no black footer clips text",
-            geometry.heightPixels, readingViewport().bottom)
-        assertTrue("Text and Latest intentionally share the bottom reading region", Rect.intersects(readingViewport(), latest))
+        assertDockClearance(latest)
     }
 
     private fun assertStopGlyph() {
@@ -1155,7 +1152,7 @@ class AssistantUxEmulatorTest {
             assertTrue("Beginning of overflowing answer can be read", visible(0))
             awaitDescription(LATEST)
             assertLatestGeometry()
-            assertTextPaintsBehindLatest()
+            assertVisibleTextClearsLatest()
             val beginning = visibleAnswerCharacters().second
             val tops = beginning.map { it.bounds.top }.distinct().sorted()
             val expectedLineHeight = 16f * geometry.density * fontScale
@@ -1170,7 +1167,7 @@ class AssistantUxEmulatorTest {
             assertTrue("Middle of overflowing answer can be read", visible(middle))
             awaitDescription(LATEST)
             assertLatestGeometry()
-            assertTextPaintsBehindLatest()
+            assertVisibleTextClearsLatest()
             assertEquals("Text remains complete rather than shortened/ellipsized", answer, answerCharacterBoxes().first)
             tap(LATEST)
             awaitDescription(MIC)
@@ -1181,45 +1178,14 @@ class AssistantUxEmulatorTest {
         }
     }
 
-    private fun assertTextPaintsBehindLatest() {
+    private fun assertVisibleTextClearsLatest() {
         val latest = controlBounds(LATEST)
-        val icon = RectF(latest).apply { inset(12f * geometry.density, 12f * geometry.density) }
+        assertDockClearance(latest)
         val (text, characters) = visibleAnswerCharacters()
-        val behindTarget = characters.filter { text[it.index].isLetterOrDigit() &&
-            RectF.intersects(it.bounds, RectF(latest)) && !RectF.intersects(it.bounds, icon) }
-        assertTrue("Long text must continue into Latest's transparent touch region outside the arrow", behindTarget.isNotEmpty())
-        val bitmap = requireNotNull(automation.takeScreenshot())
-        try {
-            val radius = 23f * geometry.density
-            fun hasGlyphContrast(frame: android.graphics.Bitmap): Boolean = behindTarget.any { character ->
-                    val bounds = RectF(character.bounds).apply { intersect(RectF(latest)) }
-                    var ink = 0
-                    var background = 0
-                    for (y in bounds.top.toInt().coerceAtLeast(0) until bounds.bottom.toInt().coerceAtMost(frame.height)) {
-                        for (x in bounds.left.toInt().coerceAtLeast(0) until bounds.right.toInt().coerceAtMost(frame.width)) {
-                            val dx = x - latest.exactCenterX()
-                            val dy = y - latest.exactCenterY()
-                            if (dx * dx + dy * dy >= radius * radius) continue
-                            val pixel = frame.getPixel(x, y)
-                            if (Color.red(pixel) > 180 && Color.green(pixel) > 180 && Color.blue(pixel) > 180) ink++
-                            if (Color.red(pixel) < 100 && Color.green(pixel) < 100 && Color.blue(pixel) < 100) background++
-                        }
-                    }
-                    ink >= 2 && background >= 2
-                }
-            assertTrue("Glyphs need both light ink and dark inter-glyph background, not just an opaque white target",
-                hasGlyphContrast(bitmap))
-            // Negative control from the identical frame/geometry. Neither an opaque white nor a
-            // black container may pass an oracle intended to prove underlying text remains painted.
-            for (fill in listOf(Color.WHITE, Color.BLACK)) {
-                val opaque = bitmap.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
-                try {
-                    android.graphics.Canvas(opaque).drawCircle(latest.exactCenterX(), latest.exactCenterY(), radius + 1f,
-                        android.graphics.Paint().apply { color = fill })
-                    assertFalse("An opaque container must fail the text contrast oracle", hasGlyphContrast(opaque))
-                } finally { opaque.recycle() }
-            }
-        } finally { bitmap.recycle() }
+        val readable = characters.filter { text[it.index].isLetterOrDigit() }
+        assertTrue("Actual renderer exposes readable characters at this scroll position", readable.isNotEmpty())
+        assertTrue("Beginning and middle text stay above Latest's measured touch target",
+            readable.all { it.bounds.bottom <= latest.top - 3f * geometry.density + 2f })
     }
 
     private fun artworkMargins(): IntArray {
@@ -1308,7 +1274,7 @@ class AssistantUxEmulatorTest {
     private fun assertPolarControls(middle: String) {
         await("The persistent compact action must finish layout before measuring its geometry") {
             val primary = visibleNodes().firstOrNull { it.description == middle }?.let { it.clickableBounds ?: it.bounds }
-            primary != null && primary.height() / geometry.density >= CompactEdgeButtonDefaults.Height.value - 1f
+            primary != null && primary.height() / geometry.density >= 48f - 1f
         }
         val nodes = visibleNodes()
         val descriptions = nodes.mapNotNull { it.description }
@@ -1321,16 +1287,19 @@ class AssistantUxEmulatorTest {
         assertEquals("The primary has one semantic action target", 1, nodes.count { it.description == middle })
         assertEquals("The primary exposes the native Button role", "android.widget.Button",
             nodes.single { it.description == middle }.className)
-        assertTrue("The native edge action uses the screen width", primary.width() >= geometry.widthPixels - 2)
-        assertTrue("The compact visual shape retains a full 48dp semantic touch target within the screen",
-            primary.height() / geometry.density in 47f..49f)
+        assertEquals("Primary uses a native 48dp target width", 48f, primary.width() / geometry.density, 1f)
+        assertEquals("Primary uses a native 48dp target height", 48f, primary.height() / geometry.density, 1f)
         assertTrue("Target bounds stay on screen", Rect(0, 0, geometry.widthPixels, geometry.heightPixels).contains(primary))
         assertEquals("Target is centered horizontally", geometry.widthPixels / 2f, primary.exactCenterX(), 1f)
-        assertTrue("Primary stays bottom center", primary.centerY() > geometry.heightPixels * .75f)
-        assertTrue("The edge action's accessible bounds hug the bottom; painted shape is verified separately",
-            geometry.heightPixels - primary.bottom <= 4f * geometry.density)
-        // A full-width edge button has a curved painted shape, not an inscribed rectangular target.
-        // Offscreen paragraph semantics also cannot prove painted glyph readability at the bezel.
+        assertEquals("Primary keeps the 6dp bottom inset", 6f,
+            (geometry.heightPixels - primary.bottom) / geometry.density, 1f)
+        if (instrumentation.targetContext.resources.configuration.isScreenRound) {
+            val radius = minOf(geometry.widthPixels, geometry.heightPixels) / 2f
+            for (x in listOf(primary.left, primary.right)) for (y in listOf(primary.top, primary.bottom)) {
+                assertTrue("The entire touch target stays on the round face",
+                    kotlin.math.hypot(x - geometry.widthPixels / 2f, y - geometry.heightPixels / 2f) <= radius + 1f)
+            }
+        }
         val rowDescriptions = visibleNodes().filter {
             it.description != null && (it.clickableBounds ?: it.bounds).centerY() == primary.centerY()
         }.map { it.description }
@@ -1440,7 +1409,7 @@ class AssistantUxEmulatorTest {
         if (description && label in listOf(MIC, CONVERSATION_MIC, SEND, STOP)) {
             await("The compact primary must finish layout before a center tap") {
                 val node = visibleNodes().firstOrNull { it.description == label }
-                node != null && (node.clickableBounds ?: node.bounds).height() / geometry.density >= CompactEdgeButtonDefaults.Height.value - 1f
+                node != null && (node.clickableBounds ?: node.bounds).height() / geometry.density >= 48f - 1f
             }
         }
         val bounds = controlBounds(label, description)

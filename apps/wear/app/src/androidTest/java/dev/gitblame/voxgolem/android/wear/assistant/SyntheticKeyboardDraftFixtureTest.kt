@@ -258,7 +258,6 @@ class SyntheticKeyboardDraftFixtureTest {
         val geometry = target.resources.displayMetrics
         val configuration = target.resources.configuration
         var micEnabled = false
-        var isolatedGlyphs = 0
         AssistantStore(target).use { store ->
             val before = store.snapshot()
             val oldRecords = recordKeys(before.getJSONArray("records"))
@@ -291,7 +290,7 @@ class SyntheticKeyboardDraftFixtureTest {
                                  (it.contentDescription?.toString() in listOf("New chat", "Chats", "Keyboard: edit draft", "Settings") ||
                                      it.text?.toString() in listOf("New chat", "Chats", "Keyboard")) }
                      }
-                     isolatedGlyphs = assertPolarBounds("Send draft", geometry.widthPixels, geometry.heightPixels, configuration.isScreenRound)
+                     assertPolarBounds("Send draft", geometry.widthPixels, geometry.heightPixels, configuration.isScreenRound)
                     saveScreenshot(File(screenshotDirectory, "$fixtureName-main.png"))
                      openSettings()
                     val settingsBefore = inspectSettings()
@@ -350,7 +349,7 @@ class SyntheticKeyboardDraftFixtureTest {
         instrumentation.sendStatus(0, Bundle().apply {
             putString("stream", "\n$title | PASS draft=preserved model=recreated-and-restored native-back=main mic-enabled=$micEnabled " +
                 "round=${configuration.isScreenRound} font-scale=${configuration.fontScale} density=${geometry.density} " +
-                "isolated-24dp-glyphs=$isolatedGlyphs native-edge-shape=not-proven-by-accessibility screenshots=$screenshotDirectory/$fixtureName-{main,settings,recreated}.png\n")
+                "persistent-48dp-target=verified native-paint=requires-screenshot screenshots=$screenshotDirectory/$fixtureName-{main,settings,recreated}.png\n")
         })
     }
 
@@ -370,46 +369,34 @@ class SyntheticKeyboardDraftFixtureTest {
         return target
     }
 
-    private fun assertPolarBounds(middle: String, width: Int, height: Int, round: Boolean): Int {
+    private fun assertPolarBounds(middle: String, width: Int, height: Int, round: Boolean) {
         val density = InstrumentationRegistry.getInstrumentation().targetContext.resources.displayMetrics.density
-        var isolatedGlyphs = 0
-        await("The native edge action must expand at latest before its geometry is inspected") {
+        await("Persistent action finishes layout before measuring its geometry") {
             currentNodes().firstOrNull { it.isVisibleToUser && it.contentDescription?.toString() == middle }?.let { node ->
                 val bounds = Rect().also { clickableNode(node).getBoundsInScreen(it) }
-                bounds.height() / density >= 45f
+                bounds.height() / density >= 47f
             } == true
         }
-        assertTrue("New chat belongs only in Settings", currentNodes().none { it.isVisibleToUser &&
-            (it.contentDescription?.toString() == "New chat" || it.text?.toString() == "New chat") })
-        val bounds = listOf(middle).map { description ->
-            val node = currentNodes().first { it.isVisibleToUser && it.contentDescription?.toString() == description }
-            val target = clickableNode(node)
-            if (node != target) {
-                val glyph = Rect().also { node.getBoundsInScreen(it) }
-                assertEquals("An independently exposed ExtraSmall edge glyph uses the recommended 24dp", 24f, glyph.width() / density, 1f / density)
-                assertEquals("An independently exposed ExtraSmall edge glyph uses the recommended 24dp", 24f, glyph.height() / density, 1f / density)
-                if (round) {
-                    val radius = minOf(width, height) / 2f
-                    for (x in listOf(glyph.left, glyph.right)) for (y in listOf(glyph.top, glyph.bottom)) {
-                        assertTrue("The visible icon, not the curved button's full-width bounding box, stays on the face",
-                            kotlin.math.hypot(x - width / 2f, y - height / 2f) <= radius + 1f)
-                    }
-                }
-                isolatedGlyphs++
-            }
-            Rect().also { target.getBoundsInScreen(it) }.also { rect ->
-                assertTrue("The edge action exposes positive on-screen bounds", !rect.isEmpty && Rect(0, 0, width, height).contains(rect))
-                assertTrue("The native edge action uses the screen width", rect.width() >= width - 2)
-                assertTrue("ExtraSmall exposes its 46dp surface / 52dp padded size with framework touch-target expansion",
-                    rect.height() / density in 45f..53f)
-                assertEquals("The primary edge action is centered", width / 2f, rect.exactCenterX(), 1f)
-                assertTrue("The edge action's accessible bounds hug the bottom; painted shape needs separate acceptance",
-                    height - rect.bottom <= 4f * density)
+        val nodes = currentNodes().filter { it.isVisibleToUser }
+        assertTrue("New chat belongs only in Settings", nodes.none {
+            it.contentDescription?.toString() == "New chat" || it.text?.toString() == "New chat" })
+        val actions = nodes.filter { it.contentDescription?.toString() == middle }
+        assertEquals("Primary exposes one semantic action", 1, actions.size)
+        val target = clickableNode(actions.single())
+        assertEquals("Primary exposes the native Button role", "android.widget.Button", target.className.toString())
+        val bounds = Rect().also { target.getBoundsInScreen(it) }
+        assertTrue("Primary remains entirely on screen", Rect(0, 0, width, height).contains(bounds))
+        assertEquals("Primary uses a 48dp target width", 48f, bounds.width() / density, 1f)
+        assertEquals("Primary uses a 48dp target height", 48f, bounds.height() / density, 1f)
+        assertEquals("Primary is centered horizontally", width / 2f, bounds.exactCenterX(), 1f)
+        assertEquals("Primary keeps the 6dp bottom inset", 6f, (height - bounds.bottom) / density, 1f)
+        if (round) {
+            val radius = minOf(width, height) / 2f
+            for (x in listOf(bounds.left, bounds.right)) for (y in listOf(bounds.top, bounds.bottom)) {
+                assertTrue("Entire touch target fits the round face",
+                    kotlin.math.hypot(x - width / 2f, y - height / 2f) <= radius + 1f)
             }
         }
-        assertEquals("Only the primary edge action remains", 1, bounds.distinct().size)
-        assertTrue("Primary stays below chat", bounds.single().exactCenterY() > height * .75f)
-        return isolatedGlyphs
     }
 
     private fun inspectSettings(): Pair<Set<String>, Boolean?> {

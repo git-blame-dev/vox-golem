@@ -21,7 +21,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
 import androidx.wear.compose.material3.Icon
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.ScreenScaffold
@@ -60,7 +59,7 @@ internal fun CaptureInputScreen(transcript: String, stopEnabled: Boolean, onStop
             // while a paragraph taller than the watch is being read at any scroll offset.
             LazyColumn(
                 modifier = Modifier.fillMaxSize()
-                    .padding(bottom = maxOf(48.dp, CompactEdgeButtonDefaults.Height) + 3.dp)
+                    .padding(bottom = CompactEdgeButtonDefaults.ViewportExclusion)
                     .clipToBounds().listRotary(scroll),
                 state = scroll,
                 contentPadding = contentPadding,
@@ -80,7 +79,7 @@ internal fun CaptureInputScreen(transcript: String, stopEnabled: Boolean, onStop
                 }
             }
             Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth()
-                .height(maxOf(48.dp, CompactEdgeButtonDefaults.Height)), contentAlignment = Alignment.BottomCenter) {
+                .height(CompactEdgeButtonDefaults.OccupiedHeight), contentAlignment = Alignment.BottomCenter) {
                 CompactEdgeButton(onClick = onStop, enabled = stopEnabled, contentDescription = "Stop recording") {
                     Icon(
                         painter = painterResource(R.drawable.ic_stop),

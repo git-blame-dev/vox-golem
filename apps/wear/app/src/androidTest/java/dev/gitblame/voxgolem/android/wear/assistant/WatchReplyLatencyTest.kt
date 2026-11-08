@@ -1,6 +1,7 @@
 package dev.gitblame.voxgolem.android.wear.assistant
 
 import android.content.Intent
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -48,7 +49,7 @@ class WatchReplyLatencyTest {
         assumeTrue("Audio resource must be unowned", RecognitionResourceLease.process.current() == null)
         assumeTrue("Saved provider access is not ready", initial.credential?.reason == ProviderAuthReason.READY)
         assumeTrue("Saved model must be a supported alias", initial.model in AssistantModels.aliases)
-        val savedVoicePreferences = WearVoiceSettings(context).current()
+        val savedVoicePreferences = readVoicePreferences(context)
 
         val launch = Intent(context, AssistantActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         // Closing the production Activity backgrounds/cancels its owners, without deleting history.
@@ -182,7 +183,7 @@ class WatchReplyLatencyTest {
                 }
                 assertTrue("No later admission or metric replacement is allowed", !duplicate.get() && !invalidMetric.get())
                 assertTrue("The test must preserve saved voice preferences",
-                    WearVoiceSettings(context).current() == savedVoicePreferences)
+                    readVoicePreferences(context) == savedVoicePreferences)
                 instrumentation.sendStatus(0, Bundle().apply {
                     // Model is a checked allowlisted alias; never emit content, IDs or auth metadata.
                     putString("stream", "\nmodel=${initial.model} firstTextMs=$measured\n")
@@ -190,6 +191,11 @@ class WatchReplyLatencyTest {
             }
         }
     }
+
+    private fun readVoicePreferences(context: Context): WearVoicePreferences =
+        WearVoiceSettingsIo.executor.submit<WearVoicePreferences> {
+            WearVoiceSettings.production(context).read()
+        }.get(5, TimeUnit.SECONDS)
 
     private data class Admission(val token: String, val provider: String)
 

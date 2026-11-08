@@ -4,7 +4,6 @@ import android.app.Activity
 import android.app.RemoteInput
 import android.content.Intent
 import android.content.res.ColorStateList
-import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
 import android.view.Gravity
@@ -15,6 +14,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import dev.gitblame.voxgolem.assistant.AssistantDraftBudget
+import dev.gitblame.voxgolem.android.wear.WearAppColors
 
 internal object AssistantTextInput {
     const val KEY = "assistant-draft"
@@ -41,7 +41,7 @@ class AssistantTextEntryActivity : Activity() {
     private var keyboardRequested = false
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
+        window.setBackgroundDrawable(ColorDrawable(WearAppColors.background))
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE or WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         val round = resources.configuration.isScreenRound
         fun pixels(dp: Int) = (dp * resources.displayMetrics.density).toInt()
@@ -55,10 +55,10 @@ class AssistantTextEntryActivity : Activity() {
             inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
             imeOptions = EditorInfo.IME_ACTION_DONE or EditorInfo.IME_FLAG_NO_EXTRACT_UI
             gravity = Gravity.TOP or Gravity.START
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.LTGRAY)
+            setTextColor(WearAppColors.onBackground)
+            setHintTextColor(WearAppColors.onSurfaceVariant)
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 16f)
-            backgroundTintList = ColorStateList.valueOf(Color.WHITE)
+            backgroundTintList = ColorStateList.valueOf(WearAppColors.primary)
             setSelection(text.length)
             setOnEditorActionListener { _, action, _ ->
                 if (action == EditorInfo.IME_ACTION_DONE) { confirmDraft(); true } else false
@@ -69,13 +69,13 @@ class AssistantTextEntryActivity : Activity() {
             text = "Use text"
             isAllCaps = false
             minHeight = pixels(48)
-            setTextColor(Color.BLACK)
-            backgroundTintList = ColorStateList.valueOf(Color.WHITE)
+            setTextColor(WearAppColors.onPrimary)
+            backgroundTintList = ColorStateList.valueOf(WearAppColors.primary)
             setOnClickListener { confirmDraft() }
         }
         setContentView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.BLACK)
+            setBackgroundColor(WearAppColors.background)
             setPadding(horizontal, top, horizontal, bottom)
             setOnApplyWindowInsetsListener { view, insets ->
                 view.setPadding(horizontal, top, horizontal, if (insets.isVisible(WindowInsets.Type.ime())) pixels(8) else bottom)
