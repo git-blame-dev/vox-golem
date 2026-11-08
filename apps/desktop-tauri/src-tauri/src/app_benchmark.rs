@@ -34,7 +34,7 @@ fn resolve_live_auth_source(
         .canonicalize()
         .map_err(|_| "Live auth source unavailable")?;
     if !source.is_absolute()
-        || source != resolved
+        || !canonical_reference_matches(source, &resolved)
         || !source.is_file()
         || resolved.starts_with(root)
     {
@@ -46,6 +46,23 @@ fn resolve_live_auth_source(
         return Err("Live managed auth must be a canonical regular file".into());
     }
     Ok(Some(auth))
+}
+
+fn canonical_reference_matches(source: &Path, resolved: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        // Rust canonicalize adds the extended-length prefix; Python's canonical
+        // absolute reference normally omits it. No other alias is accepted.
+        let strip = |path: &Path| {
+            path.to_str()
+                .map(|s| s.strip_prefix(r"\\?\").unwrap_or(s).to_owned())
+        };
+        strip(source).is_some() && strip(source) == strip(resolved)
+    }
+    #[cfg(not(windows))]
+    {
+        source == resolved
+    }
 }
 use voxgolem_platform::search::RunEvent;
 
@@ -272,6 +289,8 @@ fn parse_entry(entry: Option<&str>, automatic: bool) -> Result<&'static str, Str
     match (entry.unwrap_or("voice"), automatic) {
         ("voice", _) => Ok("voice"),
         ("typed-speech-windows", false) => Ok("typed-speech-windows"),
+        ("typed-speech-qualified-windows", false) => Ok("typed-speech-qualified-windows"),
+        ("typed-qualified-windows", false) => Ok("typed-qualified-windows"),
         ("typed", false) => Ok("typed"),
         ("typed", true) => Err("Typed entry cannot queue automatic capture diagnostics".into()),
         _ => Err("Benchmark entry must be voice or typed".into()),
@@ -363,7 +382,20 @@ fn validate_environment_inner() -> Result<(), String> {
         std::env::var_os("VOXGOLEM_BENCH_AUTO_DIAGNOSTIC_CASE").is_some(),
     )?;
     let _ = ENTRY.set(entry);
-    if cfg!(target_os = "windows") && entry != "typed-speech-windows" {
+    let qualified_windows = matches!(
+        entry,
+        "typed-qualified-windows" | "typed-speech-qualified-windows"
+    );
+    if qualified_windows
+        && (!cfg!(target_os = "windows")
+            || std::env::var("VOXGOLEM_BENCH_WINDOWS_PROFILE").as_deref()
+                != Ok("live-qualified-v1")
+            || (entry == "typed-qualified-windows"
+                && std::env::var("VOXGOLEM_BENCH_MODE").as_deref() != Ok("offline")))
+    {
+        return Err("Explicit native Windows qualification profile required".into());
+    }
+    if cfg!(target_os = "windows") && entry != "typed-speech-windows" && !qualified_windows {
         return Err(
             "Windows benchmark supports only the offline Neural typed-speech diagnostic".into(),
         );
@@ -380,10 +412,10 @@ fn validate_environment_inner() -> Result<(), String> {
         return Err("Benchmark mode must be explicit".into());
     }
     let root = root()?;
-    if entry == "typed-speech-windows" {
+    if entry == "typed-speech-windows" || qualified_windows {
         validate_windows_storage(&root)?;
     }
-    if entry == "typed-speech-windows" {
+    if entry == "typed-speech-windows" || entry == "typed-speech-qualified-windows" {
         let config = voxgolem_core::config::load_runtime_config(None)
             .map_err(|_| "Typed speech configuration unavailable")?;
         if !config.local_tts.enabled
@@ -476,8 +508,15 @@ fn root() -> Result<PathBuf, String> {
 }
 
 fn validate_windows_storage(root: &Path) -> Result<(), String> {
+    let qualified =
+        std::env::var("VOXGOLEM_BENCH_WINDOWS_PROFILE").as_deref() == Ok("live-qualified-v1");
     if !cfg!(target_os = "windows")
-        || std::env::var("VOXGOLEM_BENCH_OUTPUT_ROUTE").as_deref() != Ok("wasapi-render-diagnostic")
+        || std::env::var("VOXGOLEM_BENCH_OUTPUT_ROUTE").as_deref()
+            != Ok(if qualified {
+                "wasapi-render-qualified"
+            } else {
+                "wasapi-render-diagnostic"
+            })
     {
         return Err("Windows typed speech is diagnostic-only native render output".into());
     }
@@ -1124,6 +1163,18 @@ shutil.copytree(run/'config',root/'VoxGolem')
                 Some("typed-speech-windows"),
             ),
             (Some("typed-speech-windows"), true, None),
+            (
+                Some("typed-qualified-windows"),
+                false,
+                Some("typed-qualified-windows"),
+            ),
+            (Some("typed-qualified-windows"), true, None),
+            (
+                Some("typed-speech-qualified-windows"),
+                false,
+                Some("typed-speech-qualified-windows"),
+            ),
+            (Some("typed-speech-qualified-windows"), true, None),
             (Some("typed"), false, Some("typed")),
             (Some("typed"), true, None),
             (Some(""), false, None),
@@ -1265,6 +1316,24 @@ shutil.copytree(run/'config',root/'VoxGolem')
 #[cfg(test)]
 mod canonical_auth_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_canonical_reference_accepts_only_the_verbatim_prefix_difference() {
+        let canonical = Path::new(r"\\?\C:\synthetic\config.toml");
+        assert!(canonical_reference_matches(
+            Path::new(r"C:\synthetic\config.toml"),
+            canonical
+        ));
+        assert!(canonical_reference_matches(canonical, canonical));
+        for alias in [
+            r"C:\synthetic\..\synthetic\config.toml",
+            r"C:\other\config.toml",
+            r"config.toml",
+        ] {
+            assert!(!canonical_reference_matches(Path::new(alias), canonical));
+        }
+    }
 
     #[test]
     fn source_selection_is_explicit_canonical_and_live_only() {

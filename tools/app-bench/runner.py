@@ -93,7 +93,7 @@ def prune_owned_reports(parent, now=None, max_bytes=8*1024*1024, max_files=128):
             count -= 1
 
 
-def reserve_live_budget(ledger, reservation):
+def reserve_live_budget(ledger, reservation, assignment=None):
     """Reservations survive disposable runs; uncertainty never refunds calls."""
     if fcntl is None:
         raise ValueError('Live ledger is supported only by the qualified Unix path')
@@ -106,7 +106,7 @@ def reserve_live_budget(ledger, reservation):
         raise ValueError('Budget ledger requires an existing durable parent')
     descriptor = os.open(ledger, os.O_RDWR | os.O_CREAT, 0o600)
     with os.fdopen(descriptor, 'r+') as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
+        fcntl.flock(stream, fcntl.LOCK_EX | (fcntl.LOCK_NB if assignment is not None else 0))
         stream.seek(0)
         text = stream.read(8193)
         value = json.loads(text) if text else {'schema': 1, 'reserved': 0}
@@ -114,6 +114,17 @@ def reserve_live_budget(ledger, reservation):
                 type(value.get('reserved')) is not int or
                 not 0 <= value['reserved'] <= MAX_ASSIGNMENT_CALLS - LIVE_BATCH_ALLOWANCE):
             raise ValueError('Budget ledger invalid or allowance exhausted')
+        permit = {'schema': 1, 'allowance': LIVE_BATCH_ALLOWANCE}
+        if assignment is not None:
+            from windows_assignment import digest
+            grant, binding = assignment
+            if not re.fullmatch('[0-9a-f]{32}', grant):
+                raise ValueError('Windows assignment ID invalid')
+            permit = dict(schema=2, allowance=LIVE_BATCH_ALLOWANCE, **binding)
+            assignments = value.setdefault('windows_assignments', {})
+            if not isinstance(assignments, dict) or grant in assignments:
+                raise ValueError('Windows assignment cannot be replaced')
+            assignments[grant] = digest(permit)
         # Persist the debit first. A failed subsequent reservation burns it.
         value['reserved'] += LIVE_BATCH_ALLOWANCE
         stream.seek(0)
@@ -127,7 +138,7 @@ def reserve_live_budget(ledger, reservation):
             os.fsync(directory)
         finally:
             os.close(directory)
-        private_json(reservation, {'schema': 1, 'allowance': LIVE_BATCH_ALLOWANCE})
+        private_json(reservation, permit)
     return value['reserved']
 
 
@@ -155,6 +166,17 @@ def harness_identity():
     for name in ['runner.py', 'fixtures.py', 'paths.py']:
         digest.update(name.encode())
         digest.update(Path(__file__).with_name(name).read_bytes())
+    return digest.hexdigest()
+
+
+def windows_harness_identity():
+    digest = hashlib.sha256(harness_identity().encode())
+    for name in ('windows_effects.py', 'windows_assignment.py', 'windows_qualification.py'):
+        digest.update(name.encode())
+        digest.update(Path(__file__).with_name(name).read_bytes())
+    profile = arithmetic_profile()
+    digest.update(profile.contract_sha256.encode())
+    digest.update(profile.implementation_sha256.encode())
     return digest.hexdigest()
 
 
@@ -258,16 +280,21 @@ def live_auth_source_config(run, source_config):
 
 
 def isolated_environment(run, source_config, endpoint, live=False, reservation=None, entry='voice',
-                         output_route='windows-diagnostic', base_environment=None):
-    if entry == 'typed-speech' and (live or reservation is not None):
+                         output_route='windows-diagnostic', base_environment=None, auth_source_config=None,
+                         windows_qualified=False):
+    if entry == 'typed-speech' and (live or reservation is not None) and not windows_qualified:
         raise ValueError('Typed speech is offline with no live reservation')
+    if windows_qualified and live and (entry != 'typed-speech' or reservation is None or auth_source_config is None):
+        raise ValueError('Qualified live speech requires a handoff and separate canonical auth reference')
     if entry not in ('voice', 'typed', 'typed-control', 'typed-speech'):
         raise ValueError('Desktop synthetic-voice arithmetic profile retired; use Neural typed-speech Windows diagnostics')
     env = (os.environ if base_environment is None else base_environment).copy()
     if not live and 'VOXGOLEM_BENCH_AUTH_SOURCE_CONFIG' in env:
         raise ValueError('Offline mode forbids an auth source override')
+    if auth_source_config is not None and (not live or not windows_qualified):
+        raise ValueError('Separate canonical auth reference is qualified-live only')
     if live:
-        source_config = live_auth_source_config(run, source_config)
+        auth_source_config = live_auth_source_config(run, auth_source_config or source_config)
     original = tomllib.loads(source_config.read_text())
     if not env.get('XAUTHORITY') and (Path(env.get('HOME', ''))/'.Xauthority').is_file():
         env['XAUTHORITY'] = str(Path(env['HOME'])/'.Xauthority')
@@ -300,7 +327,7 @@ def isolated_environment(run, source_config, endpoint, live=False, reservation=N
     typed_speech = entry == 'typed-speech'
     config += [f'web_enabled = {str(not typed_speech).lower()}', 'response_backend = "opencode"', '[custom_openai]']
     if live:
-        env['VOXGOLEM_BENCH_AUTH_SOURCE_CONFIG'] = str(source_config)
+        env['VOXGOLEM_BENCH_AUTH_SOURCE_CONFIG'] = str(auth_source_config)
         config += [f'endpoint = {json.dumps(MANAGED_ENDPOINT)}']
     else:
         credential = managed_credential(run/'config')
@@ -524,13 +551,14 @@ def answer_integrity(case, canonical, rendered, urls, offline, canonical_sources
     expected_urls = [] if profile or case == 'quick' else URLS
     sources_preserved = len(urls) == len(saved) and set(urls) == set(saved)
     if not profile and case != 'quick': sources_preserved &= bool(urls)
-    if offline: sources_preserved &= set(urls) == set(expected_urls)
+    if offline or profile: sources_preserved &= set(urls) == set(expected_urls)
     return {'canonical_ui_match': bool(canonical.strip()) and (
                 canonical.strip() == rendered.strip() or plain_canonical.strip() == rendered.strip()),
-            'canonical_sources_expected': set(saved) == set(expected_urls) if offline else (case == 'quick' or bool(saved)),
+            'canonical_sources_expected': set(saved) == set(expected_urls) if offline or profile else (case == 'quick' or bool(saved)),
             'sources_preserved': sources_preserved,
             'canonical_source_count': len(saved), 'ui_source_count': len(urls),
             'expected_source_count': len(expected_urls) if offline else None,
+            'profile_answer_exact': profile is not None and canonical.strip() == profile.answer,
             'offline_fixture_match': offline and plain_canonical == (profile.answer if profile else expected_answer(case)) and
                 has_canonical_sources == bool(expected_urls)}
 
@@ -625,6 +653,8 @@ def typed_checks(case, integrity, native, service, added_once, observed, profile
               'tool_reads_completed': profile is not None or case == 'quick' or (native['readable_pages'] >= 1 and native['tool_failures'] == 0),
               'inflight_stream_presented': observed['inflight_text'],
               'ui_sources_preserved': integrity['sources_preserved']}
+    if profile:
+        checks['profile_answer_exact'] = integrity['profile_answer_exact']
     if service is not None:
         checks['fixture_answer_exact'] = integrity['offline_fixture_match']
         checks['request_contract_and_history'] = service['model_matches'] and service['transcript_matches'] and service['history_matches']
@@ -797,7 +827,7 @@ def finding_dispositions(rows, relaunch, safety):
     return sorted(deferred), sorted(failures)
 
 
-def start_typed_app(args, env):
+def start_typed_app(args, env, platform=None):
     global PHASE, APP_PID
     from selenium import webdriver
     from selenium.webdriver.common.options import BaseOptions
@@ -808,7 +838,7 @@ def start_typed_app(args, env):
     APP_PID = None
     port, native_port = free_port(), free_port()
     PHASE = 'webdriver_starting'
-    process = subprocess.Popen([str(args.tools/'bin/tauri-driver'), '--port', str(port),
+    process = platform.start(env, port, native_port) if platform else subprocess.Popen([str(args.tools/'bin/tauri-driver'), '--port', str(port),
         '--native-port', str(native_port), '--native-driver',
         str(args.tools/'webkit/extracted/usr/bin/WebKitWebDriver')], env=env,
         start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -816,31 +846,50 @@ def start_typed_app(args, env):
     try:
         wait_for(lambda: can_connect(port), 15, 'webdriver_startup')
         options = Options()
-        options.set_capability('tauri:options', {'application': str(args.binary.resolve())})
+        options.set_capability('tauri:options', platform.application_options() if platform else {'application': str(args.binary.resolve())})
         PHASE = 'typed_app_launch'
         started = time.perf_counter()
         driver = webdriver.Remote(command_executor=f'http://127.0.0.1:{port}', options=options)
         driver.set_script_timeout(30)
         def ready():
             native = invoke(driver, 'benchmark_snapshot')
-            return (native['entry'] == 'typed' and not native['capture_active'] and
+            return (native['entry'] == ('typed-qualified-windows' if platform else 'typed') and not native['capture_active'] and
                     native['phase'] == 'sleeping' and
                     driver.execute_script('return document.getElementById("composerInstantSelect")?.value') == 'custom-luna-none')
         wait_for(ready, 30, 'typed_model_ready_without_capture')
+        if platform: platform.observe_app(APP_PID)
         snapshot = invoke(driver, 'get_app_snapshot')
         if snapshot['preferences'].get('web_enabled') is not True:
             raise RuntimeError('Web permission does not match the typed workflow')
         return driver, process, (time.perf_counter()-started)*1000
     except Exception as error:
-        print(json.dumps({'stage': PHASE, 'failure_category': type(error).__name__,
-                          'driver_exit_code': process.poll(), 'app_pid_observed': APP_PID is not None}))
-        shutdown_owned(driver, process)
+        exit_code, status_observed, cleanup_failed = None, False, False
+        try:
+            if platform is None:
+                exit_code, status_observed = process.poll(), True
+        except Exception:
+            pass
+        finally:
+            try:
+                platform.shutdown(driver, process) if platform else shutdown_owned(driver, process)
+            except Exception:
+                cleanup_failed = True
+        try:
+            print(json.dumps({'stage': PHASE, 'failure_category': type(error).__name__,
+                'driver_exit_code': exit_code, 'driver_status_observed': status_observed,
+                'app_pid_observed': APP_PID is not None, 'startup_cleanup_failed': cleanup_failed}))
+        except Exception:
+            pass
         raise
 
 
-def execute_typed(args):
+def execute_typed(args, platform=None):
     global PHASE
     run = args.output.resolve()
+    effects_api = SimpleNamespace(**globals())
+    if platform:
+        platform.prepare(arithmetic_profile(), effects_api)
+    stop = platform.shutdown if platform else shutdown_owned
     service = FakeServices(gated_stream=True) if not args.live else None
     if service: service.__enter__()
     driver = process = None
@@ -853,10 +902,10 @@ def execute_typed(args):
             reserved = reserve_live_budget(args.ledger, reservation)
         else:
             reserved = 0
-        env = isolated_environment(run, args.config if args.live else args.config.resolve(), service.generation_endpoint if service else None,
+        env = platform.environment(service.generation_endpoint, effects_api) if platform else isolated_environment(run, args.config if args.live else args.config.resolve(), service.generation_endpoint if service else None,
                                     args.live, reservation, entry='typed')
         if service: env['VOXGOLEM_BENCH_MCP_ENDPOINT'] = service.mcp_endpoint
-        driver, process, launch_ms = start_typed_app(args, env)
+        driver, process, launch_ms = (start_typed_app(args, env, platform) if platform else start_typed_app(args, env))
         for case in args.cases:
             PHASE = 'typed_workflow'
             result = exercise_typed(driver, case, service, args.flow_timeout)
@@ -885,11 +934,11 @@ def execute_typed(args):
             safety['cancellation_retirement'] = typed_cancellation(driver, service)
             previous = invoke(driver, 'get_app_snapshot')
             previous_requests = service.snapshot()['generation_requests']
-            prior_exit = shutdown_owned(driver, process)
+            prior_exit = stop(driver, process)
             driver = process = None
             if not prior_exit['app_exit_before_group_termination_observed']:
                 raise RuntimeError('Pre-relaunch application did not exit')
-            driver, process, relaunch_ms = start_typed_app(args, env)
+            driver, process, relaunch_ms = (start_typed_app(args, env, platform) if platform else start_typed_app(args, env))
             restored = invoke(driver, 'get_app_snapshot')
             safety['relaunch_preferences'] = previous['preferences'] == restored['preferences']
             safety['relaunch_without_generation'] = (service.snapshot()['generation_requests'] == previous_requests and
@@ -900,7 +949,7 @@ def execute_typed(args):
                 'preferences_retained': safety['relaunch_preferences'],
                 'no_new_generation': safety['relaunch_without_generation']}
         safety['passed'] = workflow_safety_passed(safety)
-        cleanup = shutdown_owned(driver, process)
+        cleanup = stop(driver, process)
         driver = process = None
         summary = {'schema': 2, 'mode': 'live' if args.live else 'offline', 'entry': 'typed',
             'coverage': 'typed-workflow', 'voice_tested': False, 'speech_assets_loaded': False,
@@ -919,13 +968,16 @@ def execute_typed(args):
         summary['qualified_for_live'] = (not args.live and completed and len(rows) == len(CASES) and
             all(row['qualification_eligible'] for row in rows) and safety['passed'])
         summary['deferred_findings'], summary['failed_checks'] = finding_dispositions(rows+supporting, relaunch, safety)
+        if platform:
+            platform.annotate_qualified(summary, effects_api)
+            completed = summary['workflow_completed']
         private_json(run/'report.json', summary)
         prune_owned_reports(run.parent)
         print(json.dumps({'workflow_completed': completed, 'qualified_for_live': summary['qualified_for_live'],
             'coverage': 'typed-workflow', 'completed_cases': len(rows), 'deferred_findings': summary['deferred_findings']}))
         return 0 if completed else 1
     finally:
-        if driver or process: shutdown_owned(driver, process)
+        if driver or process: stop(driver, process)
         if service: service.__exit__(None, None, None)
 
 
@@ -1155,7 +1207,7 @@ def execute(args, platform=None):
         spec.loader.exec_module(module)
         return module.execute_inside(args, SimpleNamespace(**globals()))
     if args.entry == 'typed':
-        return execute_typed(args)
+        return execute_typed(args, platform) if platform else execute_typed(args)
     from selenium import webdriver
     from selenium.webdriver.common.options import BaseOptions
 
@@ -1188,12 +1240,12 @@ def execute(args, platform=None):
     rows = []
     try:
         reservation = run / 'reservation.json' if args.live else None
-        if args.live:
+        if args.live and not platform:
             validate_offline_evidence(args.offline_evidence, args.binary, fixtures, speech_identity)
             reserved = reserve_live_budget(args.ledger, reservation)
         else:
             reserved = 0
-        env = platform.environment(services.generation_endpoint, effects_api) if platform else isolated_environment(
+        env = platform.environment(services.generation_endpoint if services else None, effects_api) if platform else isolated_environment(
             run, source_config, services.generation_endpoint if services else None,
             args.live, reservation, entry=args.entry)
         if services:
@@ -1298,13 +1350,17 @@ def execute(args, platform=None):
         if args.hold_native_observer:
             summary['qualified_for_live'] = False
         if platform:
-            platform.annotate(summary)
+            import windows_qualification
+            if windows_qualification.selected(args):
+                platform.annotate_qualified(summary, effects_api)
+            else:
+                platform.annotate(summary)
         private_json(run/'report.json', summary)
         prune_owned_reports(run.parent)
         passed = (not summary['diagnostic_only'] and len(rows)==len(args.cases) and
                   all(r['passed'] for r in rows) and cleanup['app_exit_before_group_termination_observed'])
         if profile:
-            passed = passed and summary['offline_profile_qualified']
+            passed = summary.get('passed', False) if platform and getattr(args, 'windows_profile', 'diagnostic') == 'live-qualified-v1' else passed and summary['offline_profile_qualified']
         print(json.dumps({'passed': passed,
                           'workflow_completed': summary.get('workflow_completed'),
                           'diagnostic_success': summary['diagnostic_success'],
@@ -1382,6 +1438,9 @@ def main():
     parser.add_argument('--cases', nargs='+', choices=list(CASES)+['arithmetic'])
     parser.add_argument('--entry', choices=['voice', 'typed', 'typed-control', 'typed-speech'], default='voice', help='Typed speech is a Neural Windows offline diagnostic')
     parser.add_argument('--desktop-platform', choices=['linux', 'windows'], default='linux')
+    parser.add_argument('--windows-profile', choices=['diagnostic', 'live-qualified-v1'], default='diagnostic')
+    parser.add_argument('--typed-evidence', type=Path)
+    parser.add_argument('--auth-source-config', type=Path)
     parser.add_argument('--windows-manifest', type=Path, help='Windows-only staged PCM/assets/tools hash manifest')
     parser.add_argument('--extended', action='store_true', help='Offline typed context/history/cancellation/relaunch matrix')
     parser.add_argument('--flow-timeout', type=float, default=180)
@@ -1393,20 +1452,11 @@ def main():
     parser.add_argument('--live', action='store_true')
     parser.add_argument('--shared-suite', action='store_true', help='Qualified live typed shared scenario suite')
     parser.add_argument('--offline-evidence', type=Path, help='Matching successful offline report, required before live reservation')
-    global ARTIFACT_ROOT, ASSIGNMENT_LEDGER
-    try:
-        if ARTIFACT_ROOT is None:
-            ARTIFACT_ROOT = artifact_root(ROOT)
-        if ASSIGNMENT_LEDGER is None:
-            ASSIGNMENT_LEDGER = ARTIFACT_ROOT / 'unified-app-bench-live-budget.json'
-    except ValueError as error:
-        parser.error(str(error))
-    parser.add_argument('--ledger', type=Path, default=ASSIGNMENT_LEDGER)
+    parser.add_argument('--ledger', type=Path)
     parser.add_argument('--inside-offline', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--inside-session', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if any(path.is_symlink() for path in (ARTIFACT_ROOT, *ARTIFACT_ROOT.parents)):
-        parser.error('Benchmark artifact storage must not use symlinks')
+    qualified_windows = args.desktop_platform == 'windows' and args.windows_profile == 'live-qualified-v1'
     typed_speech = args.entry == 'typed-speech'
     if typed_speech and args.desktop_platform != 'windows':
         parser.error('Typed speech requires native Windows offline diagnostics')
@@ -1426,9 +1476,6 @@ def main():
         parser.error('Voice and legacy controls require an explicit synthetic wake phrase')
     if args.extended and (args.entry != 'typed' or args.live):
         parser.error('Extended safety/context tests are offline typed-workflow only')
-    if (not args.output.resolve().is_relative_to(ARTIFACT_ROOT.resolve()) or
-            args.output.resolve() in (ARTIFACT_ROOT.resolve(), ASSIGNMENT_LEDGER.resolve())):
-        parser.error('Benchmark artifacts must use a private run under the outer project artifacts tree')
     if not 10 <= args.flow_timeout <= 180:
         parser.error('Flow timeout must be between 10 and 180 seconds')
     if not 0.05 <= args.poll_interval <= 1:
@@ -1443,12 +1490,10 @@ def main():
         parser.error('Offline continuation requires its network namespace')
     if args.entry == 'typed' and (args.wake_diagnostics or args.event_loop_diagnostic or args.poll_interval != 0.1):
         parser.error('Typed-workflow measurements cannot enable diagnostic probes')
-    if args.live and (args.entry not in ('voice', 'typed') or args.wake_diagnostics or args.event_loop_diagnostic or args.poll_interval != 0.1):
+    if args.live and not qualified_windows and (args.entry not in ('voice', 'typed') or args.wake_diagnostics or args.event_loop_diagnostic or args.poll_interval != 0.1):
         parser.error('Diagnostic probes cannot qualify or run final live measurement')
-    if args.live and args.cases != list(CASES):
+    if args.live and not qualified_windows and args.cases != list(CASES):
         parser.error('The final live batch runs each approved case once, in order')
-    if args.ledger.resolve() != ASSIGNMENT_LEDGER.resolve():
-        parser.error('Live allowance uses the fixed assignment-wide ledger')
     if args.desktop_platform == 'windows':
         import windows_effects
         effects = None
@@ -1471,8 +1516,27 @@ def main():
                               'native_error_code': getattr(error, 'native_error_code', None),
                               'report_persistence_failed': report_persistence_failed}))
             return 1
+    if (args.windows_profile != 'diagnostic' or args.typed_evidence is not None or args.auth_source_config is not None):
+        parser.error('Windows qualification controls require the Windows adapter')
     if sys.platform != 'linux' or args.windows_manifest is not None:
         parser.error('Linux namespace entry requires Linux and no Windows manifest')
+    global ARTIFACT_ROOT, ASSIGNMENT_LEDGER
+    try:
+        if ARTIFACT_ROOT is None:
+            ARTIFACT_ROOT = artifact_root(ROOT)
+        if ASSIGNMENT_LEDGER is None:
+            ASSIGNMENT_LEDGER = ARTIFACT_ROOT / 'unified-app-bench-live-budget.json'
+    except ValueError as error:
+        parser.error(str(error))
+    if any(path.is_symlink() for path in (ARTIFACT_ROOT, *ARTIFACT_ROOT.parents)):
+        parser.error('Benchmark artifact storage must not use symlinks')
+    if (not args.output.resolve().is_relative_to(ARTIFACT_ROOT.resolve()) or
+            args.output.resolve() in (ARTIFACT_ROOT.resolve(), ASSIGNMENT_LEDGER.resolve())):
+        parser.error('Benchmark artifacts must use a private run under the outer project artifacts tree')
+    if args.ledger is None:
+        args.ledger = ASSIGNMENT_LEDGER
+    if args.ledger.resolve() != ASSIGNMENT_LEDGER.resolve():
+        parser.error('Live allowance uses the fixed assignment-wide ledger')
     inside = args.inside_offline or args.inside_session
     if not inside:
         args.output = args.output.resolve()

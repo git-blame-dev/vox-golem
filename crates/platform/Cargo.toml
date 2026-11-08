@@ -78,7 +78,7 @@ rustix = { version = "1", default-features = false, features = ["fs", "std", "pr
 
 [target.'cfg(windows)'.dependencies]
 win32job = { version = "2.0.3", optional = true }
-windows = { version = "=0.61.3", optional = true, features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows = { version = "=0.61.3", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }

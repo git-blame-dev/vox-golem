@@ -17,6 +17,21 @@ MAX_REPORT_BYTES = 128 * 1024
 TRANSPORT_REAP_SECONDS = 5
 
 
+def live_profile(args):
+    """The shared entry opts in through an explicit schema-3 profile manifest."""
+    path = getattr(args, 'windows_manifest', None)
+    if not getattr(args, 'live', False) or path is None:
+        return False
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 256*1024:
+            return False
+        value = json.loads(path.read_text())
+        return (type(value.get('schema')) is int and value['schema'] == 3 and
+                value.get('profile') == 'windows-neural-live-qualified-v1')
+    except (OSError, ValueError):
+        return False
+
+
 def native_platform():
     if sys.platform == 'win32' and os.name == 'nt':
         return 'windows'
@@ -36,7 +51,8 @@ def authorize(args):
     if getattr(args, 'workload', None) != 'typed-speech':
         raise Blocked('desktop_synthetic_voice_profile_retired_use_neural_typed_speech_windows')
     voice_contract.load_contract()
-    if (args.platform != 'desktop' or args.live or args.max_live_calls != 0 or
+    qualified = live_profile(args)
+    if (args.platform != 'desktop' or (args.live and not qualified) or args.max_live_calls != (12 if qualified else 0) or
             args.repetitions != 1 or args.model != 'custom-luna-none'):
         raise Blocked('desktop_voice_offline_zero_live_budget_required')
     if getattr(args, 'wake_phrase', None) is not None:
@@ -45,13 +61,17 @@ def authorize(args):
     if any(getattr(args, name, None) is None for name in required):
         raise Blocked('desktop_voice_explicit_assets_required')
     if (any(getattr(args, name, None) is not None for name in
-            ('device', 'adb', 'ssh', 'remote_adb', 'apk', 'helper_apk', 'offline_evidence', 'cases')) or
+            (('device', 'adb', 'ssh', 'remote_adb', 'apk', 'helper_apk', 'cases') if qualified else
+             ('device', 'adb', 'ssh', 'remote_adb', 'apk', 'helper_apk', 'offline_evidence', 'cases'))) or
             args.allow_device or args.wear_ui_probe or args.collect_stages or
             args.history_seed_turns != 1 or args.port != 9223 or args.turn_timeout != 180 or
-            args.build_variant != 'unspecified' or
+            args.build_variant != ('performance' if qualified else 'unspecified') or
             getattr(args, 'explicit_options', set()) &
-            {'--history-seed-turns', '--port', '--turn-timeout', '--build-variant'}):
+            ({'--history-seed-turns', '--port', '--turn-timeout'} if qualified else
+             {'--history-seed-turns', '--port', '--turn-timeout', '--build-variant'})):
         raise Blocked('desktop_voice_foreign_controls_unsupported')
+    if qualified and args.offline_evidence is None:
+        raise Blocked('desktop_voice_matching_qualification_required')
     platform = getattr(args, 'desktop_platform', None) or native_platform()
     if platform != 'windows':
         raise Blocked('typed_speech_requires_native_windows')
@@ -84,7 +104,113 @@ def command(args, common, platform, output):
         '--tools', str(args.tools), '--output', str(output), '--config', str(args.config),
         '--entry', 'typed-speech']
     argv += ['--desktop-platform', 'windows', '--windows-manifest', str(args.windows_manifest)]
+    if live_profile(args):
+        # Config means the separate canonical auth *reference* in this explicit
+        # live contract. The staged source remains the synthetic Neural-only file.
+        sys.path.insert(0, str(common.ROOT/'tools/app-bench'))
+        import windows_effects
+        from fixtures import arithmetic_profile
+        _, roles = windows_effects.load_manifest(args.windows_manifest, arithmetic_profile(), qualified=True)
+        argv[argv.index('--config')+1] = str(roles['config'])
+        argv += ['--windows-profile', 'live-qualified-v1', '--live',
+                 '--auth-source-config', str(args.config), '--offline-evidence', str(args.offline_evidence)]
     return argv
+
+
+def qualified_failure_facts(value, code, args, common, evidence=None):
+    """Validate bounded observations without treating them as successful execution."""
+    sys.path.insert(0, str(common.ROOT/'tools/app-bench'))
+    import runner
+    import windows_qualification as qualification
+    from fixtures import arithmetic_profile
+    binding = value.get('windows_binding')
+    if type(binding) is not dict or type(binding.get('speech_identity')) is not dict:
+        raise Blocked('desktop_voice_child_profile_mismatch')
+    expected = qualification.binding(args, runner, arithmetic_profile(),
+                                      binding['speech_identity'])
+    profile = dict(schema=5, mode='live', entry='typed-speech-qualified-windows',
+        windows_profile=qualification.PROFILE, windows_binding=expected,
+        requested_model='custom-luna-none', diagnostic_only=False, qualified_for_live=False)
+    if any(type(value.get(key)) is not type(item) or value.get(key) != item for key, item in profile.items()):
+        raise Blocked('desktop_voice_child_profile_mismatch')
+    facts = dict(child_schema=5, child_evidence='validated-self-reported',
+        child_exit_code=code if type(code) is int else None,
+        live_calls=None, live_calls_verification='unverified', assignment_reserved=None,
+        assignment_reserved_verification='unverified',
+        child_identities={key:expected[key] for key in ('binary_sha256', 'harness_sha256',
+            'source_manifest_sha256', 'contract_sha256', 'implementation_sha256')})
+    invalid = code is not None and type(code) is not int
+    cleanup = value.get('cleanup')
+    if type(cleanup) is dict:
+        safe_cleanup = {}
+        for key in ('app_exit_before_group_termination_observed', 'app_exit_observed',
+                    'forced_group_termination', 'webdriver_quit_error', 'owned_job_retired'):
+            if key in cleanup:
+                if type(cleanup[key]) is bool:
+                    safe_cleanup[key] = cleanup[key]
+                else:
+                    invalid = True
+        if safe_cleanup:
+            facts['cleanup'] = safe_cleanup
+    else:
+        invalid = True
+    for key, maximum in (('live_calls', 12), ('assignment_reserved', 100)):
+        count = value.get(key)
+        if count is not None:
+            if type(count) is int and 0 <= count <= maximum and (key != 'assignment_reserved' or count % 12 == 0):
+                facts[key] = count
+                facts[key+'_verification'] = 'validated-self-reported'
+            else:
+                invalid = True
+    rows = value.get('rows')
+    counts = rows[0].get('generation_counts') if type(rows) is list and len(rows) == 1 and type(rows[0]) is dict else None
+    if type(counts) is dict and 'spent' in counts:
+        spent = counts['spent']
+        if (type(spent) is not int or not 0 <= spent <= 12 or
+                (facts['live_calls'] is not None and spent != facts['live_calls'])):
+            facts.update(live_calls=None, live_calls_verification='unverified')
+            invalid = True
+    for key in ('passed', 'workflow_completed'):
+        if key in value:
+            if type(value[key]) is bool:
+                facts['child_'+key] = value[key]
+            else:
+                invalid = True
+    for key in ('failure_category', 'stage', 'platform_stage'):
+        if key in value:
+            category = value[key]
+            if type(category) is str and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,63}', category):
+                facts['child_'+key] = category
+            else:
+                invalid = True
+    if evidence is not None:
+        evidence.update(facts)
+    if invalid:
+        raise Blocked('desktop_voice_qualified_live_receipts_invalid')
+    return runner, qualification, expected, facts
+
+
+def interpret_qualified(value, code, args, common, *, evidence=None):
+    runner, qualification, expected, facts = qualified_failure_facts(value, code, args, common, evidence)
+    qualification.speech_evidence(args.offline_evidence, expected, runner, args.binary)
+    rows, cleanup = value.get('rows'), value.get('cleanup', {})
+    if (type(code) is not int or code != 0 or value.get('passed') is not True or
+            value.get('workflow_completed') is not True or
+            type(value.get('live_calls')) is not int or value['live_calls'] != 1 or
+            value.get('private_storage_acl_verified') is not True or
+            value.get('app_job_and_creation_identity_verified') is not True or
+            cleanup.get('owned_job_retired') is not True or
+            cleanup.get('app_exit_before_group_termination_observed') is not True or
+            type(rows) is not list or len(rows) != 1 or rows[0].get('case') != 'arithmetic' or
+            rows[0].get('passed') is not True or
+            not qualification.speech_row_valid(rows[0], expected, runner, False) or
+            rows[0].get('generation_counts') != {'generation_attempts':1, 'spent':1, 'remaining':11}):
+        raise Blocked('desktop_voice_qualified_live_receipts_invalid')
+    return dict(facts, status='pass', workflow_completed=True, qualified_for_live=False,
+        live_admission_budget=12, fake_model_admission_budget=0, live_calls=1, child_schema=5,
+        child_evidence='validated-self-reported',
+        windows_binding=expected, cleanup=cleanup, child_rows=rows,
+        acoustic_output='unverified', external_shared_service_lifecycle='unverified')
 
 
 def launch(argv, root):
@@ -279,20 +405,35 @@ def main(args, common):
         'host_observation_watchdog_seconds':HOST_OBSERVATION_SECONDS,
         'transport_teardown_allowance_seconds':2 * TRANSPORT_REAP_SECONDS}
     code = 1
+    qualified, output = False, None
     try:
         platform = authorize(args)
+        qualified = args.live
         summary['desktop_platform'] = platform
+        if qualified:
+            summary.update(live_admission_budget=12, fake_model_admission_budget=0,
+                live_calls=None, live_calls_verification='unverified', assignment_reserved=None,
+                assignment_reserved_verification='unverified')
         output = fresh_output(args, common)
         argv = command(args, common, platform, output)
         child_code = launch(argv, common.ROOT)
         summary['child_exit_code'] = child_code
         summary['report_path'] = str(output / 'report.json')
+        if qualified:
+            summary.update(interpret_qualified(child_report(output), child_code, args, common, evidence=summary))
+            print(json.dumps(summary))
+            return 0
         summary.update(interpret(child_report(output), child_code, platform, evidence=summary, workload=args.workload))
         summary['status'] = 'unverified'
         code = 2
     except Blocked as error:
         summary['failure_category'] = str(error)
     except subprocess.TimeoutExpired:
+        if qualified and output is not None:
+            try:
+                qualified_failure_facts(child_report(output), None, args, common, summary)
+            except Exception:
+                pass  # Retain the timeout and any independently validated facts.
         summary['failure_category'] = 'desktop_voice_child_timeout_cleanup_unverified'
     except BaseException:
         summary['failure_category'] = 'desktop_voice_operation_failed_payload_omitted'

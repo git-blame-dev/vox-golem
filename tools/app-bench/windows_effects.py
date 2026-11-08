@@ -17,6 +17,9 @@ import subprocess
 import sys
 import time
 import tomllib
+import uuid
+
+import windows_qualification as qualification
 import urllib.request
 from urllib.parse import urlsplit
 
@@ -72,6 +75,9 @@ class FileTime(C.Structure):
 
 def validate_options(args, host=None):
     is_win32 = (sys.platform if host is None else host) == 'win32' or getattr(args, '_test_win32', False)
+    if qualification.selected(args):
+        validate_qualified_options(args, is_win32)
+        return
     if not is_win32 or getattr(args, 'live', False) or getattr(args, 'entry', None) != 'typed-speech':
         raise ValueError('Windows supports only native offline Neural typed-speech diagnostics')
     if (
@@ -83,6 +89,38 @@ def validate_options(args, host=None):
         raise ValueError('Typed speech requires one offline arithmetic case without voice assets or probes')
     if getattr(args, 'windows_manifest', None) is None:
         raise ValueError('Windows requires a verified schema-2 typed-speech manifest')
+    if any(getattr(args, name, None) is not None for name in
+           ('ledger', 'offline_evidence', 'typed_evidence', 'auth_source_config')):
+        raise ValueError('Windows diagnostics cannot use live ledgers or qualification evidence')
+
+
+def validate_qualified_options(args, is_win32):
+    typed = args.entry == 'typed'
+    if (not is_win32 or args.entry not in ('typed', 'typed-speech') or
+            getattr(args, 'windows_manifest', None) is None or
+            getattr(args, 'ledger', None) is not None or
+            getattr(args, 'wake_phrase', None) is not None or
+            any(getattr(args, key, False) for key in ('shared_suite', 'wake_diagnostics',
+                'event_loop_diagnostic', 'driver_free_diagnostic', 'hold_native_observer')) or
+            getattr(args, 'poll_interval', 0.1) != 0.1):
+        raise ValueError('Qualified Windows profile controls invalid')
+    from fixtures import CASES
+    if typed:
+        if args.live or not args.extended or args.cases != list(CASES):
+            raise ValueError('Windows typed qualification requires the full offline extended matrix')
+        if any(getattr(args, name, None) is not None for name in ('typed_evidence', 'offline_evidence')):
+            raise ValueError('Typed matrix does not consume prior qualification evidence')
+    elif args.cases != ['arithmetic'] or args.extended:
+        raise ValueError('Qualified speech requires one arithmetic admission')
+    if args.live:
+        if args.offline_evidence is None or args.auth_source_config is None or getattr(args, 'typed_evidence', None) is not None:
+            raise ValueError('Live Windows speech requires offline proof and canonical auth reference')
+    elif getattr(args, 'auth_source_config', None) is not None:
+        raise ValueError('Offline qualification forbids canonical auth access')
+    elif not typed and getattr(args, 'typed_evidence', None) is None:
+        raise ValueError('Neural qualification requires matching typed safety/context evidence')
+    elif not typed and getattr(args, 'offline_evidence', None) is not None:
+        raise ValueError('Offline Neural proof consumes typed evidence only')
 
 
 def session_creation_cause(error):
@@ -430,20 +468,30 @@ def unique_object(pairs):
     return result
 
 
-def load_manifest(path, profile, entry='typed-speech'):
-    if entry != 'typed-speech':
+def load_manifest(path, profile, entry='typed-speech', qualified=False):
+    if entry != 'typed-speech' and not (qualified and entry == 'typed'):
         raise ValueError('Desktop synthetic-voice arithmetic profile retired')
     reject_reparse(path)
     if not path.is_file() or path.stat().st_size > 256*1024:
         raise ValueError('Bounded Windows staging manifest required')
     value = json.loads(path.read_text(encoding='utf-8'),
                        object_pairs_hook=unique_object)
-    if (not isinstance(value, dict) or type(value.get('schema')) is not int or value.get('schema') != 2 or
-            value.get('entry') != 'typed-speech-windows' or value.get('contract_sha256') != profile.contract_sha256 or
+    if (not isinstance(value, dict) or type(value.get('schema')) is not int or value.get('schema') != (3 if qualified else 2) or
+            value.get('entry') != ('typed-speech-qualified-windows' if qualified else 'typed-speech-windows') or value.get('contract_sha256') != profile.contract_sha256 or
             value.get('application_id') != 'dev.gitblame.voxgolem.benchmark' or
             not re.fullmatch('[0-9a-f]{64}', value.get('native_source_sha256', '')) or
             not isinstance(value.get('files'), dict) or not 1 <= len(value['files']) <= 4096):
         raise ValueError('Windows staging identity invalid')
+    if qualified:
+        import runner
+        wsl = value.get('wsl', {})
+        if (value.get('profile') != qualification.PROFILE or
+                value.get('harness_sha256') != runner.windows_harness_identity() or
+                set(wsl) != {'distribution', 'source_root'} or
+                not isinstance(wsl['distribution'], str) or not re.fullmatch(r'[A-Za-z0-9._-]{1,128}', wsl['distribution']) or
+                not isinstance(wsl['source_root'], str) or not wsl['source_root'].startswith('/') or
+                len(wsl['source_root']) > 4096):
+            raise ValueError('Explicit qualified profile and canonical WSL owner required')
     versions = value.get('driver_versions', {})
     if (set(versions) != {'tauri', 'edge', 'webview'} or
             versions['tauri'] != '2.1.0' or
@@ -597,7 +645,8 @@ class WindowsEffects:
                                      contract_sha256=profile.contract_sha256,
                                      implementation_sha256=profile.implementation_sha256)
         args = self.args
-        value, roles = load_manifest(args.windows_manifest, profile, 'typed-speech')
+        profile = profile or api.arithmetic_profile()
+        value, roles = load_manifest(args.windows_manifest, profile, getattr(args, 'entry', 'typed-speech'), qualification.selected(args))
         if (args.binary.resolve() != roles['binary'] or args.config.resolve() != roles['config'] or
                 args.tools.resolve() != roles['tauri_driver'].parent):
             raise ValueError('CLI paths do not match verified staging roles')
@@ -612,7 +661,11 @@ class WindowsEffects:
             'owner': 'voxgolem-app-bench', 'created_epoch_seconds': time.time()})
         self.run_owned = True
         for folder in ('home', 'config', 'data', 'state', 'cache', 'runtime', 'temp',
-                       'appdata', 'localappdata', 'webview', 'fixtures'):
+                       'appdata', 'localappdata', 'webview', 'fixtures',
+                       'home/AppData', 'home/AppData/Local', 'home/AppData/Roaming'):
+            # SHGetFolderPath expands USERPROFILE independently of APPDATA.
+            # Missing standard folders also makes Chromium's default-profile
+            # check fail closed, preventing the WebDriver debugging connection.
             private_directory(run/folder)
         self.stage = 'windows_neural_descriptor'
         speech = probe_neural_service(neural_configuration(roles['config']))
@@ -620,7 +673,14 @@ class WindowsEffects:
             contract_sha256=profile.contract_sha256, implementation_sha256=profile.implementation_sha256,
             speech_identity=speech, external_shared_service_lifecycle='unverified')
         self.profile_identity = identity
-        return {}, speech, identity
+        if qualification.selected(args):
+            self.binding = qualification.binding(args, api, profile, speech)
+            self.profile_identity = dict(identity, profile=qualification.PROFILE)
+            if args.live:
+                qualification.speech_evidence(args.offline_evidence, self.binding, api, roles['binary'])
+            elif args.entry == 'typed-speech':
+                qualification.typed_evidence(args.typed_evidence, self.binding, api, roles['binary'])
+        return {}, speech, self.profile_identity
 
     def environment(self, endpoint, api):
         self.stage = 'windows_private_environment'
@@ -629,14 +689,41 @@ class WindowsEffects:
             'PROGRAMFILES(X86)', 'PROGRAMW6432', 'PROGRAMDATA', 'NUMBER_OF_PROCESSORS',
             'PROCESSOR_ARCHITECTURE', 'PROCESSOR_IDENTIFIER', 'PROCESSOR_LEVEL', 'PROCESSOR_REVISION'}
         source = {key: value for key, value in os.environ.items() if key.upper() in system_keys}
-        env = api.isolated_environment(run, roles['config'], endpoint,
-            entry='typed-speech', output_route='windows-diagnostic',
-            base_environment=source)
+        qualified = qualification.selected(args)
+        reservation = run/'reservation.json' if getattr(args, 'live', False) else None
+        if getattr(args, 'live', False):
+            api.live_auth_source_config(run, args.auth_source_config)
+            self.stage = 'windows_canonical_assignment'
+            grant = uuid.uuid4().hex
+            wsl = self.manifest['wsl']
+            payload = dict(binding=self.binding, windows_run=str(run))
+            script = (Path(__file__).with_name('paths.py').read_text()+'\n'+
+                      Path(__file__).with_name('windows_assignment.py').read_text())
+            executable = Path(os.environ['SystemRoot'])/'System32/wsl.exe'
+            reject_reparse(executable)
+            result = subprocess.run([str(executable), '--distribution', wsl['distribution'], '--exec',
+                '/usr/bin/python3', '-I', '-c', script, 'reserve', wsl['source_root'], grant],
+                input=json.dumps(payload).encode(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                env=source, timeout=30)
+            receipt = json.loads(result.stdout, object_pairs_hook=unique_object)
+            if (result.returncode or type(receipt.get('reserved')) is not int or
+                    not 12 <= receipt['reserved'] <= 100 or len(result.stdout) > 1024):
+                raise ValueError('Canonical WSL reservation failed; uncertainty never refunds')
+            self.assignment_reserved = receipt['reserved']
+            api.private_json(reservation, dict(schema=2, grant=grant, binding=self.binding,
+                windows_run=str(run), **wsl))
+        env = api.isolated_environment(run, roles['config'], endpoint, getattr(args, 'live', False), reservation,
+            entry=getattr(args, 'entry', 'typed-speech'), output_route='windows-diagnostic', base_environment=source,
+            auth_source_config=getattr(args, 'auth_source_config', None), windows_qualified=qualified)
         env.update(APPDATA=str(run/'appdata'), LOCALAPPDATA=str(run/'localappdata'),
             USERPROFILE=str(run/'home'), TEMP=str(run/'temp'), TMP=str(run/'temp'),
             WEBVIEW2_USER_DATA_FOLDER=str(run/'webview'),
             VOXGOLEM_BENCH_ENTRY='typed-speech-windows',
             VOXGOLEM_BENCH_OUTPUT_ROUTE='wasapi-render-diagnostic')
+        if qualified:
+            env.update(VOXGOLEM_BENCH_WINDOWS_PROFILE='live-qualified-v1',
+                VOXGOLEM_BENCH_ENTRY='typed-qualified-windows' if args.entry == 'typed' else 'typed-speech-qualified-windows',
+                VOXGOLEM_BENCH_OUTPUT_ROUTE='wasapi-render-qualified')
         home = run/'home'
         env.update(HOMEDRIVE=home.drive, HOMEPATH=str(home)[len(home.drive):])
         # No inherited WebView command-line overrides/debug listeners or host proxies.
@@ -684,10 +771,44 @@ class WindowsEffects:
         self.last_cleanup = owner.shutdown(driver)
         return self.last_cleanup
 
+    def annotate_qualified(self, summary, api):
+        typed = self.args.entry == 'typed'
+        summary.update(windows_profile=qualification.PROFILE, windows_binding=self.binding,
+            private_storage_acl_verified=self.private_storage_verified,
+            app_job_and_creation_identity_verified=self.app_observed,
+            os_network_containment='unverified', acoustic_output='unverified',
+            external_shared_service_lifecycle='unverified',
+            private_session_bus=False, private_process_namespace=False,
+            live_calls=summary['rows'][-1].get('generation_counts', {}).get('spent', 0) if self.args.live and summary['rows'] else 0)
+        local = (self.private_storage_verified and self.app_observed and
+            summary['cleanup'].get('owned_job_retired') is True and
+            summary['cleanup'].get('app_exit_before_group_termination_observed') is True)
+        if typed:
+            summary['qualified_for_live'] &= local
+            summary['workflow_completed'] &= local
+        else:
+            rows = summary['rows']
+            complete = (local and len(rows) == 1 and rows[0].get('passed') is True and
+                qualification.speech_row_valid(rows[0], self.binding, api, not self.args.live))
+            if self.args.live:
+                counts = rows[-1].get('generation_counts', {}) if rows else {}
+                complete &= (type(counts.get('spent')) is int and counts['spent'] == 1 and
+                             counts.get('remaining') == 11 and counts.get('generation_attempts') == 1)
+            summary.update(schema=5, entry='typed-speech-qualified-windows', diagnostic_only=False,
+                passed=complete, workflow_completed=complete,
+                qualified_for_live=complete and not self.args.live,
+                offline_profile_qualified=complete and not self.args.live,
+                output_route='wasapi-render-qualified',
+                assignment_reserved=getattr(self, 'assignment_reserved', 0))
+            if not self.args.live:
+                summary.update(typed_evidence_path=str(self.args.typed_evidence.resolve()),
+                    typed_evidence_sha256=file_hash(self.args.typed_evidence))
+        return summary
+
     def _base_envelope(self):
         args = getattr(self, 'args', None)
         manifest = getattr(self, 'manifest', None)
-        return {
+        envelope = {
             'external_shared_service_lifecycle': 'unverified', 'live_calls': 0,
             'schema': 4, 'entry': 'typed-speech-windows', 'diagnostic_only': True,
             'overall_status': 'unverified', 'passed': False, 'qualified_for_live': False,
@@ -698,6 +819,13 @@ class WindowsEffects:
             'native_source_sha256': manifest.get('native_source_sha256') if isinstance(manifest, dict) else None,
             'private_storage_acl_verified': getattr(self, 'private_storage_verified', False),
         }
+        if args and qualification.selected(args):
+            envelope.update(schema=5, entry='typed-speech-qualified-windows', diagnostic_only=False,
+                windows_profile=qualification.PROFILE, windows_binding=getattr(self, 'binding', None),
+                live_calls=None if args.live else 0,
+                assignment_reserved=getattr(self, 'assignment_reserved', None),
+                output_route='wasapi-render-qualified')
+        return envelope
 
     def failure_report(self, api, phase, error):
         if self.run_owned and not (self.args.output/'report.json').exists():
@@ -706,7 +834,7 @@ class WindowsEffects:
             profile_identity = getattr(self, 'profile_identity', None)
             api.private_json(self.args.output/'report.json', {
                 **self._base_envelope(),
-                'mode': 'offline', 'requested_model': 'custom-luna-none',
+                'mode': 'live' if getattr(self.args, 'live', False) else 'offline', 'requested_model': 'custom-luna-none',
                 'workflow_completed': False, 'rows': [],
                 'binary_sha256': file_hash(binary) if binary else None,
                 'harness_sha256': api.harness_identity() if hasattr(api, 'harness_identity') else (file_hash(Path(api.__file__).resolve()) if getattr(api, '__file__', None) else file_hash(Path(__file__).resolve())),

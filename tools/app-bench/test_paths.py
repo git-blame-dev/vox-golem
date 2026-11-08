@@ -1,5 +1,7 @@
 import os
 import sys
+import io
+from contextlib import redirect_stderr
 from pathlib import Path
 import subprocess
 import tempfile
@@ -100,15 +102,19 @@ class CanonicalPathsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir='/tmp/opencode') as temporary:
             root = Path(temporary)
             argv = ['runner', '--binary', '/synthetic/app', '--tools', '/synthetic/tools',
-                    '--config', '/synthetic/config', '--output', str(root/'artifacts/run')]
+                    '--config', '/synthetic/config', '--output', str(root/'artifacts/run'),
+                    '--entry', 'typed']
             with patch.object(runner, 'ROOT', root), \
                     patch.object(runner, 'ARTIFACT_ROOT', None), \
                     patch.object(runner, 'ASSIGNMENT_LEDGER', None), \
                     patch.object(sys, 'argv', argv), \
+                    patch.object(runner, 'artifact_root', wraps=paths.artifact_root) as discover, \
                     patch.object(runner, 'reserve_live_budget') as reserve, \
-                    patch.object(runner, 'execute') as execute:
+                    patch.object(runner, 'execute') as execute, redirect_stderr(io.StringIO()) as errors:
                 with self.assertRaises(SystemExit):
                     runner.main()
+                discover.assert_called_once_with(root)
+                self.assertIn('Canonical benchmark workspace unavailable or unsupported', errors.getvalue())
                 reserve.assert_not_called()
                 execute.assert_not_called()
             self.assertFalse((root/'artifacts').exists())

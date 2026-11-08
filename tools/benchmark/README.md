@@ -59,6 +59,7 @@ actual attempts and their disposition in the outer history.
 | Android A17 shared arithmetic | Finite synthesized PCM into the real recognizer; real semantic Ask, frontend Channel, canonical/UI answer and native TTS | One explicitly authorized live trial; exact answer and separate retirement/profile proofs; overall unverified, exit 2 on a valid workflow |
 | Desktop synthetic voice | Retired Piper arithmetic profiles | Unsupported, including `--list`; exit 2 before runtime access |
 | Native Windows typed speech | Normal composer and existing Neural service; WASAPI render diagnostic | Zero live admissions; schema 4 stays diagnostic-only, `passed=false`, no live qualification; completed diagnostic maps to shared exit 2 |
+| Qualified Windows live typed speech | Explicit schema-3 `windows-neural-live-qualified-v1` manifest and matching schema-5 offline proof | Existing WSL ledger reserves 12 calls; one arithmetic admission; native claim/spending and strict evidence checks; schema 4 never qualifies |
 | Wear legacy synthetic voice | Existing **four-word** fixture, recognizer, native model/presentation/TTS | Separate protocol-1 one-trial profile; earlier physical acceptance does not qualify shared arithmetic |
 
 Only arithmetic has additive `voice` metadata in `scenarios.json`.
@@ -687,3 +688,37 @@ WebView speech payload-receipt observations (including IPC/poll overhead), separ
 native-clock speech stage intervals, speech identity and local retirement evidence.
 Shared-service lifecycle and acoustics remain unverified; Job retirement covers
 only owned processes. Legacy workloads and live-budget gates are unchanged.
+
+### Qualified Windows live typed speech
+
+Use the [qualified Windows workflow](../app-bench/README.md#qualified-windows-live-neural-arithmetic)
+to produce matching same-binary typed safety/context and offline Neural arithmetic
+evidence first. Its explicit schema-3 manifest profile is
+`windows-neural-live-qualified-v1`; a schema-4 diagnostic is ineligible.
+
+The shared adapter accepts that contract with `--live`, an explicit
+`--max-live-calls 12`, `--build-variant performance` and `--offline-evidence` pointing
+to the successful schema-5 offline speech report. In this contract, `--config` is
+the separate canonical auth config **reference**; the manifest's config role
+remains the hash-verified synthetic Neural-only file. Neither the shared adapter
+nor controller reads/copies canonical config contents or credentials. The build
+variant argument declares the intended artifact condition; it does not establish
+optimization without the build's separate verification.
+
+```powershell
+& $PRIVATE_PYTHON tools/benchmark/benchmark.py --platform desktop `
+  --workload typed-speech --desktop-platform windows --live `
+  --max-live-calls 12 --build-variant performance `
+  --binary $BENCHMARK_EXE --tools $PRIVATE_DRIVERS `
+  --config $CANONICAL_CONFIG_REFERENCE --windows-manifest $QUALIFIED_MANIFEST `
+  --offline-evidence $SPEECH_RUN/report.json --output $LIVE_RUN
+```
+
+It reuses the existing runner, Job lifecycle and DOM/native observers. WSL owns
+the existing fixed assignment-wide ledger and exclusive grant claim; no Windows
+ledger can be selected. One arithmetic admission spends one of the 12 reserved
+calls, with no refund/replay of unused or uncertain allowance. Shared exit 0
+requires the strict schema-5 live result, all timing/integrity/speech/cleanup
+receipts and native spend counts. Acoustics and external shared-service lifecycle
+remain unverified. Linux tests and cross-compilation do not certify Windows
+runtime readiness or latency.

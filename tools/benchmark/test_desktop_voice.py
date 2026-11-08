@@ -14,6 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'app-bench'))
 import benchmark
 import desktop_voice as voice
 import voice_contract
+import runner
+import windows_qualification as qualification
+import test_windows_qualification as qualification_tests
 
 
 class DispatchTest(unittest.TestCase):
@@ -111,6 +114,128 @@ class DesktopVoiceTest(unittest.TestCase):
 
     def typed_args(self, extra=()):
         return self.args(extra)
+
+    def test_explicit_qualified_live_profile_has_separate_budget_and_evidence_controls(self):
+        manifest = self.root/'manifest.json'
+        manifest.write_text(json.dumps(dict(schema=3, profile=qualification.PROFILE)))
+        args = self.args(['--live', '--build-variant', 'performance', '--max-live-calls', '12',
+                          '--offline-evidence', str(self.root/'offline.json')])
+        with patch.object(voice, 'native_platform', return_value='windows'):
+            self.assertEqual(voice.authorize(args), 'windows')
+            args.max_live_calls = 0
+            with self.assertRaises(benchmark.Blocked): voice.authorize(args)
+            args.max_live_calls = 12
+            args.offline_evidence = None
+            with self.assertRaises(benchmark.Blocked): voice.authorize(args)
+
+    def test_qualified_live_interpreter_rejects_legacy_missing_timings_and_boolean_exit(self):
+        manifest = self.root/'manifest.json'
+        manifest.write_text(json.dumps(dict(schema=3, profile=qualification.PROFILE)))
+        args = self.args(['--live', '--build-variant', 'performance', '--max-live-calls', '12',
+                          '--offline-evidence', str(self.root/'offline.json')])
+        args.binary.write_bytes(b'synthetic binary')
+        identity = dict(engine='neural', backend='synthetic', voice='synthetic-a',
+                        protocol_version=1, sample_rate_hz=24000, incremental_audio=False)
+        binding = qualification.binding(args, runner, runner.arithmetic_profile(), identity)
+        row = qualification_tests.speech_row(binding)
+        row['generation_counts'] = dict(generation_attempts=1, spent=1, remaining=11)
+        value = dict(schema=5, mode='live', entry='typed-speech-qualified-windows',
+            windows_profile=qualification.PROFILE, windows_binding=binding,
+            requested_model='custom-luna-none', diagnostic_only=False,
+            passed=True, workflow_completed=True, qualified_for_live=False, live_calls=1,
+            private_storage_acl_verified=True, app_job_and_creation_identity_verified=True,
+            cleanup=dict(owned_job_retired=True, app_exit_before_group_termination_observed=True), rows=[row])
+        # Offline report validity is tested by its owner; this test isolates the
+        # shared adapter's interpretation of the live child's receipts.
+        with patch.object(qualification, 'speech_evidence'):
+            self.assertEqual(voice.interpret_qualified(value, 0, args, self.common)['status'], 'pass')
+            for code in (False, True, 1):
+                with self.subTest(code=code), self.assertRaises(benchmark.Blocked):
+                    voice.interpret_qualified(value, code, args, self.common)
+            for change in ({'schema':4}, {'schema':True}, {'mode':'offline'}, {'entry':'typed'},
+                           {'windows_profile':'diagnostic'}, {'windows_binding':{}},
+                           {'requested_model':'synthetic-other'}, {'diagnostic_only':True},
+                           {'live_calls':True}, {'qualified_for_live':True}):
+                with self.subTest(change=change), self.assertRaises(benchmark.Blocked):
+                    voice.interpret_qualified(dict(value, **change), 0, args, self.common)
+            invalid_rows = [dict(row, checks={}), dict(row, reply_speech={}),
+                            dict(row, speech_identity=dict(identity, voice='synthetic-other'))]
+            required = {'profile_answer_exact', 'local_speech_completed_and_retired',
+                        'speech_identity_matches_descriptor', 'ui_sources_preserved'}
+            for key in row['checks']:
+                if key in required:
+                    invalid_rows.append(dict(row, checks={name:check for name, check in row['checks'].items()
+                                                           if name != key}))
+                invalid_rows.append(dict(row, checks=dict(row['checks'], **{key:False})))
+            for invalid_row in invalid_rows:
+                with self.subTest(row=invalid_row), self.assertRaises(benchmark.Blocked):
+                    voice.interpret_qualified(dict(value, rows=[invalid_row]), 0, args, self.common)
+            row['ui_submit_to_first_complete_word_dom_ms'] = None
+            with self.assertRaises(benchmark.Blocked): voice.interpret_qualified(value, 0, args, self.common)
+
+    def test_qualified_live_failures_keep_budgets_valid_cleanup_and_reservation_facts(self):
+        manifest = self.root/'manifest.json'
+        manifest.write_text(json.dumps(dict(schema=3, profile=qualification.PROFILE)))
+        (self.root/'synthetic-app').write_bytes(b'synthetic binary')
+        for outcome in ('failed_arithmetic', 'rejected_receipt', 'invalid_consumption',
+                        'contradictory_consumption', 'timeout_with_report', 'timeout_without_report'):
+            args = self.args(['--live', '--build-variant', 'performance', '--max-live-calls', '12',
+                '--offline-evidence', str(self.root/'offline.json'), '--output', str(self.root/outcome)])
+            identity = dict(engine='neural', backend='synthetic', voice='synthetic-a',
+                            protocol_version=1, sample_rate_hz=24000, incremental_audio=False)
+            binding = qualification.binding(args, runner, runner.arithmetic_profile(), identity)
+            row = qualification_tests.speech_row(binding)
+            row['generation_counts'] = dict(generation_attempts=1, spent=1, remaining=11)
+            value = dict(schema=5, mode='live', entry='typed-speech-qualified-windows',
+                windows_profile=qualification.PROFILE, windows_binding=binding,
+                requested_model='custom-luna-none', diagnostic_only=False,
+                passed=False, workflow_completed=False, qualified_for_live=False, live_calls=1,
+                assignment_reserved=24, private_storage_acl_verified=True,
+                app_job_and_creation_identity_verified=True,
+                cleanup=dict(owned_job_retired=True, app_exit_before_group_termination_observed=True), rows=[row])
+            if outcome == 'failed_arithmetic':
+                row['passed'] = False
+                row['checks']['profile_answer_exact'] = False
+            elif outcome == 'rejected_receipt':
+                value.update(passed=True, workflow_completed=True)
+                row['ui_submit_to_first_complete_word_dom_ms'] = None
+            elif outcome == 'invalid_consumption':
+                value['live_calls'] = True
+            elif outcome == 'contradictory_consumption':
+                value['live_calls'] = 0
+            def launch(*_args):
+                if outcome != 'timeout_without_report':
+                    args.output.mkdir()
+                    (args.output/'report.json').write_text(json.dumps(value))
+                if outcome.startswith('timeout'):
+                    raise subprocess.TimeoutExpired('synthetic runner', 900)
+                return 0 if outcome == 'rejected_receipt' else 1
+            stdout = io.StringIO()
+            with self.subTest(outcome=outcome), patch.object(voice, 'native_platform', return_value='windows'), \
+                    patch.object(voice, 'command', return_value=['synthetic-runner']), \
+                    patch.object(voice, 'launch', side_effect=launch), \
+                    patch.object(qualification, 'speech_evidence'), redirect_stdout(stdout):
+                self.assertEqual(voice.main(args, self.common), 1)
+                summary = json.loads(stdout.getvalue())
+                self.assertEqual(summary['live_admission_budget'], 12)
+                self.assertEqual(summary['fake_model_admission_budget'], 0)
+                self.assertFalse(summary['workflow_completed'])
+                self.assertEqual(summary['status'], 'fail')
+                if outcome == 'timeout_without_report':
+                    self.assertEqual(summary['cleanup'], 'unverified')
+                    self.assertIsNone(summary['assignment_reserved'])
+                else:
+                    self.assertTrue(summary['cleanup']['owned_job_retired'])
+                    self.assertEqual(summary['assignment_reserved'], 24)
+                    self.assertEqual(summary['child_evidence'], 'validated-self-reported')
+                if outcome in ('invalid_consumption', 'contradictory_consumption', 'timeout_without_report'):
+                    self.assertIsNone(summary['live_calls'])
+                    self.assertEqual(summary['live_calls_verification'], 'unverified')
+                else:
+                    self.assertEqual(summary['live_calls'], 1)
+                    self.assertEqual(summary['live_calls_verification'], 'validated-self-reported')
+                if outcome.startswith('timeout'):
+                    self.assertEqual(summary['failure_category'], 'desktop_voice_child_timeout_cleanup_unverified')
 
     def test_typed_speech_dispatch_and_diagnostic_interpretation(self):
         value = report('windows')

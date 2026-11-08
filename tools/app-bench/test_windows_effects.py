@@ -16,6 +16,30 @@ import windows_effects as windows
 
 
 class WindowsEffectsTests(unittest.TestCase):
+    def test_staged_windows_cli_never_discovers_git_or_uses_live_ledger(self):
+        argv = ['runner', '--entry', 'typed-speech', '--desktop-platform', 'windows',
+                '--binary', 'synthetic.exe', '--tools', 'synthetic-tools',
+                '--config', 'synthetic.toml', '--windows-manifest', 'synthetic.json',
+                '--output', 'synthetic-private-run']
+        with patch.object(sys, 'argv', argv), patch.object(sys, 'platform', 'win32'), \
+                patch.object(runner, 'ARTIFACT_ROOT', None), \
+                patch.object(runner, 'ASSIGNMENT_LEDGER', None), \
+                patch.object(runner, 'artifact_root', side_effect=AssertionError('Git discovery forbidden')), \
+                patch.object(runner, 'reserve_live_budget') as reserve, \
+                patch.object(windows, 'WindowsEffects') as effects, \
+                patch.object(runner, 'execute', return_value=1) as execute:
+            self.assertEqual(runner.main(), 1)
+            self.assertIsNone(execute.call_args.args[0].ledger)
+            self.assertIs(execute.call_args.kwargs['platform'], effects.return_value)
+            reserve.assert_not_called()
+
+    def test_windows_rejects_live_ledger_and_qualification_inputs(self):
+        for field in ('ledger', 'offline_evidence'):
+            args = SimpleNamespace(entry='typed-speech', live=False,
+                                   windows_manifest=Path('synthetic.json'), **{field: Path('synthetic')})
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                windows.validate_options(args, 'win32')
+
     def test_webview_capability_binds_the_same_private_folder_as_native_storage_guard(self):
         with tempfile.TemporaryDirectory() as directory:
             effects = windows.WindowsEffects.__new__(windows.WindowsEffects)
@@ -181,6 +205,10 @@ class WindowsEffectsTests(unittest.TestCase):
                     patch.object(windows, 'probe_neural_service', return_value={}):
                 _, _, identity = effects.prepare(profile, SimpleNamespace(**vars(runner)))
             self.assertEqual(identity['implementation_sha256'], profile.implementation_sha256)
+            # Windows known-folder lookup expands USERPROFILE even when the
+            # controller redirects APPDATA and LOCALAPPDATA separately.
+            self.assertTrue((root/'run/home/AppData/Local').is_dir())
+            self.assertTrue((root/'run/home/AppData/Roaming').is_dir())
             summary = {'profile_identity': identity, 'rows': [], 'cleanup': {}}
             effects.annotate(summary)
             self.assertEqual(summary['profile_identity']['implementation_sha256'], profile.implementation_sha256)

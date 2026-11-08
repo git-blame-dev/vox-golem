@@ -1,6 +1,6 @@
 # Unified application benchmark
 
-Desktop controllers derive artifact storage from the primary Git checkout's
+Linux desktop controllers derive artifact storage from the primary Git checkout's
 outer workspace using Git common-directory metadata. Registered linked worktrees
 and checkout symlink aliases share that artifact tree and the fixed
 `unified-app-bench-live-budget.json` ledger; source paths remain checkout-local.
@@ -9,6 +9,10 @@ separate-Git-directory or unsupported layouts. There is no fallback ledger or
 automatic ledger migration. Continuity across independent repository copies or
 relocation of the primary checkout is not guaranteed. Artifact/ledger symlinks
 remain refused.
+
+Native Windows offline diagnostics run from a hash-verified staging directory,
+with an explicit fresh local output folder protected by the Windows adapter.
+They do not discover Git storage or accept live-ledger/qualification inputs.
 
 For the shared cross-platform **typed or synthetic-voice entry**, start with
 `make benchmark PLATFORM=desktop BENCHMARK_FLAGS="--help"` and
@@ -293,6 +297,13 @@ The benchmark binary writes a bounded categorical `startup-validation.json`
 receipt when environment validation runs. `ready` confirms that boundary only;
 a missing receipt does not identify a failure cause. Shipping builds omit it.
 
+The private Windows home also contains `AppData/Local` and `AppData/Roaming`.
+Windows known-folder lookup needs this standard layout even with explicit
+`APPDATA`/`LOCALAPPDATA` redirection. Without it, Chromium can reject remote
+debugging with “requires a non-default data directory” because its default-folder
+lookup fails. Keep these folders under the same private run; no host profile or
+global debugging override is needed.
+
 The hash-bound synthetic source config contains only this table (replace the
 synthetic voice with an explicitly selected public voice ID in the descriptor):
 
@@ -346,3 +357,105 @@ Acoustics remain unverified. Even a completed diagnostic has `passed=false`,
 synthetic typed/speech checks, matching identity, private storage, retained app
 identity, graceful app exit and owned Job retirement. This report cannot authorize
 live measurement or establish Windows acoustic acceptance.
+
+### Qualified Windows live Neural arithmetic
+
+`--windows-profile live-qualified-v1` is a separate contract. The preceding
+schema-4 diagnostic and its exit/status rules remain unchanged and cannot qualify
+this profile. Independent implementation/security review and actual Windows
+offline qualification precede live use. Linux fake tests and cross-compilation
+do not provide that qualification.
+
+Build the benchmark on Linux with its existing features and Windows cross-build
+workflow. The native claimant binds the WSL checkout from `CARGO_MANIFEST_DIR`
+and the distribution from build-time `VOXGOLEM_BENCH_WSL_DISTRIBUTION`, falling
+back to build-time `WSL_DISTRO_NAME`. If neither is set, Windows live claims fail
+closed. Use the existing canonical checkout/distribution; changing either requires
+a new binary and matching qualification. No Windows runner or independent budget
+ledger is involved.
+
+The qualified staging manifest keeps the same four roles and restricted
+Neural-only source config, but sets `schema=3`,
+`entry="typed-speech-qualified-windows"`,
+`profile="windows-neural-live-qualified-v1"`, and `harness_sha256` from
+`runner.windows_harness_identity()`. Add a `wsl` object containing the explicit
+`distribution` and canonical Linux `source_root` matching the binary's build.
+Stage the current `windows_assignment.py` and `windows_qualification.py` alongside
+the existing harness files. The harness identity covers WindowsEffects, both new
+owners, existing runner/fixtures/paths, and the shared scenario/parser/matcher
+identity. The manifest, executable, profile, workflow and Neural descriptor are
+bound together in `windows_binding` on every qualifying report.
+
+Use a fresh private output directory for each step, the same executable/manifest/
+harness and the same running Neural service identity. The offline typed matrix
+uses fake loopback providers with Web enabled and TTS disabled; the offline
+arithmetic proof enables Neural speech with Web disabled:
+
+```powershell
+& $PRIVATE_PYTHON tools/app-bench/runner.py `
+  --binary $BENCHMARK_EXE --tools $PRIVATE_DRIVERS --config $SYNTHETIC_CONFIG `
+  --desktop-platform windows --windows-manifest $QUALIFIED_MANIFEST `
+  --windows-profile live-qualified-v1 --entry typed --extended --output $TYPED_RUN
+
+& $PRIVATE_PYTHON tools/app-bench/runner.py `
+  --binary $BENCHMARK_EXE --tools $PRIVATE_DRIVERS --config $SYNTHETIC_CONFIG `
+  --desktop-platform windows --windows-manifest $QUALIFIED_MANIFEST `
+  --windows-profile live-qualified-v1 --entry typed-speech `
+  --typed-evidence $TYPED_RUN/report.json --output $SPEECH_RUN
+```
+
+The first report preserves the existing schema-2 full typed/context/safety matrix
+and adds Windows binding/ACL/Job receipts. Every existing cancellation, duplicate,
+history, preference and relaunch gate remains required. The second report is
+schema 5 and revalidates that matrix; it requires exact source-free arithmetic,
+matching speech identity, successful synthesis/output/physical local retirement,
+bounded observations, valid first-text/word/audio intervals, graceful app exit and
+Job retirement. Missing or diagnostic evidence cannot be replaced by a success
+boolean. It retains the typed report path and digest, so preserve both reports.
+
+Only a successful matching schema-5 offline proof can reserve a live batch:
+
+```powershell
+& $PRIVATE_PYTHON tools/app-bench/runner.py `
+  --binary $BENCHMARK_EXE --tools $PRIVATE_DRIVERS --config $SYNTHETIC_CONFIG `
+  --desktop-platform windows --windows-manifest $QUALIFIED_MANIFEST `
+  --windows-profile live-qualified-v1 --entry typed-speech --live `
+  --offline-evidence $SPEECH_RUN/report.json `
+  --auth-source-config $CANONICAL_CONFIG_REFERENCE --output $LIVE_RUN
+```
+
+The canonical config is a separate absolute reference outside the private run.
+The controller validates its path metadata without reading its contents. Native
+code selects the existing managed-auth owner; credentials are never staged or
+copied, and existing refresh/sign-out fencing remains authoritative. The manifest's
+config role stays synthetic and cannot contain credentials, auth paths, capture
+assets or service launch commands.
+
+The Windows controller asks the explicit WSL owner to reserve 12 calls using
+`reserve_live_budget` and the fixed `unified-app-bench-live-budget.json`. Windows
+cannot select `--ledger`. The existing assignment-wide ceiling remains 100,
+including legacy Linux reservations. The canonical ledger records each grant's
+digest; bounded grant/claim files live under `artifacts/windows-assignments/`.
+The Windows handoff contains a reference and binding, never a local allowance.
+The native claimant retains directory/file handles, rejects reparse points and
+hard-linked handoffs, checks current-user/SYSTEM private ACLs, and exclusively
+creates and flushes its local claim marker. It then runs the embedded WSL authority,
+which verifies the actual executable hash and durably claims the registered grant
+once in canonical WSL storage. Copying a handoff/run cannot replay a grant. A
+failure, crash or uncertain handoff burns the reservation; never remove markers
+or refund/recreate grants. Native actual sends still spend the allowance.
+
+Live arithmetic executes one admission. A successful schema-5 live report requires
+native counts `generation_attempts=1`, `spent=1`, `remaining=11`, valid existing DOM/
+native timing observations and completed local speech/Job retirement. Unused calls
+stay reserved. Failure reports preserve unknown live-call counts instead of
+inventing zero. Acoustics and the external shared service lifecycle remain
+`unverified`; WASAPI activation and local retirement do not establish audible
+output. No runtime or latency claim follows from a cross-build.
+
+Windows file/security semantics follow Microsoft's
+[CreateFile documentation](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew),
+[file access-control model](https://learn.microsoft.com/en-us/windows/win32/fileio/file-security-and-access-rights),
+and [GetSecurityInfo contract](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo).
+The native Windows ACL/hard-link regression uses the controller's same protected
+DACL fixture without an app, credentials, WSL claim or live-ledger access.

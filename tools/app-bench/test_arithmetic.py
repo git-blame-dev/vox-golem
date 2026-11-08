@@ -13,6 +13,30 @@ from test_fixtures import request, events
 
 
 class ArithmeticProfileTests(unittest.TestCase):
+    def test_live_arithmetic_requires_exact_source_free_canonical_and_ui_answer(self):
+        profile = fixtures.arithmetic_profile()
+        good = runner.answer_integrity('arithmetic', profile.answer, profile.answer,
+                                       [], False, [], profile)
+        self.assertTrue(good['canonical_sources_expected'])
+        self.assertTrue(good['sources_preserved'])
+        self.assertTrue(good['profile_answer_exact'])
+        self.assertFalse(good['offline_fixture_match'])
+        for answer in (profile.answer+'0', 'The answer is '+profile.answer,
+                       profile.answer+'\n\nSources:\n', ''):
+            bad = runner.answer_integrity('arithmetic', answer, answer, [], False, [], profile)
+            self.assertFalse(bad['profile_answer_exact'])
+            native = dict(events=[{'stage':stage} for stage in (
+                'prompt_admitted', 'generation_dispatched', 'canonical_turn_committed')], dropped=0)
+            checks = runner.typed_checks('arithmetic', bad, native, None, True,
+                                         {'inflight_text':True}, profile)
+            checks['completed_text_outcome'] = True
+            self.assertEqual(runner.typed_eligibility(checks), (False, False))
+        sources = [{'url': 'https://example.invalid/synthetic'}]
+        bad = runner.answer_integrity('arithmetic', profile.answer, profile.answer,
+                                      [sources[0]['url']], False, sources, profile)
+        self.assertFalse(bad['canonical_sources_expected'])
+        self.assertFalse(bad['sources_preserved'])
+
     def test_removed_profiles_and_model_option_reject_before_execution(self):
         base = ['runner.py', '--binary', 'synthetic-app', '--tools', 'synthetic-tools',
                 '--config', 'synthetic-config', '--output', 'synthetic-output']
