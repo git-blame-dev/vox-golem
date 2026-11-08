@@ -219,10 +219,7 @@ fn start_worker(app: &tauri::AppHandle, state: &AppState) {
     // Stop optional preparation before waiting for physical retirement. Its fixed
     // generation prevents remaining cues from entering ahead of this reply.
     if let Ok(runtime) = state.local_tts_runtime.lock() {
-        if let Some(runtime) = runtime
-            .as_ref()
-            .filter(|runtime| runtime.neural_client().is_some())
-        {
+        if let Some(runtime) = runtime.as_ref() {
             runtime.cancel_generation();
         }
     }
@@ -248,89 +245,18 @@ fn start_worker(app: &tauri::AppHandle, state: &AppState) {
             }
             return;
         };
-        let neural = state
+        let runtime = state
             .local_tts_runtime
             .lock()
             .ok()
-            .and_then(|runtime| runtime.clone())
-            .filter(|runtime| runtime.neural_client().is_some());
-        if let Some(runtime) = neural {
+            .and_then(|runtime| runtime.clone());
+        if let Some(runtime) = runtime {
             drain_neural(&app, &state, runtime);
-            latch.armed = false;
-            return;
+        } else {
+            stop_after_tracking_failure(&app, &state);
+            log_category(&state, super::diagnostics::TtsEvent::NativeReplyIncomplete);
         }
-        loop {
-            // Keep the request IN the replaceable slot while old physical work
-            // retires: taking it first would create a second pending request.
-            if !await_physical_retirement(&state) {
-                latch.armed = false;
-                stop_after_tracking_failure(&app, &state);
-                return;
-            }
-            let (request, playback_id) = {
-                let Ok(reply) = state.native_reply.lock() else {
-                    return;
-                };
-                let request = next_request(
-                    &reply,
-                    &state.native_speech_delivery,
-                    &state.native_speech_running,
-                );
-                let Some(request) = request else {
-                    latch.armed = false;
-                    publish(&app, &state);
-                    return;
-                };
-                let Ok(id) = state.tts_audio_playback.reserve(PlaybackPurpose::Speech) else {
-                    reject_admission(&state.native_speech_delivery, &request);
-                    log_category(&state, super::diagnostics::TtsEvent::NativeReplyIncomplete);
-                    publish(&app, &state);
-                    continue;
-                };
-                if super::register_tts_playback(&state.tts_playback, id).is_err() {
-                    let _ = state
-                        .tts_audio_playback
-                        .cancel_owned(id, PlaybackPurpose::Speech);
-                    reject_admission(&state.native_speech_delivery, &request);
-                    log_category(&state, super::diagnostics::TtsEvent::NativeReplyIncomplete);
-                    publish(&app, &state);
-                    continue;
-                }
-                publish(&app, &state);
-                (request, id)
-            };
-            let ticket = super::SpeechPlaybackTicket {
-                playback: state.tts_audio_playback.clone(),
-                playback_id,
-            };
-            // Parent helper must accept an already registered matching ticket and
-            // recheck this policy generation AFTER its async tts_operation_lock wait.
-            let result = tauri::async_runtime::block_on(super::speak_local_tts_from_state(
-                request.text.clone(),
-                playback_id,
-                &state,
-                Some(request.generation),
-            ));
-            {
-                let Ok(_reply) = state.native_reply.lock() else {
-                    return;
-                };
-                if let Ok(mut delivery) = state.native_speech_delivery.lock() {
-                    delivery.complete(request.generation, request.chunk_id);
-                }
-                drop(ticket);
-                let _ = super::finish_tts_playback_state(&state.tts_playback, playback_id);
-                // Read the current owner, never publish an old worker's cached idle.
-                publish(&app, &state);
-            }
-            if result.is_err() {
-                #[cfg(feature = "app-benchmark")]
-                super::app_benchmark::mark("reply_speech_failed");
-                log_category(&state, super::diagnostics::TtsEvent::NativeReplyIncomplete);
-            }
-            // A cancelled helper result is not physical native-engine completion.
-            // Keep this worker's update/work leases until the real call retires.
-        }
+        latch.armed = false;
     });
 }
 
@@ -382,18 +308,18 @@ fn drain_neural(
             (request, runtime.start_generation())
         };
         let Ok(playback_id) = state.tts_audio_playback.reserve(PlaybackPurpose::Speech) else {
-            if let Ok(mut delivery) = state.native_speech_delivery.lock() {
-                delivery.cancel();
-            }
+            reject_admission(&state.native_speech_delivery, &request);
+            log_category(state, super::diagnostics::TtsEvent::NativeReplyIncomplete);
+            publish(app, state);
             continue;
         };
         if super::register_tts_playback(&state.tts_playback, playback_id).is_err() {
             let _ = state
                 .tts_audio_playback
                 .cancel_owned(playback_id, PlaybackPurpose::Speech);
-            if let Ok(mut delivery) = state.native_speech_delivery.lock() {
-                delivery.cancel();
-            }
+            reject_admission(&state.native_speech_delivery, &request);
+            log_category(state, super::diagnostics::TtsEvent::NativeReplyIncomplete);
+            publish(app, state);
             continue;
         }
         let ticket = super::SpeechPlaybackTicket {

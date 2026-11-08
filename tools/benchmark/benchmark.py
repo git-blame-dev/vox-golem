@@ -412,13 +412,12 @@ def parser():
         p.add_argument('--' + name, type=Path, help='Desktop qualified lifecycle prerequisite')
     p.add_argument('--desktop-platform', choices=['linux', 'windows'])
     p.add_argument('--windows-manifest', type=Path)
-    p.add_argument('--tts-model', type=Path)
     p.add_argument('--wake-phrase')
     return p
 
 
 def reject_desktop_voice_options(args):
-    names = ('desktop_platform', 'windows_manifest', 'tts_model', 'wake_phrase')
+    names = ('desktop_platform', 'windows_manifest', 'wake_phrase')
     if (any(getattr(args, name, None) is not None for name in names) or
             getattr(args, 'explicit_options', set()) & {'--' + name.replace('_', '-') for name in names}):
         raise Blocked('desktop_voice_options_require_desktop_synthetic_voice')

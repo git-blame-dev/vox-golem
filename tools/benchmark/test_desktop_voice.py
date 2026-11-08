@@ -17,15 +17,29 @@ import voice_contract
 
 
 class DispatchTest(unittest.TestCase):
-    def test_desktop_voice_list_uses_shared_arithmetic_without_transport(self):
+    def test_retired_desktop_voice_list_is_unsupported_without_transport(self):
         stdout, stderr = io.StringIO(), io.StringIO()
         with patch('sys.argv', ['benchmark', '--platform', 'desktop', '--workload', 'synthetic-voice', '--list']), \
                 redirect_stdout(stdout), redirect_stderr(stderr), \
                 patch.object(benchmark.subprocess, 'Popen', side_effect=AssertionError('no transport')), \
                 patch.object(benchmark.subprocess, 'run', side_effect=AssertionError('no transport')):
             result = benchmark.main()
-        self.assertEqual(result, 0)
-        self.assertEqual(stdout.getvalue(), 'synthetic-voice-arithmetic arithmetic one-trial\n')
+        self.assertEqual(result, 2)
+        self.assertEqual(json.loads(stdout.getvalue())['status'], 'unsupported')
+        self.assertIn('retired', json.loads(stdout.getvalue())['failure_category'])
+
+    def test_retired_execution_fails_before_assets_or_transport(self):
+        args = benchmark.parser().parse_args(['--platform', 'desktop', '--workload', 'synthetic-voice'])
+        output = io.StringIO()
+        with patch.object(voice, 'authorize', side_effect=AssertionError('no asset access')), \
+                patch.object(voice, 'launch', side_effect=AssertionError('no transport')), redirect_stdout(output):
+            self.assertEqual(voice.main(args, SimpleNamespace()), 2)
+        self.assertIn('retired', json.loads(output.getvalue())['failure_category'])
+
+    def test_removed_tts_model_option_is_rejected(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            benchmark.parser().parse_args(['--platform', 'desktop', '--tts-model', '/synthetic/model'])
+        self.assertEqual(error.exception.code, 2)
 
     def test_typed_speech_list_requires_no_runtime_and_rejects_other_platforms(self):
         for platform, expected in (('desktop', 0), ('android', 1), ('wear', 1)):
@@ -38,21 +52,17 @@ class DispatchTest(unittest.TestCase):
                 self.assertEqual(stdout.getvalue(), 'typed-speech-windows arithmetic one-trial diagnostic\n')
 
 
-def report(platform='linux'):
-    windows = platform == 'windows'
-    value = {'schema':4 if windows else 3, 'mode':'offline',
-        'entry':'voice-arithmetic-windows' if windows else 'voice-arithmetic',
-        'requested_model':'custom-luna-none', 'diagnostic_only':windows, 'qualified_for_live':False,
-        'offline_profile_qualified':not windows,
-        'output_route':'wasapi-render-diagnostic' if windows else 'alsa-null-software',
-        'binary_sha256':'a' * 64, 'harness_sha256':'b' * 64,
-        'profile_identity':{'profile':'voice-arithmetic-windows-diagnostic-v1' if windows else 'voice-arithmetic-v1',
+def report(platform='windows'):
+    return {'schema':4, 'mode':'offline', 'entry':'typed-speech-windows',
+        'requested_model':'custom-luna-none', 'diagnostic_only':True, 'qualified_for_live':False,
+        'offline_profile_qualified':False, 'output_route':'wasapi-render-diagnostic',
+        'binary_sha256':'a'*64, 'harness_sha256':'b'*64,
+        'profile_identity':{'profile':'typed-speech-windows-diagnostic-v1',
                             'contract_sha256':voice_contract.contract_sha256()},
-        'cleanup':{'app_exit_before_group_termination_observed':True}}
-    if windows:
-        value.update(passed=False, workflow_completed=True, overall_status='unverified', private_storage_acl_verified=True)
-        value['cleanup']['owned_job_retired'] = True
-    return value
+        'cleanup':{'app_exit_before_group_termination_observed':True, 'owned_job_retired':True},
+        'passed':False, 'workflow_completed':True, 'overall_status':'unverified',
+        'private_storage_acl_verified':True, 'live_calls':0,
+        'external_shared_service_lifecycle':'unverified'}
 
 
 class DesktopVoiceTest(unittest.TestCase):
@@ -67,15 +77,15 @@ class DesktopVoiceTest(unittest.TestCase):
         self.python.parent.mkdir(parents=True)
         self.python.write_bytes(b'synthetic-interpreter-not-executed')
         self.common = SimpleNamespace(ROOT=self.checkout)
-        self.argv = ['--platform', 'desktop', '--workload', 'synthetic-voice', '--max-live-calls', '0',
+        self.argv = ['--platform', 'desktop', '--workload', 'typed-speech', '--desktop-platform', 'windows', '--windows-manifest', str(self.root/'manifest.json'), '--max-live-calls', '0',
             '--binary', str(self.root / 'synthetic-app'), '--tools', str(self.tools),
-            '--config', str(self.root / 'synthetic.toml'), '--tts-model', str(self.root / 'synthetic.onnx'),
-            '--wake-phrase', 'synthetic wake', '--output', str(self.root / 'fresh-run')]
+            '--config', str(self.root / 'synthetic.toml'),
+            '--output', str(self.root / 'fresh-run')]
 
     def args(self, extra=()):
         return benchmark.parser().parse_args(self.argv + list(extra))
 
-    def execute(self, args, platform='linux', value=None, code=None, error=None):
+    def execute(self, args, platform='windows', value=None, code=None, error=None):
         launches = []
         def child(argv, **kwargs):
             launches.append((argv, kwargs))
@@ -100,13 +110,7 @@ class DesktopVoiceTest(unittest.TestCase):
         return result, json.loads(stdout.getvalue()), launches
 
     def typed_args(self, extra=()):
-        argv = self.argv.copy()
-        for flag in ('--tts-model', '--wake-phrase'):
-            index = argv.index(flag)
-            del argv[index:index+2]
-        argv[argv.index('--workload')+1] = 'typed-speech'
-        return benchmark.parser().parse_args(argv + ['--desktop-platform', 'windows',
-            '--windows-manifest', str(self.root/'manifest.json')] + list(extra))
+        return self.args(extra)
 
     def test_typed_speech_dispatch_and_diagnostic_interpretation(self):
         value = report('windows')
@@ -126,30 +130,13 @@ class DesktopVoiceTest(unittest.TestCase):
                 voice.interpret(dict(value, **update), 1, 'windows', workload='typed-speech')
 
     def test_typed_speech_authorization_forbids_live_voice_assets_and_other_platforms(self):
-        for extra in (['--live'], ['--tts-model', '/synthetic/model'], ['--wake-phrase', 'synthetic'],
+        for extra in (['--live'], ['--wake-phrase', 'synthetic'],
                       ['--max-live-calls', '1'], ['--cases', 'arithmetic']):
             with patch.object(voice, 'native_platform', return_value='windows'), self.assertRaises(benchmark.Blocked):
                 voice.authorize(self.typed_args(extra))
         with patch.object(voice, 'native_platform', return_value='linux'), self.assertRaises(benchmark.Blocked):
             voice.authorize(self.typed_args(['--desktop-platform', 'linux']))
 
-    def test_linux_delegates_one_existing_offline_profile_without_live_gate(self):
-        result, summary, launches = self.execute(self.args())
-        self.assertEqual(result, 2)
-        self.assertEqual(summary['status'], 'unverified')
-        self.assertTrue(summary['offline_profile_qualified'])
-        self.assertFalse(summary['qualified_for_live'])
-        self.assertEqual(summary['live_admission_budget'], 0)
-        self.assertEqual(summary['fake_model_admission_budget'], 1)
-        self.assertEqual(len(launches), 1)
-        argv, kwargs = launches[0]
-        self.assertEqual(argv[0], str(self.python))
-        self.assertEqual(argv[1], str(self.checkout / 'tools/app-bench/runner.py'))
-        self.assertEqual(argv[argv.index('--entry') + 1], 'voice-arithmetic')
-        self.assertNotIn('--live', argv)
-        self.assertNotIn('--cases', argv)
-        self.assertEqual(kwargs['stdout'], subprocess.DEVNULL)
-        self.assertEqual(kwargs['stderr'], subprocess.DEVNULL)
 
     def test_windows_expected_diagnostic_exit_one_is_unverified_not_failure(self):
         args = self.args(['--desktop-platform', 'windows', '--windows-manifest', str(self.root / 'manifest.json')])
@@ -164,9 +151,9 @@ class DesktopVoiceTest(unittest.TestCase):
         self.assertIn('--windows-manifest', argv)
         self.assertIn('--desktop-platform', argv)
 
-    def test_failed_linux_child_keeps_validated_cleanup_and_bounded_failure_receipts(self):
+    def test_failed_typed_speech_child_keeps_validated_cleanup_and_bounded_failure_receipts(self):
         value = report()
-        value['offline_profile_qualified'] = False
+        value['workflow_completed'] = False
         value['cleanup'].update(app_exit_observed=True, forced_group_termination=False, webdriver_quit_error=False)
         value['rows'] = [{'case':'arithmetic', 'passed':False, 'failure':'flow_deadline',
             'ui_state':{'failure_categories':['not configured', 'synthetic-private-payload'], 'runtime_status':'sleeping'},
@@ -192,7 +179,7 @@ class DesktopVoiceTest(unittest.TestCase):
         self.assertEqual(summary['cleanup']['owned_job_retired'], True)
 
     def test_unexpected_exit_retains_only_self_reported_facts_not_root_completion(self):
-        for platform in ('linux', 'windows'):
+        for platform in ('windows',):
             with self.subTest(platform=platform):
                 evidence = {'workflow_completed':False}
                 with self.assertRaises(benchmark.Blocked):
@@ -216,18 +203,18 @@ class DesktopVoiceTest(unittest.TestCase):
             with self.subTest(keys=sorted(value)), self.assertRaises(benchmark.Blocked):
                 evidence = {}
                 try:
-                    voice.interpret(value, 1, 'linux', evidence=evidence)
+                    voice.interpret(value, 1, 'windows', evidence=evidence)
                 finally:
                     self.assertEqual(evidence, {})
 
     def test_missing_or_unknown_failure_receipts_do_not_infer_zero_or_export_content(self):
         value = report()
-        value['offline_profile_qualified'] = False
+        value['workflow_completed'] = False
         value['rows'] = [{'case':'arithmetic', 'failure':'synthetic-private-payload',
             'ui_state':{'failure_categories':['synthetic-private-payload'], 'runtime_status':'synthetic-private-payload'}}]
         evidence = {}
         with self.assertRaises(benchmark.Blocked):
-            voice.interpret(value, 1, 'linux', evidence=evidence)
+            voice.interpret(value, 1, 'windows', evidence=evidence)
         self.assertEqual(evidence['child_failure_receipts'], [])
         self.assertNotIn('synthetic-private-payload', json.dumps(evidence))
 
@@ -238,13 +225,13 @@ class DesktopVoiceTest(unittest.TestCase):
             ['--remote-adb', '/synthetic/adb'], ['--apk', '/synthetic/app.apk'], ['--helper-apk', '/synthetic/helper.apk'],
             ['--offline-evidence', '/synthetic/old.json'], ['--cases', 'arithmetic'], ['--wear-ui-probe'],
             ['--collect-stages'], ['--history-seed-turns', '1'], ['--port', '9223'], ['--turn-timeout', '180'],
-            ['--windows-manifest', '/synthetic/manifest.json'])
+            ['--wake-phrase', 'synthetic'])
         for extra in extras:
-            with self.subTest(extra=extra), patch.object(voice, 'native_platform', return_value='linux'):
+            with self.subTest(extra=extra), patch.object(voice, 'native_platform', return_value='windows'):
                 with self.assertRaises(benchmark.Blocked):
                     voice.authorize(self.args(extra))
         default_budget = benchmark.parser().parse_args([a for a in self.argv if a not in ('--max-live-calls', '0')])
-        with self.assertRaises(benchmark.Blocked):
+        with patch.object(voice, 'native_platform', return_value='windows'), self.assertRaises(benchmark.Blocked):
             voice.authorize(default_budget)
 
     def test_os_mismatch_no_implicit_wsl_to_windows_bridge(self):
@@ -257,14 +244,14 @@ class DesktopVoiceTest(unittest.TestCase):
 
     def test_child_crossprofile_tamper_unknown_text_and_unexpected_exit_fail_closed(self):
         for changes in ({'schema':1}, {'entry':'voice'}, {'qualified_for_live':True},
-                        {'passed':'synthetic-private-payload'}, {'offline_profile_qualified':False},
+                        {'passed':'synthetic-private-payload'}, {'offline_profile_qualified':True},
                         {'profile_identity':{'profile':'wrong', 'contract_sha256':'a' * 64}},
                         {'cleanup':{'app_exit_before_group_termination_observed':False}}):
             with self.subTest(changes=changes):
                 value = report()
                 value.update(changes)
                 with self.assertRaises(benchmark.Blocked):
-                    voice.interpret(value, 0, 'linux')
+                    voice.interpret(value, 1, 'windows')
         with self.assertRaises(benchmark.Blocked):
             voice.interpret(report('windows'), 0, 'windows')
         with self.assertRaises(benchmark.Blocked):
@@ -322,7 +309,7 @@ class DesktopVoiceTest(unittest.TestCase):
 
     def test_new_options_rejected_for_typed_and_phone_wear(self):
         import wear_voice
-        for option, value in (('--desktop-platform', 'linux'), ('--tts-model', '/synthetic/tts'),
+        for option, value in (('--desktop-platform', 'linux'),
                               ('--wake-phrase', 'synthetic'), ('--windows-manifest', '/synthetic/manifest')):
             args = benchmark.parser().parse_args(['--platform', 'desktop', option, value])
             with self.assertRaises(benchmark.Blocked):
@@ -334,6 +321,8 @@ class DesktopVoiceTest(unittest.TestCase):
         import windows_effects
         args = self.args(['--desktop-platform', 'windows', '--windows-manifest', str(self.root / 'manifest.json')])
         args._test_win32 = True
+        args.entry = 'typed-speech'
+        args.cases = ['arithmetic']
         manifest_path = self.root / 'manifest.json'
         manifest_path.write_text('{"native_source_sha256": "' + ('c' * 64) + '", "driver_versions": {}}')
         args.windows_manifest = manifest_path
@@ -343,17 +332,17 @@ class DesktopVoiceTest(unittest.TestCase):
         tauri_driver_path.write_bytes(b'tauri_driver')
         native_driver_path = self.root / 'native_driver.exe'
         native_driver_path.write_bytes(b'native_driver')
-        
+
         effects = windows_effects.WindowsEffects(args)
         effects.roles = {'binary': binary_path, 'tauri_driver': tauri_driver_path, 'native_driver': native_driver_path}
         effects.manifest = json.loads(manifest_path.read_text())
-        effects.profile_identity = {'profile': 'voice-arithmetic-windows-diagnostic-v1', 'contract_sha256': voice_contract.contract_sha256()}
+        effects.profile_identity = {'profile': 'typed-speech-windows-diagnostic-v1', 'contract_sha256': voice_contract.contract_sha256()}
         args.output.mkdir(mode=0o700)
         effects.run_owned = True
         effects.private_storage_verified = True
         effects.stage = 'windows_app_launch'
         effects.last_cleanup = {'owned_job_retired': True, 'app_exit_before_group_termination_observed': True}
-        
+
         class MockApi:
             __file__ = __file__
             @staticmethod
@@ -371,7 +360,7 @@ class DesktopVoiceTest(unittest.TestCase):
 
         error = SessionNotCreatedException()
         effects.failure_report(MockApi(), 'windows_app_launch', error)
-        
+
         report_data = voice.child_report(args.output)
         evidence = {}
         with self.assertRaises(benchmark.Blocked) as ctx:

@@ -1,4 +1,4 @@
-"""Offline arithmetic adapter to the existing desktop lifecycle owner, not a harness."""
+"""Neural typed-speech adapter to the existing Windows desktop lifecycle owner."""
 import importlib.util
 import json
 import os
@@ -33,19 +33,17 @@ def windows_python():
 
 
 def authorize(args):
+    if getattr(args, 'workload', None) != 'typed-speech':
+        raise Blocked('desktop_synthetic_voice_profile_retired_use_neural_typed_speech_windows')
     voice_contract.load_contract()
     if (args.platform != 'desktop' or args.live or args.max_live_calls != 0 or
             args.repetitions != 1 or args.model != 'custom-luna-none'):
         raise Blocked('desktop_voice_offline_zero_live_budget_required')
-    typed_speech = getattr(args, 'workload', None) == 'typed-speech'
-    if typed_speech and (getattr(args, 'tts_model', None) is not None or getattr(args, 'wake_phrase', None) is not None):
+    if getattr(args, 'wake_phrase', None) is not None:
         raise Blocked('typed_speech_forbids_voice_assets')
-    required = ('binary', 'tools', 'config') if typed_speech else ('binary', 'tools', 'config', 'tts_model', 'wake_phrase')
+    required = ('binary', 'tools', 'config')
     if any(getattr(args, name, None) is None for name in required):
         raise Blocked('desktop_voice_explicit_assets_required')
-    if not typed_speech and (not isinstance(args.wake_phrase, str) or not 1 <= len(args.wake_phrase.encode()) <= 128 or
-            any(ord(c) < 32 for c in args.wake_phrase)):
-        raise Blocked('desktop_voice_wake_phrase_invalid')
     if (any(getattr(args, name, None) is not None for name in
             ('device', 'adb', 'ssh', 'remote_adb', 'apk', 'helper_apk', 'offline_evidence', 'cases')) or
             args.allow_device or args.wear_ui_probe or args.collect_stages or
@@ -55,14 +53,12 @@ def authorize(args):
             {'--history-seed-turns', '--port', '--turn-timeout', '--build-variant'}):
         raise Blocked('desktop_voice_foreign_controls_unsupported')
     platform = getattr(args, 'desktop_platform', None) or native_platform()
-    if typed_speech and platform != 'windows':
+    if platform != 'windows':
         raise Blocked('typed_speech_requires_native_windows')
     if platform != native_platform():
         raise Blocked('desktop_voice_native_host_mismatch')
     if platform == 'windows' and getattr(args, 'windows_manifest', None) is None:
         raise Blocked('windows_staged_manifest_required')
-    if platform == 'linux' and getattr(args, 'windows_manifest', None) is not None:
-        raise Blocked('windows_manifest_requires_windows')
     return platform
 
 
@@ -81,16 +77,13 @@ def fresh_output(args, common):
 
 
 def command(args, common, platform, output):
-    interpreter = windows_python() if platform == 'windows' else str(args.tools / 'venv/bin/python')
+    interpreter = windows_python()
     if not Path(interpreter).is_file():
         raise Blocked('desktop_voice_existing_python_required')
     argv = [interpreter, str(common.ROOT / 'tools/app-bench/runner.py'), '--binary', str(args.binary),
         '--tools', str(args.tools), '--output', str(output), '--config', str(args.config),
-        '--entry', 'typed-speech' if getattr(args, 'workload', None) == 'typed-speech' else 'voice-arithmetic']
-    if getattr(args, 'workload', None) != 'typed-speech':
-        argv += ['--tts-model', str(args.tts_model), '--wake-phrase', args.wake_phrase]
-    if platform == 'windows':
-        argv += ['--desktop-platform', 'windows', '--windows-manifest', str(args.windows_manifest)]
+        '--entry', 'typed-speech']
+    argv += ['--desktop-platform', 'windows', '--windows-manifest', str(args.windows_manifest)]
     return argv
 
 
@@ -183,24 +176,25 @@ def failure_receipts(value):
     return receipts
 
 
-def interpret(value, code, platform, *, evidence=None, workload='synthetic-voice'):
+def interpret(value, code, platform, *, evidence=None, workload='typed-speech'):
     if type(code) is not int:
         raise Blocked('desktop_voice_child_exit_invalid')
     windows = platform == 'windows'
-    typed_speech = workload == 'typed-speech'
-    if typed_speech and not windows:
+    if workload != 'typed-speech':
+        raise Blocked('desktop_synthetic_voice_profile_retired_use_neural_typed_speech_windows')
+    if not windows:
         raise Blocked('typed_speech_requires_native_windows')
-    expected = {'schema':4 if windows else 3, 'mode':'offline',
-        'entry':('typed-speech-windows' if typed_speech else 'voice-arithmetic-windows') if windows else 'voice-arithmetic',
+    expected = {'schema':4, 'mode':'offline',
+        'entry':'typed-speech-windows',
         'requested_model':'custom-luna-none', 'qualified_for_live':False,
-        'diagnostic_only':windows, 'output_route':'wasapi-render-diagnostic' if windows else 'alsa-null-software'}
+        'diagnostic_only':windows, 'output_route':'wasapi-render-diagnostic'}
     if any(type(value.get(k)) is not type(v) or value.get(k) != v for k, v in expected.items()):
         raise Blocked('desktop_voice_child_profile_mismatch')
     identity = value.get('profile_identity')
     if (type(identity) is not dict or identity.get('contract_sha256') != voice_contract.contract_sha256() or
-            identity.get('profile') != (('typed-speech-windows-diagnostic-v1' if typed_speech else 'voice-arithmetic-windows-diagnostic-v1') if windows else 'voice-arithmetic-v1')):
+            identity.get('profile') != 'typed-speech-windows-diagnostic-v1'):
         raise Blocked('desktop_voice_child_contract_mismatch')
-    if typed_speech and (type(value.get('live_calls')) is not int or value['live_calls'] != 0 or
+    if (type(value.get('live_calls')) is not int or value['live_calls'] != 0 or
             value.get('external_shared_service_lifecycle') != 'unverified'):
         raise Blocked('typed_speech_child_lifecycle_or_live_mismatch')
     cleanup = value.get('cleanup')
@@ -259,25 +253,26 @@ def interpret(value, code, platform, *, evidence=None, workload='synthetic-voice
     # these receipts independently upgrades root workflow or native retirement.
     if evidence is not None:
         evidence.update(facts)
-    if code not in ((1,) if windows else (0, 1)):
+    if code != 1:
         raise Blocked('desktop_voice_unexpected_child_exit')
-    if windows:
-        if (value.get('passed') is not False or value.get('overall_status') != 'unverified' or
-                qualified is not False or value.get('workflow_completed') is not True or
-                cleanup.get('owned_job_retired') is not True or
-                value.get('private_storage_acl_verified') is not True):
-            raise Blocked('desktop_voice_windows_workflow_unverified')
-    elif code != 0 or qualified is not True or value.get('passed', True) is not True or value.get('workflow_completed', True) is not True:
-        raise Blocked('desktop_voice_linux_profile_unqualified')
+    if (value.get('passed') is not False or value.get('overall_status') != 'unverified' or
+            qualified is not False or value.get('workflow_completed') is not True or
+            cleanup.get('owned_job_retired') is not True or
+            value.get('private_storage_acl_verified') is not True):
+        raise Blocked('desktop_voice_windows_workflow_unverified')
     if cleanup.get('app_exit_before_group_termination_observed') is not True:
         raise Blocked('desktop_voice_child_retirement_unverified')
     return dict(facts, workflow_completed=True)
 
 
 def main(args, common):
+    if getattr(args, 'workload', None) != 'typed-speech':
+        print(json.dumps({'status':'unsupported', 'workflow_completed':False,
+            'failure_category':'desktop_synthetic_voice_profile_retired_use_neural_typed_speech_windows'}))
+        return 2
     if args.list:
         voice_contract.load_contract()
-        print('typed-speech-windows arithmetic one-trial diagnostic' if getattr(args, 'workload', None) == 'typed-speech' else 'synthetic-voice-arithmetic arithmetic one-trial')
+        print('typed-speech-windows arithmetic one-trial diagnostic')
         return 0
     summary = {'status':'fail', 'workflow_completed':False, 'qualified_for_live':False,
         'live_admission_budget':0, 'fake_model_admission_budget':1, 'cleanup':'unverified',

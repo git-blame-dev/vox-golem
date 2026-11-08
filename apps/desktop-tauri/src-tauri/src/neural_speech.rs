@@ -36,12 +36,7 @@ impl Session {
             generation,
             voice: runtime.selected_neural_voice().unwrap_or_default(),
             _work: runtime.track_neural_work(),
-            maximum_samples: runtime.sample_rate_hz() as usize
-                * state
-                    .runtime_config
-                    .as_ref()
-                    .map_or(300, |config| config.local_tts.max_duration_s)
-                    as usize,
+            maximum_samples: runtime.maximum_samples(),
             runtime,
             output: Arc::new(Mutex::new(None)),
             sample_rate: Arc::new(AtomicU32::new(0)),
@@ -61,10 +56,7 @@ impl Session {
     /// Completion here acknowledges delivered PCM, not audible completion. The
     /// adapter retains the output session/update lease through finish/drain.
     pub(super) async fn append(&self, text: &str) -> Result<(), String> {
-        let client = self
-            .runtime
-            .neural_client()
-            .ok_or("Neural TTS runtime unavailable")?;
+        let client = self.runtime.neural_client();
         let (cancellation, _) = self.runtime.neural_request(self.generation)?;
         #[cfg(feature = "app-benchmark")]
         if self.reply {

@@ -24,9 +24,8 @@ Custom Responses streaming and MCP tools, canonical settlement, correlated UI
 completion, context and cancellation. The `typed` workflow profile excludes
 capture; the separate `voice` entry additionally exercises synthetic raw capture
 and real wake detection/VAD/Parakeet. Neither legacy profile certifies physical audio,
-phone/Wear, Windows or acoustic output. The new `voice-arithmetic` profile below
-adds real local reply synthesis/backend output handling; it does not change those
-legacy profiles or their qualification evidence.
+phone/Wear, Windows or acoustic output. Neural reply speech is covered by the separate Windows
+`typed-speech` diagnostic below. Legacy profiles do not enable reply TTS.
 
 ## Coverage and current status
 
@@ -34,7 +33,7 @@ The opt-in Rust `app-benchmark` feature replaces only hardware input. It feeds t
 existing bounded capture worker before downmixing/resampling/framing. CPAL device
 negotiation, sample-format conversion, OS microphone permission, acoustic input,
 Windows, Android and Wear are **not** established by the legacy Linux software-input
-qualification. The Windows arithmetic diagnostic below has its own narrower evidence.
+qualification. The Windows Neural typed-speech diagnostic below has its own narrower evidence.
 Capture emits continuous silence between real-time fixture clips. A returned
 start acknowledgement is not a received sample or a completed utterance.
 
@@ -126,189 +125,19 @@ measure DOM submission, not painted pixels. `--extended` adds real UI-seeded war
 and longer canonical histories, duplicate/empty submission, Stop/cancellation,
 retirement and relaunch checks. It is prohibited for live execution.
 
-## Shared arithmetic voice: Linux offline and native Windows diagnostic
+## Retired desktop arithmetic voice profiles
 
-Use `tools/benchmark/benchmark.py --platform desktop --workload synthetic-voice`
-as the common entry; complete variable-based recipes are in
-`tools/benchmark/README.md`. It delegates to this runner rather than implementing
-another audio/UI lifecycle. No runtime acceptance is asserted by these recipes.
-Record actual platform disposition separately in the outer benchmark history.
+`voice-arithmetic` (Linux) and `voice-arithmetic-windows` are retired. Their
+Piper model/adjacent JSON, private eSpeak staging, schema-1 Windows manifests and
+CPU/CUDA output qualification are no longer supported. `--tts-model` is removed.
+Historical schema-3 Linux and schema-4 Windows reports retain their original
+meaning; they do not qualify Neural synthesis or the `typed-speech` diagnostic.
+The generic `typed`, `voice` and `typed-control` profiles and their same-binary
+offline qualification/live-budget gates remain unchanged. CLI `espeak-ng` fixture
+generation remains required for synthetic voice input in the legacy voice lane.
 
-`fixtures.arithmetic_profile()` loads the authoritative spoken metadata and exact
-answer from `tools/benchmark/voice_contract.py` / `scenarios.json`; there is no
-second arithmetic question catalog. The real synthetic capture path still traverses
-wake detection, VAD and Parakeet, ordinary native voice admission, streaming model
-response, correlated canonical/UI settlement, Piper synthesis and native output.
-No transcript injection, wake bypass or direct engine submission substitutes for it.
-
-Arithmetic reports include `profile_identity.implementation_sha256` for the actual
-imported shared matcher, normalizer and production scenario-parser implementation.
-It is separate from canonical contract-data, fixture, native binary/source and
-runner harness identities. Linux reports and Windows annotations/early failure
-reports carry the same field. Legacy harness/live-qualification rules are unchanged;
-older reports without this field do not identify those imported implementation bytes.
-
-### Linux: private ALSA null output
-
-Use the optimized `app-benchmark` build above and already approved local tools and
-assets. Supply the **actual configured** wake phrase and explicit Piper ONNX model;
-do not assume the generator's legacy default phrase matches the wake model. The
-adjacent `<model>.onnx.json` is also hashed. The current profile configures 22050 Hz:
-verify that the actual model JSON declares that sample rate. Do not tune the model,
-wake threshold or silence policy merely to force a pass. Record CPU/CUDA provider
-selection and fallback as observed; a missing CUDA library is not permission to
-install GPU packages or change the host.
-
-The approved `alsa-null-software` route uses a private ALSA null configuration,
-real Piper synthesis and rodio/backend handling. The namespace does not expose
-`/dev/snd`; host Pulse/PipeWire sockets are masked and inherited audio overrides
-are removed. Do not bind host Pulse/PipeWire/JACK transports or substitute speaker
-output. Null completion is software evidence, not acoustic output, speaker timing
-or a security certification. Source configuration supplies existing speech asset
-locations; ordinary config/secrets must not be exported into reports.
-
-For the repository's supported Hey LiveKit test profile, pair the explicit
-`--wake-phrase "hey livekit"` with
-`apps/desktop-tauri/src-tauri/tests/fixtures/hey_livekit.onnx` (SHA256
-`e773490192400f19a9840acb909c2afc43f99f08ca6ae43552e582deea2cb560`).
-This is the LiveKit Rust SDK test classifier; it is not interchangeable with the
-hello-wakeword example classifier. The framed production-model test uses `0.68`.
-Select this profile through a private speech-only source configuration, not by
-changing ordinary application preferences. The runner does not infer phrase/model
-compatibility: record both identities and generate a new matching fixture rather
-than relabeling PCM produced for another wake phrase. A test operating point is
-not accuracy, false-activation or full-app acceptance evidence.
-
-For focused direct qualification through the same authoritative child (the shared
-entry is preferred for cross-platform orchestration):
-
-```sh
-"$BENCH_TOOLS/venv/bin/python" tools/app-bench/runner.py \
-  --binary "$BINARY" --tools "$BENCH_TOOLS" --config "$SOURCE_CONFIG" \
-  --output "$FRESH_RUN" --entry voice-arithmetic \
-  --tts-model "$TTS_MODEL" --wake-phrase "$SYNTHETIC_WAKE_PHRASE"
-```
-
-The output must be fresh and outside Git. This one-case profile uses zero live
-provider admissions and one fake-model admission, not the legacy three-case matrix.
-Native synthesis-valid, submitted, completed, failed and retired counters are
-checked separately; idle alone is insufficient. Schema 3 reports
-`offline_profile_qualified` and always `qualified_for_live=false`. Child exit 0
-means this offline profile qualified. The shared wrapper intentionally returns
-overall **unverified / exit 2**, not physical/acoustic acceptance. Current Linux
-child JSON lacks top-level `passed`/`workflow_completed`; its stdout `passed` and
-qualification/cleanup fields must not be confused with missing JSON evidence.
-
-Rejected arithmetic requests may include
-`rows[].service_metadata.rejection_diagnostics`: fixed shape enums, bounded
-message/part/token counts, a zero-based first mismatch index and a categorical
-comparison result. No rejected text, tokens or token hashes are retained.
-`first_mismatch_index=-1` means normalized text matches; `-2` means unavailable.
-`analysis=bounded` means counts may be partial/capped and `mismatch=unknown`;
-it is not a full-request comparison. `mismatch=match` concerns only normalized
-prompt text, not model/history/other contract validation. These fields do not
-relax the shared oracle or identify the rejected words, and older reports cannot
-be retroactively diagnosed from their match boolean.
-
-### Windows: stage on Linux, execute with native private Python
-
-Build with existing Linux cross-build prerequisites, without a Windows CI runner:
-
-```sh
-make pc-benchmark
-```
-
-This target uses `cargo-xwin`, `app-benchmark`, the frontend benchmark flag and
-private identifier `dev.gitblame.voxgolem.benchmark`; output is isolated under
-`target/app-benchmark-windows/<Windows-target>/release/vox-golem.exe`. Stage a copy
-outside Git. Do not run `pc-dist` over a staged benchmark EXE or replace it with an
-ordinary application binary. Preserve the actual builder/source record alongside
-the EXE identity; a declared source hash alone cannot prove how an EXE was built.
-
-Windows needs an explicitly staged checkout/controller and complete local bundle:
-matching DLLs, all model/config/espeak assets, the arithmetic PCM generated by
-`generate_fixtures(..., profile=arithmetic_profile())`, and the code/harness used to
-interpret them. The schema-1 manifest must bind the contract, private application
-ID, `native_source_sha256`, per-file SHA-256 values and exactly these ten roles:
-`binary`, `tauri_driver`, `native_driver`, `config`, `fixture`,
-`wake_word_model_path`, `silero_vad_model`, `parakeet_model_dir`, `tts_model`,
-`espeak_data_dir`. Include adjacent Piper JSON, all speech-directory files and
-every file beside app/driver executables; undeclared load-affecting files fail.
-Use a synthetic speech-only source config, not a copied credential-bearing config.
-Keep the private Python venv outside the app/driver directories.
-
-The existing validator pins Tauri driver 2.1.0 and requires declared EdgeDriver and
-WebView versions to agree in their first three version components. Actual file
-hashes, native-driver identity and runtime compatibility still require explicit
-evidence. Do not silently install global tools, change PATH/registry/firewall, or
-claim private Windows storage/Job isolation equals Linux network namespaces.
-The manifest is bounded to 256 KiB and at most 4096 file entries. Validate the
-staged manifest through production code, not a copied check list:
-
-```powershell
-& $PRIVATE_PYTHON -c "import sys; sys.path.insert(0, 'tools/app-bench'); from pathlib import Path; from fixtures import arithmetic_profile; from windows_effects import load_manifest; load_manifest(Path(sys.argv[1]), arithmetic_profile())" $WINDOWS_MANIFEST
-```
-
-Run on **native Windows** using the already approved private venv with Selenium,
-from the staged checkout. The shared entry requires `--max-live-calls 0`,
-`--desktop-platform windows` and `--windows-manifest`; its `--tools` argument is
-the driver bundle, not the Python venv. The equivalent direct child command is:
-
-```powershell
-& $PRIVATE_PYTHON tools/app-bench/runner.py --desktop-platform windows `
-  --windows-manifest $WINDOWS_MANIFEST --entry voice-arithmetic `
-  --binary $BINARY --tools $WINDOWS_DRIVERS --config $SOURCE_CONFIG `
-  --tts-model $TTS_MODEL --wake-phrase $SYNTHETIC_WAKE_PHRASE --output $FRESH_RUN
-```
-
-Its parent artifact directory must already exist. The child owns private DACL
-verification, fresh app/WebView storage, executable creation identity and a
-kill-on-close Windows Job. No Unix chmod substitute or WSL bridge establishes
-those properties. It preserves private profiles for inspection; forced Job
-retirement is distinct from graceful app exit and does not certify every resource.
-
-Windows failure reports include `session_creation_cause`, a conservative fixed
-category derived in memory from explicit known session-creation driver statements:
-`version_mismatch`, `unsupported_capability`, `application_launch_failed`,
-`webview_attach_timeout`, or `unknown`. Missing, oversized, ambiguous or unrecognized
-messages remain unknown; raw messages/paths/endpoints are not retained. A category
-describes a driver statement, not independent proof of its underlying cause.
-Older failures that retained only an exception class cannot be retroactively
-classified.
-
-Schema 4 remains `diagnostic_only=true`, `passed=false`,
-`offline_profile_qualified=false`, `qualified_for_live=false`,
-`overall_status=unverified`, with `workflow_completed` and cleanup reported
-separately. **Direct child exit 1 is expected even when that diagnostic completes.**
-The shared wrapper maps only a valid completed diagnostic with owned cleanup to
-unverified / exit 2; it does not discard the child report or promote it to Linux
-qualification. `wasapi-render-diagnostic` is not audible/speaker acceptance;
-network containment, hardware isolation and breakaway-process coverage remain
-explicitly unverified. No live run or security certification follows from this report.
-
-### Budgets, evidence and cleanup
-
-Both arithmetic profiles reject live operation in CLI/environment/native admission
-guards. They do not spend, reset or qualify the legacy fixed-12 ledger. No automatic
-retry, model sweep, fixture retuning or extra trial follows failure. Real runtime
-verification must follow the separately authorized Android → Linux → Windows order.
-
-Retain binary/harness/contract, actual PCM, wake/STT assets, TTS ONNX/JSON and actual
-provider/route identities with build, repetition and instrumentation conditions.
-Do not export raw audio, transcripts, prompts, answers, tokens, endpoints, secrets
-or provider bodies. Fixture generation/setup, native monotonic intervals and
-WebView/host observations are separate clock/input domains. Never subtract
-unrelated clocks or compare null-output, WASAPI diagnostic, Wear and phone timings
-as matched acoustic or cold-start baselines. Fake tests do not prove physical
-acceptance; TTS callbacks and DOM observation do not prove sound or painted pixels.
-
-The child owns marked metadata retention: at most 90 days, 128 files and 8 MiB per
-collection. The common wrapper refuses a child report over 128 KiB; do not infer
-that this is a per-file limit enforced by the child's `private_json` writer.
-Generated fixture bundles are separately capped at 16 MiB/run. Metadata pruning
-does not erase private profiles, fixtures, credentials or ledgers; keep those
-artifacts outside Git and arrange their separately authorized lifecycle rather
-than assuming report pruning bounds all run-directory storage.
+Use the schema-2 Windows Neural `typed-speech` diagnostic below for typed reply
+speech. It is not a replacement qualification for the retired capture profiles.
 
 ## Offline native-observer hold diagnostic (legacy voice)
 
@@ -441,8 +270,8 @@ must not expose synthetic input commands or depend on these tools.
 `--entry typed-speech --desktop-platform windows` is a separate offline diagnostic.
 It runs exactly one `fixtures.arithmetic_profile()` prompt through the normal UI
 composer and the existing typed observer, with one fake-model admission and zero
-live model calls. It does not load wake/VAD/ASR/PCM/Piper assets. Legacy `typed`,
-`voice-arithmetic`, schema-1 staging and live qualification/budget rules are unchanged.
+live model calls. It does not load wake/VAD/ASR/PCM assets. Legacy `typed`, `voice` and
+`typed-control` live qualification/budget rules are unchanged.
 
 Use native Windows private Python with existing Selenium and the existing Windows
 Job/private-DACL/fresh-profile/retained application creation-identity protections.
@@ -469,7 +298,6 @@ synthetic voice with an explicitly selected public voice ID in the descriptor):
 
 ```toml
 [tts]
-provider = "neural"
 endpoint = "http://127.0.0.1:19765"
 voice = "synthetic-a"
 start_command = []

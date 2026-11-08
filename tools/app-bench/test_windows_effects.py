@@ -1,5 +1,4 @@
 import ctypes
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -95,8 +94,8 @@ class WindowsEffectsTests(unittest.TestCase):
             (run/'config').mkdir()
             (run/'config/config.toml').write_text('synthetic = true')
             (run/'synthetic.exe').write_bytes(b'synthetic')
-            args = SimpleNamespace(entry='voice-arithmetic', live=False, cases=['arithmetic'],
-                tts_model=run/'tts.onnx', binary=run/'synthetic.exe', output=run,
+            args = SimpleNamespace(entry='typed-speech', live=False, cases=['arithmetic'],
+                _test_win32=True, windows_manifest=run/'manifest.json', binary=run/'synthetic.exe', output=run,
                 driver_free_diagnostic=False, hold_native_observer=False, event_loop_diagnostic=False,
                 wake_diagnostics=False, poll_interval=0.1, flow_timeout=10)
             effects = windows.WindowsEffects.__new__(windows.WindowsEffects)
@@ -125,11 +124,11 @@ class WindowsEffectsTests(unittest.TestCase):
                     patch.object(runner, 'can_connect', return_value=True), \
                     patch.object(runner, 'FakeServices', return_value=service), \
                     patch.object(runner, 'APP_PID', None), \
-                    patch.object(runner, 'exercise', return_value={'passed': True, 'tts_actual_provider': 'cpu'}) as exercise, \
+                    patch.object(runner, 'exercise_typed', return_value={'passed': True, 'workflow_completed': True, 'checks': {}, 'speech_identity': {}}) as exercise, \
                     patch.object(runner, 'private_json') as reports, patch.object(runner, 'prune_owned_reports'), \
                     patch('builtins.print'):
                 self.assertEqual(runner.execute(args, platform), 1)
-                exercise.assert_not_called()
+                exercise.assert_called_once()
                 self.assertNotIn('process_id', json.dumps(reports.call_args.args[1]))
             self.assertEqual(observed['tauri:options'], {'application': 'synthetic-owned.exe'})
             self.assertEqual(observed['browserName'], 'wry')
@@ -138,11 +137,8 @@ class WindowsEffectsTests(unittest.TestCase):
 
     def staged_bundle(self, root):
         roles = dict(binary='app/vox-golem.exe', tauri_driver='drivers/tauri-driver.exe',
-            native_driver='drivers/msedgedriver.exe', config='speech.toml',
-            fixture='fixtures/arithmetic.pcm', wake_word_model_path='assets/wake.onnx',
-            silero_vad_model='assets/vad.onnx', parakeet_model_dir='assets/asr',
-            tts_model='assets/tts.onnx', espeak_data_dir='assets/espeak-ng-data')
-        for name in ('app', 'drivers', 'fixtures', 'assets', 'assets/asr', 'assets/espeak-ng-data'):
+            native_driver='drivers/msedgedriver.exe', config='speech.toml')
+        for name in ('app', 'drivers'):
             (root/name).mkdir(exist_ok=True)
         pe = bytearray(128)
         pe[:2] = b'MZ'
@@ -152,21 +148,11 @@ class WindowsEffectsTests(unittest.TestCase):
         struct.pack_into('<H', pe, 88, 0x20b)
         for role in ('binary', 'tauri_driver', 'native_driver'):
             (root/roles[role]).write_bytes(pe+runner.CAPABILITY)
-        for name in ('assets/wake.onnx', 'assets/vad.onnx', 'assets/asr/synthetic.onnx',
-                     'assets/tts.onnx', 'assets/espeak-ng-data/synthetic-data'):
-            (root/name).write_bytes(b'synthetic')
-        (root/'assets/tts.onnx.json').write_text('{}')
-        (root/'speech.toml').write_text('\n'.join(f'{key}={json.dumps(roles[key])}' for key in
-            ('wake_word_model_path', 'silero_vad_model', 'parakeet_model_dir')))
-        pcm = root/roles['fixture']
-        pcm.write_bytes(struct.pack('<4f', 0, 0.1, 0.2, 0))
-        metadata = dict(byte_count=16, sample_count=4, duration_seconds=4/16000,
-            wake_end_sample=1, question_start_sample=2, question_end_sample=4,
-            sha256=windows.file_hash(pcm))
-        value = dict(schema=1, contract_sha256=arithmetic_profile().contract_sha256,
+        (root/'speech.toml').write_text('[tts]\nendpoint="http://127.0.0.1:19765"\nvoice="synthetic-a"\nstart_command=[]\n')
+        value = dict(schema=2, entry='typed-speech-windows', contract_sha256=arithmetic_profile().contract_sha256,
             application_id='dev.gitblame.voxgolem.benchmark', native_source_sha256='a'*64,
             driver_versions=dict(tauri='2.1.0', edge='155.0.4283.62', webview='155.0.4283.45'),
-            roles=roles, fixture_metadata={'arithmetic': metadata},
+            roles=roles,
             files={file.relative_to(root).as_posix(): windows.file_hash(file)
                    for file in root.rglob('*') if file.is_file()})
         path = root/'manifest.json'
@@ -175,7 +161,7 @@ class WindowsEffectsTests(unittest.TestCase):
 
     def test_wrong_host_and_live_never_launch(self):
         for host, live in [('linux', False), ('win32', True)]:
-            args = SimpleNamespace(live=live, entry='voice-arithmetic')
+            args = SimpleNamespace(live=live, entry='typed-speech')
             with self.assertRaises(ValueError):
                 windows.validate_options(args, host)
 
@@ -186,12 +172,13 @@ class WindowsEffectsTests(unittest.TestCase):
             roles = value['roles']
             effects = windows.WindowsEffects.__new__(windows.WindowsEffects)
             effects.args = SimpleNamespace(windows_manifest=manifest, binary=root/roles['binary'],
-                config=root/roles['config'], tts_model=root/roles['tts_model'],
+                config=root/roles['config'],
                 tools=(root/roles['tauri_driver']).parent, output=root/'run')
             effects.private_storage_verified = effects.app_observed = False
             profile = arithmetic_profile()
             with patch.object(windows, 'private_directory', side_effect=lambda path: path.mkdir()), \
-                    patch.object(windows, 'verify_native_driver_version', return_value='155.0.4283.62'):
+                    patch.object(windows, 'verify_native_driver_version', return_value='155.0.4283.62'), \
+                    patch.object(windows, 'probe_neural_service', return_value={}):
                 _, _, identity = effects.prepare(profile, SimpleNamespace(**vars(runner)))
             self.assertEqual(identity['implementation_sha256'], profile.implementation_sha256)
             summary = {'profile_identity': identity, 'rows': [], 'cleanup': {}}
@@ -257,61 +244,17 @@ class WindowsEffectsTests(unittest.TestCase):
         self.assertEqual(windows.application_capability(Path('synthetic.exe')),
                          {'application': str(Path('synthetic.exe').resolve())})
 
-    def test_staged_asset_hashes_and_pcm_metadata_are_verified(self):
+    def test_staged_artifact_hashes_are_verified(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             path, value = self.staged_bundle(root)
             loaded, roles = windows.load_manifest(path, arithmetic_profile())
-            self.assertEqual(loaded['fixture_metadata'], value['fixture_metadata'])
-            (root/'assets/tts.onnx.json').write_text('{"changed":true}')
+            self.assertEqual(loaded['roles'], value['roles'])
+            (root/'speech.toml').write_text('synthetic_tamper=true')
             with self.assertRaises(ValueError):
                 windows.load_manifest(path, arithmetic_profile())
 
-    def test_declared_espeak_assets_reach_shipping_strict_private_appdata_layout(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            manifest_path, manifest = self.staged_bundle(root)
-            args = SimpleNamespace(windows_manifest=manifest_path, output=root/'run',
-                binary=root/manifest['roles']['binary'], config=root/manifest['roles']['config'],
-                tts_model=root/manifest['roles']['tts_model'], tools=root/'drivers')
-            effects = windows.WindowsEffects.__new__(windows.WindowsEffects)
-            effects.args = args
-            def owned_directory(path, create=True):
-                if create:
-                    path.mkdir()
-            with patch.object(windows, 'private_directory', side_effect=owned_directory), \
-                    patch.object(windows, 'verify_native_driver_version', return_value='155.0.4283.62'), \
-                    patch.dict(os.environ, {'SystemRoot': str(root/'synthetic-system'),
-                        'APPDATA': str(root/'forbidden-host-appdata')}, clear=True):
-                _, _, identity = effects.prepare(arithmetic_profile(), runner)
-                env = effects.environment('http://127.0.0.1:32123/responses', runner)
-            # This is the shipping Rust resolver's exact directory contract, not
-            # the former staged-model-adjacent override that Windows replaces.
-            strict_root = Path(env['APPDATA'])/'VoxGolem/models/tts'
-            copied = strict_root/'espeak-ng-data/synthetic-data'
-            self.assertTrue(copied.is_file())
-            self.assertEqual(windows.file_hash(copied), manifest['files']['assets/espeak-ng-data/synthetic-data'])
-            self.assertEqual(Path(env['PIPER_ESPEAKNG_DATA_DIRECTORY']), strict_root)
-            self.assertTrue(strict_root.is_relative_to(args.output))
-            self.assertIn('espeak_copy_sha256', identity)
-            expected = {'synthetic-data': manifest['files']['assets/espeak-ng-data/synthetic-data']}
-            self.assertEqual(identity['espeak_copy_sha256'], hashlib.sha256(json.dumps(
-                expected, sort_keys=True, separators=(',', ':')).encode()).hexdigest())
-            self.assertFalse((root/'forbidden-host-appdata').exists())
 
-    def test_private_espeak_copy_tampering_blocks_before_launch(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            _, manifest = self.staged_bundle(root)
-            run = root/'run'
-            (run/'appdata').mkdir(parents=True)
-            original = windows.shutil.copyfile
-            def corrupt(source, destination):
-                original(source, destination)
-                Path(destination).write_bytes(b'synthetic-corrupted-copy')
-            with patch.object(windows.shutil, 'copyfile', side_effect=corrupt):
-                with self.assertRaisesRegex(ValueError, 'does not match declared identity'):
-                    windows.stage_private_espeak(run, root/'assets/espeak-ng-data', manifest)
 
     def test_missing_retained_pid_never_opens_a_process(self):
         effects = windows.WindowsEffects.__new__(windows.WindowsEffects)
@@ -322,14 +265,12 @@ class WindowsEffectsTests(unittest.TestCase):
                 effects.observe_app(pid)
 
     def test_unlisted_dll_and_raw_fixture_metadata_block_admission(self):
-        for change in ('dll', 'metadata', 'version', 'config'):
+        for change in ('dll', 'version', 'config'):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 path, value = self.staged_bundle(root)
                 if change == 'dll':
                     (root/'app/foreign.dll').write_bytes(b'synthetic')
-                elif change == 'metadata':
-                    value['fixture_metadata']['arithmetic']['raw_text'] = 'synthetic-forbidden-field'
                 elif change == 'version':
                     value['driver_versions']['edge'] = '154.0.4283.62'
                 else:
@@ -358,7 +299,7 @@ class WindowsEffectsTests(unittest.TestCase):
             self.assertEqual(report['os_network_containment'], 'unverified')
             evidence = path.parent/'report.json'
             evidence.write_text(json.dumps(report))
-            for entry in ('voice', 'typed', 'voice-arithmetic', 'voice-arithmetic-windows'):
+            for entry in ('voice', 'typed', 'voice-arithmetic', 'typed-speech-windows'):
                 with self.assertRaises(ValueError):
                     runner.validate_offline_evidence(evidence, effects.roles['binary'], {}, {}, entry)
 
@@ -386,7 +327,7 @@ class WindowsEffectsTests(unittest.TestCase):
             self.assertNotIn('ORT_DYLIB_PATH', env)
             self.assertNotIn('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', env)
             self.assertNotIn('ALSA_CONFIG_PATH', env)
-            self.assertEqual(env['VOXGOLEM_BENCH_ENTRY'], 'voice-arithmetic-windows')
+            self.assertEqual(env['VOXGOLEM_BENCH_ENTRY'], 'typed-speech-windows')
 
     def test_x64_windows_sdk_structure_layouts(self):
         if ctypes.sizeof(ctypes.c_void_p) != 8:
@@ -406,7 +347,8 @@ class WindowsEffectsTests(unittest.TestCase):
             self.assertFalse(target.exists())
 
     def test_actual_edge_file_version_must_match_manifest(self):
-        with patch.object(windows, 'powershell', return_value='155.0.4283.62'):
+        with patch.object(windows, 'powershell', return_value='155.0.4283.62'), \
+                    patch.object(windows, 'probe_neural_service', return_value={}):
             self.assertEqual(windows.verify_native_driver_version(Path('synthetic.exe'), '155.0.4283.62'),
                              '155.0.4283.62')
             with self.assertRaises(ValueError):

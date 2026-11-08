@@ -12,9 +12,6 @@ const DEFAULT_SILERO_VAD_MODEL: &str = "models/silero-vad.onnx";
 const DEFAULT_INITIAL_SILENCE_TIMEOUT_MS: u64 = 2_500;
 const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 750;
 const DEFAULT_WAKE_WORD_DETECTION_THRESHOLD: f32 = 0.68;
-const DEFAULT_TTS_WORKER_COUNT: usize = 1;
-const DEFAULT_TTS_MAX_QUEUE: usize = 8;
-const DEFAULT_TTS_SAMPLE_RATE_HZ: u32 = 22_050;
 const DEFAULT_TTS_MAX_DURATION_S: u64 = 300;
 const DEFAULT_TTS_OUTPUT_GAIN_DB: f32 = 3.0;
 const DEFAULT_TELEMETRY_MAX_BYTES: usize = 10 * 1024 * 1024;
@@ -25,36 +22,24 @@ const MIN_TTS_OUTPUT_GAIN_DB: f32 = -24.0;
 const MAX_TTS_OUTPUT_GAIN_DB: f32 = 24.0;
 const MAX_JS_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
 
-pub const MIN_TTS_WORKER_COUNT: usize = 1;
-pub const MAX_TTS_WORKER_COUNT: usize = 2;
-pub const MIN_TTS_MAX_QUEUE: usize = 1;
-pub const MAX_TTS_MAX_QUEUE: usize = 16;
 pub const MIN_TTS_MAX_DURATION_S: u64 = 1;
 pub const MAX_TTS_MAX_DURATION_S: u64 = 360;
-/// Maximum size in bytes of a single synthesized TTS audio buffer copied into Rust memory
-/// after ONNX inference. Native ONNX Runtime tensor allocation and total retained process
-/// memory are not bounded by this per-result post-inference copy check.
+/// Maximum size in bytes of a single synthesized TTS audio buffer retained by the client.
+/// This per-result bound does not bound service inference memory or total process memory.
 pub const MAX_TTS_RESULT_BYTES: usize = 64 * 1024 * 1024;
-/// Maximum number of `f32` PCM samples in a single synthesized TTS audio buffer copied into
-/// Rust memory after ONNX inference (`16,777,216` samples / `64 MiB`).
+/// Maximum number of `f32` PCM samples in a single synthesized TTS audio buffer
+/// (`16,777,216` samples / `64 MiB`), independent of the duration budget.
 pub const MAX_TTS_RESULT_SAMPLES: usize = MAX_TTS_RESULT_BYTES / std::mem::size_of::<f32>();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ValidatedTtsResourceLimits {
-    pub worker_count: usize,
-    pub max_queue: usize,
+pub struct ValidatedTtsAudioLimits {
     pub sample_rate_hz: u32,
-    pub max_duration_s: u64,
     pub max_duration_ms: u64,
     pub max_duration_samples: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TtsResourceValidationError {
-    WorkerCountZero,
-    WorkerCountOutOfRange { min: usize, max: usize },
-    MaxQueueZero,
-    MaxQueueOutOfRange { min: usize, max: usize },
     SampleRateZero,
     MaxDurationZero,
     MaxDurationOutOfRange { min: u64, max: u64 },
@@ -64,14 +49,6 @@ pub enum TtsResourceValidationError {
 impl TtsResourceValidationError {
     pub fn format_with_prefix(&self, prefix: &str) -> String {
         match self {
-            Self::WorkerCountZero => format!("{prefix}worker_count must be greater than zero"),
-            Self::WorkerCountOutOfRange { min, max } => {
-                format!("{prefix}worker_count must be between {min} and {max} inclusive")
-            }
-            Self::MaxQueueZero => format!("{prefix}max_queue must be greater than zero"),
-            Self::MaxQueueOutOfRange { min, max } => {
-                format!("{prefix}max_queue must be between {min} and {max} inclusive")
-            }
             Self::SampleRateZero => format!("{prefix}sample_rate_hz must be greater than zero"),
             Self::MaxDurationZero => format!("{prefix}max_duration_s must be greater than zero"),
             Self::MaxDurationOutOfRange { min, max } => {
@@ -84,42 +61,16 @@ impl TtsResourceValidationError {
     }
 }
 
-pub fn validate_tts_resource_limits(
-    worker_count: usize,
-    max_queue: usize,
+/// Validate a service-negotiated sample rate against the portable duration budget.
+/// Consumers must also enforce `MAX_TTS_RESULT_SAMPLES` on retained audio.
+pub fn validate_tts_audio_limits(
     sample_rate_hz: u32,
     max_duration_s: u64,
-) -> Result<ValidatedTtsResourceLimits, TtsResourceValidationError> {
-    if worker_count == 0 {
-        return Err(TtsResourceValidationError::WorkerCountZero);
-    }
-    if worker_count > MAX_TTS_WORKER_COUNT {
-        return Err(TtsResourceValidationError::WorkerCountOutOfRange {
-            min: MIN_TTS_WORKER_COUNT,
-            max: MAX_TTS_WORKER_COUNT,
-        });
-    }
-    if max_queue == 0 {
-        return Err(TtsResourceValidationError::MaxQueueZero);
-    }
-    if max_queue > MAX_TTS_MAX_QUEUE {
-        return Err(TtsResourceValidationError::MaxQueueOutOfRange {
-            min: MIN_TTS_MAX_QUEUE,
-            max: MAX_TTS_MAX_QUEUE,
-        });
-    }
+) -> Result<ValidatedTtsAudioLimits, TtsResourceValidationError> {
     if sample_rate_hz == 0 {
         return Err(TtsResourceValidationError::SampleRateZero);
     }
-    if max_duration_s == 0 {
-        return Err(TtsResourceValidationError::MaxDurationZero);
-    }
-    if max_duration_s > MAX_TTS_MAX_DURATION_S {
-        return Err(TtsResourceValidationError::MaxDurationOutOfRange {
-            min: MIN_TTS_MAX_DURATION_S,
-            max: MAX_TTS_MAX_DURATION_S,
-        });
-    }
+    validate_tts_max_duration(max_duration_s)?;
     let max_duration_ms = max_duration_s
         .checked_mul(1_000)
         .ok_or(TtsResourceValidationError::DurationBudgetOverflow)?;
@@ -129,14 +80,24 @@ pub fn validate_tts_resource_limits(
     let max_duration_samples = usize::try_from(max_duration_samples_u64)
         .map_err(|_| TtsResourceValidationError::DurationBudgetOverflow)?;
 
-    Ok(ValidatedTtsResourceLimits {
-        worker_count,
-        max_queue,
+    Ok(ValidatedTtsAudioLimits {
         sample_rate_hz,
-        max_duration_s,
         max_duration_ms,
         max_duration_samples,
     })
+}
+
+fn validate_tts_max_duration(max_duration_s: u64) -> Result<(), TtsResourceValidationError> {
+    if max_duration_s == 0 {
+        return Err(TtsResourceValidationError::MaxDurationZero);
+    }
+    if max_duration_s > MAX_TTS_MAX_DURATION_S {
+        return Err(TtsResourceValidationError::MaxDurationOutOfRange {
+            min: MIN_TTS_MAX_DURATION_S,
+            max: MAX_TTS_MAX_DURATION_S,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -231,30 +192,72 @@ struct RawCompletionConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawTtsConfigInput")]
 struct RawTtsConfig {
+    enabled: bool,
+    endpoint: String,
+    voice: String,
+    start_command: Vec<String>,
+    max_duration_s: u64,
+    output_gain_db: f32,
+}
+
+// Input-only compatibility for installed explicit-Neural configurations. The old
+// tuning values are discarded here and never become runtime settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTtsConfigInput {
     #[serde(default)]
     enabled: bool,
-    #[serde(default)]
-    provider: TtsProvider,
     #[serde(default = "default_neural_tts_endpoint")]
     endpoint: String,
     #[serde(default)]
     voice: String,
     #[serde(default)]
     start_command: Vec<String>,
-    #[serde(default = "default_piper_model_path")]
-    model_path: PathBuf,
-    #[serde(default = "default_tts_worker_count")]
-    worker_count: usize,
-    #[serde(default = "default_tts_max_queue")]
-    max_queue: usize,
-    #[serde(default = "default_tts_sample_rate_hz")]
-    sample_rate_hz: u32,
     #[serde(default = "default_tts_max_duration_s")]
     max_duration_s: u64,
     #[serde(default = "default_tts_output_gain_db")]
     output_gain_db: f32,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model_path: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    worker_count: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    max_queue: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    sample_rate_hz: Option<serde::de::IgnoredAny>,
+}
+
+impl TryFrom<RawTtsConfigInput> for RawTtsConfig {
+    type Error = &'static str;
+
+    fn try_from(input: RawTtsConfigInput) -> Result<Self, Self::Error> {
+        match input.provider.as_deref() {
+            Some("piper") => return Err(
+                "tts.provider = \"piper\" is no longer supported; install the Neural TTS service separately, configure tts.endpoint/voice, and remove provider and Piper tuning keys",
+            ),
+            Some("neural") => {}
+            Some(_) => return Err("tts.provider is obsolete; only legacy \"neural\" input is accepted"),
+            None if input.model_path.is_some()
+                || input.worker_count.is_some()
+                || input.max_queue.is_some()
+                || input.sample_rate_hz.is_some() => return Err(
+                "Piper tuning keys are obsolete; configure the Neural TTS service and remove model_path, worker_count, max_queue and sample_rate_hz from [tts]",
+            ),
+            None => {}
+        }
+        Ok(Self {
+            enabled: input.enabled,
+            endpoint: input.endpoint,
+            voice: input.voice,
+            start_command: input.start_command,
+            max_duration_s: input.max_duration_s,
+            output_gain_db: input.output_gain_db,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -388,29 +391,30 @@ pub struct TelemetryConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalTtsConfig {
     pub enabled: bool,
-    pub provider: TtsProvider,
     pub endpoint: String,
     pub voice: String,
     pub start_command: Vec<String>,
-    pub model_path: PathBuf,
-    pub worker_count: usize,
-    pub max_queue: usize,
-    pub sample_rate_hz: u32,
     pub max_duration_s: u64,
     pub output_gain_db: f32,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TtsProvider {
-    #[default]
-    Piper,
-    Neural,
+impl LocalTtsConfig {
+    /// Configuration presence only; the client separately verifies the endpoint and readiness.
+    pub fn is_configured(&self) -> bool {
+        !self.endpoint.trim().is_empty()
+    }
 }
 
-impl LocalTtsConfig {
-    pub fn assets_configured(&self) -> bool {
-        self.provider == TtsProvider::Neural || self.model_path.is_file()
+impl Default for LocalTtsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_neural_tts_endpoint(),
+            voice: String::new(),
+            start_command: Vec::new(),
+            max_duration_s: DEFAULT_TTS_MAX_DURATION_S,
+            output_gain_db: DEFAULT_TTS_OUTPUT_GAIN_DB,
+        }
     }
 }
 
@@ -722,16 +726,6 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
 
     let local_tts = match raw_config.tts {
         Some(raw_tts) => {
-            let model_path = resolve_config_path(&config_dir, raw_tts.model_path);
-            if raw_tts.provider == TtsProvider::Piper {
-                record_path_issue(
-                    &mut capability_issues,
-                    "tts",
-                    true,
-                    model_path.is_file(),
-                    &model_path,
-                );
-            }
             if raw_tts.endpoint.len() > 2048
                 || raw_tts.voice.len() > 256
                 || raw_tts.voice.chars().any(char::is_control)
@@ -746,15 +740,11 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
                 });
             }
 
-            validate_tts_resource_limits(
-                raw_tts.worker_count,
-                raw_tts.max_queue,
-                raw_tts.sample_rate_hz,
-                raw_tts.max_duration_s,
-            )
-            .map_err(|error| ConfigError::ParseConfigFailed {
-                path: config_path.clone(),
-                details: error.format_with_prefix("tts."),
+            validate_tts_max_duration(raw_tts.max_duration_s).map_err(|error| {
+                ConfigError::ParseConfigFailed {
+                    path: config_path.clone(),
+                    details: error.format_with_prefix("tts."),
+                }
             })?;
 
             if !raw_tts.output_gain_db.is_finite() {
@@ -776,36 +766,14 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
 
             LocalTtsConfig {
                 enabled: raw_tts.enabled,
-                provider: raw_tts.provider,
                 endpoint: raw_tts.endpoint,
                 voice: raw_tts.voice,
                 start_command: raw_tts.start_command,
-                model_path,
-                worker_count: raw_tts.worker_count,
-                max_queue: raw_tts.max_queue,
-                sample_rate_hz: raw_tts.sample_rate_hz,
                 max_duration_s: raw_tts.max_duration_s,
                 output_gain_db: raw_tts.output_gain_db,
             }
         }
-        None => {
-            let model_path =
-                resolve_config_path(&config_dir, PathBuf::from("models/tts/jarvis.onnx"));
-
-            LocalTtsConfig {
-                enabled: false,
-                provider: TtsProvider::Piper,
-                endpoint: default_neural_tts_endpoint(),
-                voice: String::new(),
-                start_command: Vec::new(),
-                model_path,
-                worker_count: DEFAULT_TTS_WORKER_COUNT,
-                max_queue: DEFAULT_TTS_MAX_QUEUE,
-                sample_rate_hz: DEFAULT_TTS_SAMPLE_RATE_HZ,
-                max_duration_s: DEFAULT_TTS_MAX_DURATION_S,
-                output_gain_db: DEFAULT_TTS_OUTPUT_GAIN_DB,
-            }
-        }
+        None => LocalTtsConfig::default(),
     };
 
     let logging = LoggingConfig {
@@ -1112,19 +1080,7 @@ fn default_runtime_config(config_dir: &Path, config_reason: Option<String>) -> R
         initial_silence_timeout_ms: DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
         silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
         wake_word_detection_threshold: DEFAULT_WAKE_WORD_DETECTION_THRESHOLD,
-        local_tts: LocalTtsConfig {
-            enabled: false,
-            provider: TtsProvider::Piper,
-            endpoint: default_neural_tts_endpoint(),
-            voice: String::new(),
-            start_command: Vec::new(),
-            model_path: resolve_config_path(config_dir, PathBuf::from("models/tts/jarvis.onnx")),
-            worker_count: DEFAULT_TTS_WORKER_COUNT,
-            max_queue: DEFAULT_TTS_MAX_QUEUE,
-            sample_rate_hz: DEFAULT_TTS_SAMPLE_RATE_HZ,
-            max_duration_s: DEFAULT_TTS_MAX_DURATION_S,
-            output_gain_db: DEFAULT_TTS_OUTPUT_GAIN_DB,
-        },
+        local_tts: LocalTtsConfig::default(),
         logging: LoggingConfig { enabled: false },
         telemetry: TelemetryConfig {
             enabled: true,
@@ -1176,24 +1132,8 @@ fn default_wake_word_detection_threshold() -> f32 {
     DEFAULT_WAKE_WORD_DETECTION_THRESHOLD
 }
 
-fn default_tts_worker_count() -> usize {
-    DEFAULT_TTS_WORKER_COUNT
-}
-
-fn default_piper_model_path() -> PathBuf {
-    PathBuf::from("models/tts/jarvis.onnx")
-}
-
 fn default_neural_tts_endpoint() -> String {
     String::from("http://127.0.0.1:8765")
-}
-
-fn default_tts_max_queue() -> usize {
-    DEFAULT_TTS_MAX_QUEUE
-}
-
-fn default_tts_sample_rate_hz() -> u32 {
-    DEFAULT_TTS_SAMPLE_RATE_HZ
 }
 
 fn default_tts_max_duration_s() -> u64 {
@@ -2350,51 +2290,64 @@ mod tests {
     }
 
     #[test]
-    fn reports_unavailable_configured_tts_model_file() {
+    fn neural_tts_defaults_do_not_require_local_assets() {
         let temp = TempDir::new();
-        let model_dir = temp.path().join("models");
-        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
-        let silero_vad_model = model_dir.join("silero-vad.onnx");
-        let missing_tts_model_path = model_dir.join("tts").join("jarvis.onnx");
-        let opencode_path = temp.path().join("opencode.exe");
-        let config_path = temp.path().join("config.toml");
-
-        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
-        create_file(&wake_word_model_path);
-        create_file(&silero_vad_model);
-        create_file(&opencode_path);
-
-        fs::write(
-            &config_path,
-            format!(
-                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n\n[tts]\nenabled = true\nmodel_path = \"{}\"\nworker_count = 1\nmax_queue = 8\nsample_rate_hz = 22050\n",
-                escape_path(&wake_word_model_path),
-                escape_path(&model_dir),
-                escape_path(&silero_vad_model),
-                escape_path(&opencode_path),
-                escape_path(&missing_tts_model_path),
-            ),
-        )
-        .expect("config fixture should be written");
-
-        let result = load_runtime_config(Some(&config_path));
-
-        let config = result.expect("missing TTS asset must not block response capabilities");
-        assert!(config.capability_issues.iter().any(|issue| {
-            issue.capability == "tts"
-                && issue
-                    .reason
-                    .contains(&missing_tts_model_path.display().to_string())
-        }));
+        let path = temp.path().join("config.toml");
+        for input in ["", "[tts]", "[tts]\nenabled = false"] {
+            fs::write(&path, input).unwrap();
+            let config = load_runtime_config(Some(&path)).unwrap();
+            assert_eq!(config.local_tts, super::LocalTtsConfig::default());
+            assert!(config.local_tts.is_configured());
+            assert_eq!(config.local_tts.endpoint, "http://127.0.0.1:8765");
+            assert_eq!(config.local_tts.max_duration_s, 300);
+            assert_eq!(config.local_tts.output_gain_db, 3.0);
+            assert!(!config
+                .capability_issues
+                .iter()
+                .any(|issue| issue.capability == "tts"));
+        }
     }
 
     #[test]
-    fn neural_tts_configuration_does_not_require_a_piper_model() {
+    fn tts_configuration_presence_is_separate_from_client_readiness() {
+        let mut config = super::LocalTtsConfig::default();
+        for endpoint in ["", " \t\n"] {
+            config.endpoint = endpoint.into();
+            assert!(!config.is_configured());
+        }
+        config.endpoint = "synthetic-invalid-endpoint".into();
+        assert!(
+            config.is_configured(),
+            "the client must report invalid configured endpoints"
+        );
+    }
+
+    #[test]
+    fn loads_neural_tts_configuration_without_provider_or_model() {
         let temp = TempDir::new();
         let path = temp.path().join("config.toml");
-        fs::write(&path, "[tts]\nenabled = true\nprovider = \"neural\"\nendpoint = \"http://127.0.0.1:8765\"\nvoice = \"synthetic-voice\"\n").unwrap();
-        let config = load_runtime_config(Some(&path)).expect("Neural TTS uses service assets");
+        fs::write(
+            &path,
+            r#"[tts]
+enabled = true
+endpoint = "http://127.0.0.1:9876"
+voice = "synthetic-voice"
+start_command = ["synthetic-service", "--local"]
+max_duration_s = 360
+output_gain_db = 6.0
+"#,
+        )
+        .unwrap();
+        let config = load_runtime_config(Some(&path)).unwrap();
         assert!(config.local_tts.enabled);
+        assert_eq!(config.local_tts.endpoint, "http://127.0.0.1:9876");
+        assert_eq!(config.local_tts.voice, "synthetic-voice");
+        assert_eq!(
+            config.local_tts.start_command,
+            ["synthetic-service", "--local"]
+        );
+        assert_eq!(config.local_tts.max_duration_s, 360);
+        assert_eq!(config.local_tts.output_gain_db, 6.0);
         assert!(!config
             .capability_issues
             .iter()
@@ -2402,123 +2355,144 @@ mod tests {
     }
 
     #[test]
-    fn loads_valid_tts_config_when_present() {
+    fn accepts_legacy_explicit_neural_input_and_discards_piper_tuning() {
         let temp = TempDir::new();
-        let model_dir = temp.path().join("models");
-        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
-        let silero_vad_model = model_dir.join("silero-vad.onnx");
-        let tts_model_path = model_dir.join("tts").join("jarvis.onnx");
-        let opencode_path = temp.path().join("opencode.exe");
-        let config_path = temp.path().join("config.toml");
-
-        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
-        create_file(&wake_word_model_path);
-        create_file(&silero_vad_model);
-        create_file(&tts_model_path);
-        create_file(&opencode_path);
-
+        let path = temp.path().join("config.toml");
         fs::write(
-            &config_path,
-            format!(
-                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n\n[tts]\nenabled = true\nmodel_path = \"{}\"\nworker_count = 2\nmax_queue = 16\nsample_rate_hz = 24000\nmax_duration_s = 360\noutput_gain_db = 6.0\n",
-                escape_path(&wake_word_model_path),
-                escape_path(&model_dir),
-                escape_path(&silero_vad_model),
-                escape_path(&opencode_path),
-                escape_path(&tts_model_path),
-            ),
+            &path,
+            r#"[tts]
+enabled = true
+provider = "neural"
+model_path = "synthetic-missing-model.onnx"
+worker_count = 0
+max_queue = 0
+sample_rate_hz = 0
+"#,
         )
-        .expect("config fixture should be written");
-
-        let result = load_runtime_config(Some(&config_path)).expect("valid config should load");
-
-        assert!(result.local_tts.enabled);
-        assert_eq!(result.local_tts.model_path, tts_model_path);
-        assert_eq!(result.local_tts.worker_count, 2);
-        assert_eq!(result.local_tts.max_queue, 16);
-        assert_eq!(result.local_tts.sample_rate_hz, 24_000);
-        assert_eq!(result.local_tts.max_duration_s, 360);
-        assert_eq!(result.local_tts.output_gain_db, 6.0);
+        .unwrap();
+        let config = load_runtime_config(Some(&path)).unwrap();
+        assert_eq!(
+            config.local_tts,
+            super::LocalTtsConfig {
+                enabled: true,
+                ..Default::default()
+            }
+        );
+        assert!(!config
+            .capability_issues
+            .iter()
+            .any(|issue| issue.capability == "tts"));
     }
 
     #[test]
-    fn reports_invalid_tts_max_duration_when_zero() {
+    fn rejects_piper_with_explicit_migration_guidance() {
         let temp = TempDir::new();
-        let model_dir = temp.path().join("models");
-        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
-        let silero_vad_model = model_dir.join("silero-vad.onnx");
-        let tts_model_path = model_dir.join("tts").join("jarvis.onnx");
-        let opencode_path = temp.path().join("opencode.exe");
-        let config_path = temp.path().join("config.toml");
-
-        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
-        create_file(&wake_word_model_path);
-        create_file(&silero_vad_model);
-        create_file(&tts_model_path);
-        create_file(&opencode_path);
-
-        fs::write(
-            &config_path,
-            format!(
-                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n\n[tts]\nenabled = true\nmodel_path = \"{}\"\nworker_count = 2\nmax_queue = 16\nsample_rate_hz = 24000\nmax_duration_s = 0\n",
-                escape_path(&wake_word_model_path),
-                escape_path(&model_dir),
-                escape_path(&silero_vad_model),
-                escape_path(&opencode_path),
-                escape_path(&tts_model_path),
-            ),
-        )
-        .expect("config fixture should be written");
-
-        let result = load_runtime_config(Some(&config_path));
-
-        assert_eq!(
-            result,
-            Err(ConfigError::ParseConfigFailed {
-                path: config_path,
-                details: String::from("tts.max_duration_s must be greater than zero"),
-            })
-        );
+        let path = temp.path().join("config.toml");
+        for enabled in [true, false] {
+            fs::write(
+                &path,
+                format!("[tts]\nenabled = {enabled}\nprovider = 'piper'\n"),
+            )
+            .unwrap();
+            let error = load_runtime_config(Some(&path)).unwrap_err().to_string();
+            assert!(error.contains("piper"));
+            assert!(error.contains("no longer supported"));
+            assert!(error.contains("install the Neural TTS service separately"));
+        }
     }
 
     #[test]
-    fn reports_invalid_tts_output_gain_db_when_out_of_range() {
+    fn tts_input_compatibility_keeps_unknown_keys_strict() {
         let temp = TempDir::new();
-        let model_dir = temp.path().join("models");
-        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
-        let silero_vad_model = model_dir.join("silero-vad.onnx");
-        let tts_model_path = model_dir.join("tts").join("jarvis.onnx");
-        let opencode_path = temp.path().join("opencode.exe");
-        let config_path = temp.path().join("config.toml");
+        let path = temp.path().join("config.toml");
+        for input in [
+            "provider = 'neural'\nworker_cout = 1",
+            "provider = 'neural'\nmodel_pat = 'missing.onnx'",
+            "provider = 'neurla'",
+            "endpont = 'http://127.0.0.1:8765'",
+            "model_path = 'synthetic-old-model.onnx'",
+            "sample_rate_hz = 24000",
+        ] {
+            fs::write(&path, format!("[tts]\n{input}\n")).unwrap();
+            assert!(
+                load_runtime_config(Some(&path)).is_err(),
+                "accepted {input}"
+            );
+        }
+    }
 
-        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
-        create_file(&wake_word_model_path);
-        create_file(&silero_vad_model);
-        create_file(&tts_model_path);
-        create_file(&opencode_path);
-
-        fs::write(
-            &config_path,
-            format!(
-                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n\n[tts]\nenabled = true\nmodel_path = \"{}\"\nworker_count = 2\nmax_queue = 16\nsample_rate_hz = 24000\nmax_duration_s = 360\noutput_gain_db = 100.0\n",
-                escape_path(&wake_word_model_path),
-                escape_path(&model_dir),
-                escape_path(&silero_vad_model),
-                escape_path(&opencode_path),
-                escape_path(&tts_model_path),
+    #[test]
+    fn rejects_invalid_neural_tts_duration_gain_and_service_bounds() {
+        let temp = TempDir::new();
+        let path = temp.path().join("config.toml");
+        for (input, expected) in [
+            (
+                "max_duration_s = 0".to_owned(),
+                "tts.max_duration_s must be greater than zero",
             ),
-        )
-        .expect("config fixture should be written");
-
-        let result = load_runtime_config(Some(&config_path));
-
-        assert_eq!(
-            result,
-            Err(ConfigError::ParseConfigFailed {
-                path: config_path,
-                details: String::from("tts.output_gain_db must be between -24 and 24 inclusive",),
-            })
-        );
+            (
+                "max_duration_s = 361".to_owned(),
+                "tts.max_duration_s must be between 1 and 360 inclusive",
+            ),
+            (
+                "output_gain_db = 24.1".to_owned(),
+                "tts.output_gain_db must be between -24 and 24 inclusive",
+            ),
+            (
+                "output_gain_db = -24.1".to_owned(),
+                "tts.output_gain_db must be between -24 and 24 inclusive",
+            ),
+            (
+                "output_gain_db = nan".to_owned(),
+                "tts.output_gain_db must be a finite number",
+            ),
+            (
+                "output_gain_db = inf".to_owned(),
+                "tts.output_gain_db must be a finite number",
+            ),
+            (
+                format!("voice = '{}'", "x".repeat(257)),
+                "tts service configuration exceeds its bounds",
+            ),
+            (
+                "voice = \"synthetic\\nvoice\"".to_owned(),
+                "tts service configuration exceeds its bounds",
+            ),
+            (
+                format!("endpoint = '{}'", "x".repeat(2049)),
+                "tts service configuration exceeds its bounds",
+            ),
+            (
+                "start_command = ['']".to_owned(),
+                "tts service configuration exceeds its bounds",
+            ),
+            (
+                format!("start_command = ['{}']", "x".repeat(4097)),
+                "tts service configuration exceeds its bounds",
+            ),
+            (
+                format!("start_command = [{}]", vec!["'synthetic'"; 33].join(",")),
+                "tts service configuration exceeds its bounds",
+            ),
+        ] {
+            fs::write(&path, format!("[tts]\n{input}\n")).unwrap();
+            assert_eq!(
+                load_runtime_config(Some(&path)),
+                Err(ConfigError::ParseConfigFailed {
+                    path: path.clone(),
+                    details: expected.to_owned(),
+                }),
+                "input: {input}"
+            );
+        }
+        for gain in [-24, 24] {
+            fs::write(
+                &path,
+                format!("[tts]\nmax_duration_s = 1\noutput_gain_db = {gain}\n"),
+            )
+            .unwrap();
+            assert!(load_runtime_config(Some(&path)).is_ok());
+        }
     }
 
     #[test]
@@ -2682,91 +2656,52 @@ mod tests {
     }
 
     #[test]
-    fn validates_canonical_tts_resource_limits_and_high_sample_rate_models() {
-        for (worker_count, max_queue, sample_rate_hz, max_duration_s, expected_samples) in [
-            (1, 8, 22_050, 300, 6_615_000),
-            (2, 16, 24_000, 360, 8_640_000),
-            (1, 8, 44_100, 360, 15_876_000),
-            (2, 16, 48_000, 300, 14_400_000),
-            (2, 16, 48_000, 360, 17_280_000),
+    fn validates_tts_audio_limits_for_service_negotiated_rates() {
+        for (sample_rate_hz, max_duration_s, expected_samples) in [
+            (24_000, 300, 7_200_000),
+            (44_100, 360, 15_876_000),
+            (48_000, 300, 14_400_000),
+            (48_000, 360, 17_280_000),
+            (1, 1, 1),
         ] {
-            let validated = super::validate_tts_resource_limits(
-                worker_count,
-                max_queue,
-                sample_rate_hz,
-                max_duration_s,
-            )
-            .expect("valid TTS resource configuration should be accepted");
-            assert_eq!(validated.worker_count, worker_count);
-            assert_eq!(validated.max_queue, max_queue);
+            let validated = super::validate_tts_audio_limits(sample_rate_hz, max_duration_s)
+                .expect("valid service audio limits should be accepted");
             assert_eq!(validated.sample_rate_hz, sample_rate_hz);
-            assert_eq!(validated.max_duration_s, max_duration_s);
             assert_eq!(validated.max_duration_ms, max_duration_s * 1_000);
             assert_eq!(validated.max_duration_samples, expected_samples);
         }
-
+        // Retained-buffer and duration bounds are independent; consumers enforce both.
         assert_eq!(super::MAX_TTS_RESULT_BYTES, 64 * 1024 * 1024);
         assert_eq!(super::MAX_TTS_RESULT_SAMPLES, 16_777_216);
-
-        for (worker_count, max_queue, sample_rate_hz, max_duration_s, expected_error) in [
+        for (rate, duration, expected) in [
+            (0, 300, "tts.sample_rate_hz must be greater than zero"),
+            (24_000, 0, "tts.max_duration_s must be greater than zero"),
             (
-                0,
-                8,
-                22_050,
-                300,
-                "tts.worker_count must be greater than zero",
-            ),
-            (
-                3,
-                8,
-                22_050,
-                300,
-                "tts.worker_count must be between 1 and 2 inclusive",
-            ),
-            (1, 0, 22_050, 300, "tts.max_queue must be greater than zero"),
-            (
-                1,
-                17,
-                22_050,
-                300,
-                "tts.max_queue must be between 1 and 16 inclusive",
-            ),
-            (1, 8, 0, 300, "tts.sample_rate_hz must be greater than zero"),
-            (
-                1,
-                8,
-                22_050,
-                0,
-                "tts.max_duration_s must be greater than zero",
-            ),
-            (
-                1,
-                8,
-                22_050,
+                24_000,
                 361,
                 "tts.max_duration_s must be between 1 and 360 inclusive",
             ),
+            (
+                24_000,
+                u64::MAX,
+                "tts.max_duration_s must be between 1 and 360 inclusive",
+            ),
         ] {
-            let temp = TempDir::new();
-            let config_path = temp.path().join("config.toml");
-            let tts_model_path = temp.path().join("jarvis.onnx");
-            create_file(&tts_model_path);
-            fs::write(
-                &config_path,
-                format!(
-                    "[tts]\nenabled = true\nmodel_path = \"{}\"\nworker_count = {worker_count}\nmax_queue = {max_queue}\nsample_rate_hz = {sample_rate_hz}\nmax_duration_s = {max_duration_s}\n",
-                    escape_path(&tts_model_path),
-                ),
-            )
-            .expect("config fixture should be written");
-
             assert_eq!(
-                load_runtime_config(Some(&config_path)),
-                Err(ConfigError::ParseConfigFailed {
-                    path: config_path,
-                    details: String::from(expected_error),
-                })
+                super::validate_tts_audio_limits(rate, duration)
+                    .unwrap_err()
+                    .format_with_prefix("tts."),
+                expected,
             );
         }
+        assert_eq!(
+            super::TtsResourceValidationError::DurationBudgetOverflow.format_with_prefix("tts."),
+            "tts.max_duration_s and sample_rate_hz exceed supported sample budget"
+        );
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(
+            super::validate_tts_audio_limits(u32::MAX, 360),
+            Err(super::TtsResourceValidationError::DurationBudgetOverflow)
+        );
     }
 }

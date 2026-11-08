@@ -2130,12 +2130,10 @@ fn publish_validated_preferences(
     *ui_preferences = requested_ui;
     let speech_voice_changed = network_preferences.speech_tts_voice != preferences.speech_tts_voice;
     if let Some(runtime) = tts_runtime.as_ref() {
-        if runtime.neural_client().is_some() {
-            // Validation already ran before persistence; publication cannot substitute an unknown voice.
-            runtime
-                .set_neural_voice(preferences.speech_tts_voice.as_str(), "")
-                .map_err(|_| ipc_command_error("selected Neural TTS voice is unavailable"))?;
-        }
+        // Validation already ran before persistence; publication cannot substitute an unknown voice.
+        runtime
+            .set_neural_voice(preferences.speech_tts_voice.as_str())
+            .map_err(|_| ipc_command_error("selected Neural TTS voice is unavailable"))?;
     }
     if speech_voice_changed {
         state.voice_cue_cache.invalidate();
@@ -2166,13 +2164,6 @@ fn publish_validated_preferences(
             replaced_tts_runtime = tts_runtime.take();
         }
         let runtime_available = tts_runtime.is_some();
-        let actual_provider = tts_runtime
-            .as_deref()
-            .and_then(tts::LocalTtsRuntime::actual_provider)
-            .map(|provider| match provider {
-                tts::TtsActualProvider::Cuda => "cuda",
-                tts::TtsActualProvider::Cpu => "cpu",
-            });
         if let StartupStatePayload::WarmingModel {
             capabilities,
             tts_enabled,
@@ -2189,7 +2180,6 @@ fn publish_validated_preferences(
                 capabilities,
                 preferences.tts_enabled,
                 runtime_available,
-                actual_provider,
             );
         }
     }
@@ -2518,18 +2508,17 @@ async fn update_preferences_from_state(
         .map_err(|_| ipc_command_error("speech runtime unavailable"))?
         .as_ref()
     {
-        if let Some(client) = runtime.neural_client() {
-            let provider = preferences.speech_tts_provider.as_str();
-            if (!provider.is_empty() && provider != "neural")
-                || client
-                    .capabilities()
-                    .resolve_voice(preferences.speech_tts_voice.as_str())
-                    .is_none()
-            {
-                return Err(ipc_command_error(
-                    "selected Neural TTS voice is unavailable",
-                ));
-            }
+        let client = runtime.neural_client();
+        let provider = preferences.speech_tts_provider.as_str();
+        if (!provider.is_empty() && provider != "neural")
+            || client
+                .capabilities()
+                .resolve_voice(preferences.speech_tts_voice.as_str())
+                .is_none()
+        {
+            return Err(ipc_command_error(
+                "selected Neural TTS voice is unavailable",
+            ));
         }
     }
     let requested_persisted = PersistedState::from(&preferences);
@@ -2618,7 +2607,7 @@ async fn update_preferences_from_state(
 
     if let Some(runtime) = proposed_tts_runtime.as_ref() {
         runtime
-            .set_neural_voice(preferences.speech_tts_voice.as_str(), "")
+            .set_neural_voice(preferences.speech_tts_voice.as_str())
             .map_err(|error| preference_command_error(CommandErrorCode::Unavailable, error))?;
     }
 
@@ -3250,26 +3239,20 @@ fn get_startup_state_from_state(app_state: &AppState) -> StartupSettingsPayload 
                 available_voices: Vec::new(),
                 incremental_audio: None,
             };
-        let neural = config.local_tts.provider == voxgolem_core::config::TtsProvider::Neural;
         let runtime = app_state.local_tts_runtime.lock().ok();
         let runtime = runtime.as_ref().and_then(|runtime| runtime.as_deref());
-        let mut tts_metadata = metadata(
-            "tts",
-            if neural { "Neural TTS" } else { "Piper ONNX" },
-            runtime.is_some(),
-        );
+        let mut tts_metadata = metadata("tts", "Neural TTS", runtime.is_some());
         if let Some(runtime) = runtime {
-            if let Some(client) = runtime.neural_client() {
-                let capabilities = client.capabilities();
-                tts_metadata.configured_model = match capabilities.backend.as_str() {
-                    "qwen" => Some("Qwen"),
-                    "breeze" => Some("Breeze"),
-                    _ => None,
-                };
-                tts_metadata.configured_voice = runtime.selected_neural_voice();
-                tts_metadata.available_voices = capabilities.voices.clone();
-                tts_metadata.incremental_audio = Some(capabilities.incremental_audio);
-            }
+            let client = runtime.neural_client();
+            let capabilities = client.capabilities();
+            tts_metadata.configured_model = match capabilities.backend.as_str() {
+                "qwen" => Some("Qwen"),
+                "breeze" => Some("Breeze"),
+                _ => None,
+            };
+            tts_metadata.configured_voice = runtime.selected_neural_voice();
+            tts_metadata.available_voices = capabilities.voices.clone();
+            tts_metadata.incremental_audio = Some(capabilities.incremental_audio);
         }
         SpeechServicesMetadataPayload {
             stt: metadata(
@@ -3316,8 +3299,7 @@ async fn set_tts_enabled(
     ensure_app_running(&app_state.exit_cleanup_started)?;
     let reconnect = reconnect.unwrap_or(false);
     if reconnect
-        && (tts_config.provider != voxgolem_core::config::TtsProvider::Neural
-            || tts::physical_work_pending()
+        && (tts::physical_work_pending()
             || app_state
                 .tts_playback
                 .lock()
@@ -3353,7 +3335,7 @@ async fn set_tts_enabled(
             .network_preferences
             .lock()
             .map_err(|_| String::from("speech preferences unavailable"))?;
-        runtime.set_neural_voice(preferences.speech_tts_voice.as_str(), "")?;
+        runtime.set_neural_voice(preferences.speech_tts_voice.as_str())?;
     }
     let proposed_runtime = persist_tts_preference(enabled, proposed_runtime)?;
     let mut native_reply = app_state
@@ -3405,15 +3387,8 @@ async fn set_tts_enabled(
     let sample_rate_hz = runtime_guard
         .as_ref()
         .map(|runtime| runtime.sample_rate_hz())
-        .unwrap_or(config.local_tts.sample_rate_hz);
+        .unwrap_or(0);
     let runtime_available = runtime_guard.is_some();
-    let actual_provider = runtime_guard
-        .as_deref()
-        .and_then(tts::LocalTtsRuntime::actual_provider)
-        .map(|provider| match provider {
-            tts::TtsActualProvider::Cuda => "cuda",
-            tts::TtsActualProvider::Cpu => "cpu",
-        });
     drop(runtime_guard);
     drop(native_reply);
     drop(unused_proposed_runtime);
@@ -3435,12 +3410,7 @@ async fn set_tts_enabled(
         } = &mut *state
         {
             *tts_enabled = enabled;
-            repair_tts_capability_from_status(
-                capabilities,
-                enabled,
-                runtime_available,
-                actual_provider,
-            );
+            repair_tts_capability_from_status(capabilities, enabled, runtime_available);
         }
     }
 
@@ -3516,7 +3486,7 @@ async fn prepare_voice_cues(
     prepare_voice_cues_from_runtime(&app_state, existing).await
 }
 
-// The native adapter retains its update lease through any abandoned synthesis.
+// The native adapter retains its update lease through cue synthesis and retirement.
 // Passing the captured runtime prevents TTS-off racing this job into
 // initialization of a new model merely because the published slot became empty.
 async fn prepare_voice_cues_from_runtime(
@@ -3531,22 +3501,9 @@ async fn prepare_voice_cues_from_runtime(
         .clone();
     // Fixed embedded cues remain immediately usable with reply speech disabled.
     // Do not start a neural model solely to populate optional spoken acknowledgements.
-    if existing.is_none() && config.provider == voxgolem_core::config::TtsProvider::Neural {
-        return Err(String::from(
-            "Neural cue preparation deferred until speech service is ready",
-        ));
-    }
-    let runtime = if let Some(runtime) = existing {
-        runtime
-    } else {
-        let diagnostics = Arc::clone(&app_state.telemetry_sink);
-        let spec = config.clone();
-        spawn_runtime_blocking(move || initialize_local_tts_runtime(&spec, true, &diagnostics))
-            .await
-            .map_err(|_| String::from("cue preparation worker failed"))??
-            .map(Arc::new)
-            .ok_or_else(|| String::from("cue runtime unavailable"))?
-    };
+    let runtime = existing.ok_or_else(|| {
+        String::from("Neural cue preparation deferred until speech service is ready")
+    })?;
     // Reply admission and this snapshot share the gate: optional preparation
     // cannot join a newly admitted reply's generation after its preemption.
     let (voice, generation) = {
@@ -3554,9 +3511,7 @@ async fn prepare_voice_cues_from_runtime(
             .native_reply
             .lock()
             .map_err(|_| String::from("native speech owner unavailable"))?;
-        if runtime.neural_client().is_some()
-            && app_state.native_speech_running.load(Ordering::Acquire)
-        {
+        if app_state.native_speech_running.load(Ordering::Acquire) {
             return Err(String::from(
                 "Neural cue preparation deferred during reply speech",
             ));
@@ -3839,102 +3794,15 @@ async fn speak_local_tts_from_state(
         playback: Arc::clone(&app_state.tts_audio_playback),
         playback_id,
     };
-    if runtime.neural_client().is_some() {
-        return neural_speech::speak(
-            app_state,
-            runtime,
-            text,
-            playback_id,
-            speech_generation.is_some(),
-            generation,
-        )
-        .await;
-    }
-    #[cfg(feature = "app-benchmark")]
-    if speech_generation.is_some() {
-        app_benchmark::mark_once("reply_synthesis_requested");
-    }
-    let result =
-        spawn_runtime_blocking(move || runtime.synthesize_for_generation(&text, generation)).await;
-    let audio = match result {
-        Ok(Ok(audio)) => audio,
-        Ok(Err(error)) => {
-            finish_tts_playback_state(&app_state.tts_playback, playback_id)?;
-            log_tts_runtime_event(
-                &app_state.telemetry_sink,
-                diagnostics::TtsEvent::SynthesisFailed,
-            );
-            return Err(error);
-        }
-        Err(error) => {
-            finish_tts_playback_state(&app_state.tts_playback, playback_id)?;
-            return Err(format!("local tts synthesis task failed: {error}"));
-        }
-    };
-    ensure_tts_playback_current(&app_state.tts_playback, playback_id).inspect_err(|_error| {
-        log_tts_runtime_event(
-            &app_state.telemetry_sink,
-            diagnostics::TtsEvent::SynthesisSuperseded,
-        );
-    })?;
-    let duration_ms = audio.duration_ms;
-    #[cfg(feature = "app-benchmark")]
-    if speech_generation.is_some()
-        && !audio.pcm_f32.is_empty()
-        && audio.sample_rate_hz > 0
-        && audio.pcm_f32.iter().all(|sample| sample.is_finite())
-        && audio.pcm_f32.iter().any(|sample| *sample != 0.0)
-    {
-        app_benchmark::mark("reply_synthesis_valid");
-    }
-    let output_gain_db = app_state
-        .runtime_config
-        .as_ref()
-        .map(|config| config.local_tts.output_gain_db)
-        .unwrap_or(0.0);
-    let playback = Arc::clone(&app_state.tts_audio_playback);
-    let playback_result = spawn_runtime_blocking(move || {
-        playback.play_owned(
-            voxgolem_audio::playback::PlaybackRequest {
-                playback_id,
-                pcm_f32: audio.pcm_f32,
-                sample_rate_hz: audio.sample_rate_hz,
-                gain_db: output_gain_db,
-            },
-            voxgolem_audio::playback::PlaybackPurpose::Speech,
-            || {
-                #[cfg(feature = "app-benchmark")]
-                if speech_generation.is_some() {
-                    app_benchmark::mark("reply_output_submitted");
-                    app_benchmark::mark_once("reply_output_activated");
-                }
-            },
-        )
-    })
-    .await;
-    match playback_result {
-        Ok(Ok(_)) => {
-            #[cfg(feature = "app-benchmark")]
-            if speech_generation.is_some() {
-                app_benchmark::mark("reply_output_completed");
-            }
-            finish_tts_playback_state(&app_state.tts_playback, playback_id)?;
-        }
-        Ok(Err(error)) => {
-            finish_tts_playback_state(&app_state.tts_playback, playback_id)?;
-            log_tts_runtime_event(
-                &app_state.telemetry_sink,
-                diagnostics::TtsEvent::PlaybackFailed,
-            );
-            return Err(format!("local tts playback failed: {error}"));
-        }
-        Err(error) => {
-            finish_tts_playback_state(&app_state.tts_playback, playback_id)?;
-            return Err(format!("local tts playback task failed: {error}"));
-        }
-    }
-
-    Ok(SynthesizeLocalTtsPayload { duration_ms })
+    neural_speech::speak(
+        app_state,
+        runtime,
+        text,
+        playback_id,
+        speech_generation.is_some(),
+        generation,
+    )
+    .await
 }
 
 struct SpeechPlaybackTicket {
@@ -12356,23 +12224,16 @@ fn repair_tts_capability(
     enabled: bool,
     runtime: Option<&tts::LocalTtsRuntime>,
 ) {
-    let actual_provider = runtime
-        .and_then(tts::LocalTtsRuntime::actual_provider)
-        .map(|provider| match provider {
-            tts::TtsActualProvider::Cuda => "cuda",
-            tts::TtsActualProvider::Cpu => "cpu",
-        });
-    repair_tts_capability_from_status(capabilities, enabled, runtime.is_some(), actual_provider);
+    repair_tts_capability_from_status(capabilities, enabled, runtime.is_some());
 }
 
 fn repair_tts_capability_from_status(
     capabilities: &mut [CapabilityPayload],
     enabled: bool,
     runtime_available: bool,
-    actual_provider: Option<&'static str>,
 ) {
     if let Some(capability) = capabilities.iter_mut().find(|item| item.id == "tts") {
-        capability.actual_provider = enabled.then_some(actual_provider).flatten();
+        capability.actual_provider = None;
         if enabled && runtime_available {
             capability.state = CapabilityStatePayload::Available;
             capability.reason = String::from("ready");
@@ -12445,7 +12306,7 @@ fn configured_capabilities(
                 "wake_word" => config.wake_word_model_path.is_file(),
                 "vad" => config.silero_vad_model.is_file(),
                 "parakeet" => config.parakeet_model_dir.is_dir(),
-                "tts" => config.local_tts.assets_configured(),
+                "tts" => config.local_tts.is_configured(),
                 "deep" | "review" => custom_configured || opencode_configured,
                 _ => false,
             };
@@ -13250,9 +13111,6 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
             "OpenCode startup is pending",
         );
     }
-    let early_neural = init.runtime_config.as_ref().is_some_and(|config| {
-        config.local_tts.provider == voxgolem_core::config::TtsProvider::Neural
-    });
     AppState {
         conversation: DesktopConversationRuntime::new(init.lifecycle_gate, init.assistant_policy),
         network_preferences: Arc::new(Mutex::new(network_preferences)),
@@ -13261,11 +13119,7 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         microphone_capture: init.microphone_capture,
         native_voice: Arc::new(desktop_voice::DesktopVoiceRuntime::new()),
         native_observation: Mutex::new(desktop_observation::DesktopObservation::new()),
-        native_reply: Arc::new(Mutex::new(if early_neural {
-            reply_speech::ReplySpeech::early_clauses()
-        } else {
-            reply_speech::ReplySpeech::default()
-        })),
+        native_reply: Arc::new(Mutex::new(reply_speech::ReplySpeech::early_clauses())),
         native_speech_delivery: Arc::new(Mutex::new(
             voxgolem_core::speech_delivery::SpeechDelivery::new(1),
         )),
@@ -13368,7 +13222,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
             let parakeet_runtime: ParakeetRuntimeSlot = Arc::new(Mutex::new(None));
             let effective_tts_enabled = resolve_effective_tts_enabled(
                 config.local_tts.enabled,
-                config.local_tts.assets_configured(),
+                config.local_tts.is_configured(),
             );
             // TTS is optional and native provider construction can be slow or stuck. It is
             // warmed after the shell state exists so it cannot delay unrelated startup.
@@ -13620,33 +13474,13 @@ fn initialize_local_tts_runtime(
     }
 
     log_tts_runtime_event(diagnostics, diagnostics::TtsEvent::InitializationStarted);
-    if config.provider == voxgolem_core::config::TtsProvider::Piper
-        && tts::resolve_strict_windows_espeak_data_directory()
-            .map_err(|error| {
-                log_tts_runtime_event(diagnostics, diagnostics::TtsEvent::InitializationFailed);
-                format!("failed to resolve strict eSpeak data root: {error}")
-            })?
-            .is_some()
-    {
-        log_tts_runtime_event(diagnostics, diagnostics::TtsEvent::DataRootReady);
-    }
-
     let spec = tts::LocalTtsRuntimeSpec {
-        neural: (config.provider == voxgolem_core::config::TtsProvider::Neural).then(|| {
-            tts::NeuralTtsRuntimeSpec {
-                options: voxgolem_platform::neural_tts::NeuralTtsOptions {
-                    endpoint: config.endpoint.clone(),
-                    start_command: config.start_command.clone(),
-                },
-                voice: config.voice.clone(),
-            }
-        }),
-        model_path: Some(config.model_path.clone()),
-        worker_count: config.worker_count,
-        max_queue: config.max_queue,
-        sample_rate_hz: config.sample_rate_hz,
+        options: voxgolem_platform::neural_tts::NeuralTtsOptions {
+            endpoint: config.endpoint.clone(),
+            start_command: config.start_command.clone(),
+        },
+        voice: config.voice.clone(),
         max_duration_s: config.max_duration_s,
-        provider_policy: tts::TtsProviderPolicy::Auto,
     };
 
     match tts::LocalTtsRuntime::new(spec) {
@@ -14953,7 +14787,7 @@ pub fn run() {
             if let Some(config) = app.state::<AppState>().runtime_config.as_ref() {
                 if resolve_effective_tts_enabled(
                     config.local_tts.enabled,
-                    config.local_tts.assets_configured(),
+                    config.local_tts.is_configured(),
                 ) {
                     let tts_config = config.local_tts.clone();
                     let startup_generation = app
@@ -14990,7 +14824,6 @@ pub fn run() {
                                             })?;
                                         runtime.set_neural_voice(
                                             preferences.speech_tts_voice.as_str(),
-                                            "",
                                         )?;
                                     }
                                     Ok(runtime)
@@ -15709,7 +15542,7 @@ mod tests {
         );
         assert_eq!(
             payload["speech_services"]["tts"]["configured_engine"],
-            "Piper ONNX"
+            "Neural TTS"
         );
         for service in ["stt", "tts"] {
             for field in [
@@ -15738,7 +15571,7 @@ mod tests {
             .expect("unavailable configured metadata should serialize");
         assert_eq!(
             payload["speech_services"]["tts"]["configured_engine"],
-            "Piper ONNX"
+            "Neural TTS"
         );
         assert!(payload["speech_services"]["tts"]["runtime_engine"].is_null());
 
@@ -16698,15 +16531,10 @@ mod tests {
             silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
             wake_word_detection_threshold: 0.68,
             local_tts: voxgolem_core::config::LocalTtsConfig {
-                provider: voxgolem_core::config::TtsProvider::Piper,
                 endpoint: String::from("http://127.0.0.1:8765"),
                 voice: String::new(),
                 start_command: Vec::new(),
                 enabled: false,
-                model_path: root.join("tts.onnx"),
-                worker_count: 1,
-                max_queue: 8,
-                sample_rate_hz: 22_050,
                 max_duration_s: 300,
                 output_gain_db: 3.0,
             },
@@ -21734,7 +21562,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_effective_tts_enabled_ignores_persisted_true_without_model() {
+    fn resolve_effective_tts_enabled_ignores_persisted_true_without_service_configuration() {
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 

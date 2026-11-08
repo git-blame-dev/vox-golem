@@ -22,7 +22,7 @@ def descriptor():
 
 
 def config(path, endpoint='http://127.0.0.1:19765', extra=''):
-    path.write_text('[tts]\nprovider="neural"\nendpoint='+json.dumps(endpoint)+
+    path.write_text('[tts]\nendpoint='+json.dumps(endpoint)+
                     '\nvoice="synthetic-a"\nstart_command=[]\n'+extra)
     return path
 
@@ -48,7 +48,6 @@ class TypedSpeechTests(unittest.TestCase):
             with patch.object(windows, 'private_directory', side_effect=private), \
                     patch.object(windows, 'verify_native_driver_version', return_value='157.0.4341.42'), \
                     patch.object(windows, 'probe_neural_service', return_value=identity) as probe, \
-                    patch.object(windows, 'stage_private_espeak', side_effect=AssertionError('no Piper copy')), \
                     patch.dict(windows.os.environ, {'SystemRoot':str(root/'SyntheticWindows')}, clear=True):
                 fixtures, speech, profile = effects.prepare(arithmetic_profile(), runner)
                 self.assertEqual(fixtures, {})
@@ -74,7 +73,7 @@ class TypedSpeechTests(unittest.TestCase):
             manifest.write_text(json.dumps(value))
             loaded, roles = windows.load_manifest(manifest, arithmetic_profile(), 'typed-speech')
             self.assertEqual(set(roles), {'binary', 'tauri_driver', 'native_driver', 'config'})
-            with self.assertRaises(ValueError): windows.load_manifest(manifest, arithmetic_profile())
+            with self.assertRaises(ValueError): windows.load_manifest(manifest, arithmetic_profile(), 'voice-arithmetic')
             for update in ({'schema':True}, {'entry':'voice-arithmetic-windows'},
                            {'roles':dict(value['roles'], tts_model='assets/tts.onnx')},
                            {'contract_sha256':'0'*64}):
@@ -87,14 +86,14 @@ class TypedSpeechTests(unittest.TestCase):
     def test_configuration_refuses_nonliteral_remote_credentials_commands_and_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/'synthetic.toml'
-            self.assertEqual(windows.neural_configuration(config(path))['provider'], 'neural')
+            self.assertEqual(set(windows.neural_configuration(config(path))), {'endpoint', 'voice', 'start_command'})
             for endpoint in ('https://127.0.0.1:19765', 'http://localhost:19765',
                              'http://192.0.2.1:19765', 'http://synthetic@127.0.0.1:19765',
                              'http://127.0.0.1:19765/path', 'http://127.0.0.1:19765?',
                              'http://127.0.0.1:19765#', 'http://127.0.0.1'):
                 with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
                     windows.neural_configuration(config(path, endpoint))
-            for extra in ('model_path="synthetic.onnx"', '[custom_openai]\nendpoint="synthetic"'):
+            for extra in ('provider="neural"', 'model_path="synthetic.onnx"', '[custom_openai]\nendpoint="synthetic"'):
                 with self.assertRaises(ValueError): windows.neural_configuration(config(path, extra=extra))
             config(path)
             path.write_text(path.read_text().replace('start_command=[]', 'start_command=["synthetic"]'))
@@ -142,7 +141,7 @@ class TypedSpeechTests(unittest.TestCase):
     def test_windows_options_forbid_live_assets_and_foreign_modes(self):
         base = dict(entry='typed-speech', cases=['arithmetic'], windows_manifest=Path('/synthetic/manifest'))
         windows.validate_options(SimpleNamespace(**base), 'win32')
-        for update in ({'live':True}, {'tts_model':Path('/synthetic/model')}, {'wake_phrase':'synthetic'},
+        for update in ({'live':True}, {'wake_phrase':'synthetic'},
                        {'cases':['quick']}, {'shared_suite':True}, {'extended':True}, {'poll_interval':0.2}):
             with self.assertRaises(ValueError): windows.validate_options(SimpleNamespace(**dict(base, **update)), 'win32')
         with self.assertRaises(ValueError): windows.validate_options(SimpleNamespace(**base), 'linux')
@@ -157,7 +156,7 @@ class TypedSpeechTests(unittest.TestCase):
             import tomllib
             generated = tomllib.loads((root/'run/config/config.toml').read_text())
             self.assertEqual(generated['tts']['start_command'], [])
-            self.assertEqual(generated['tts']['provider'], 'neural')
+            self.assertNotIn('provider', generated['tts'])
             self.assertNotIn('wake_word_model_path', generated)
             self.assertFalse(generated['web_enabled'])
             self.assertEqual(env['VOXGOLEM_BENCH_MODE'], 'offline')

@@ -41,7 +41,6 @@ WINDOWS_NSIS_DIR := $(WINDOWS_RELEASE_DIR)/bundle/nsis
 WINDOWS_NSIS_INSTALLER := $(WINDOWS_NSIS_DIR)/VoxGolem_$(APP_VERSION)_x64-setup.exe
 IMPORT_LIB_DIR := $(CURDIR)/target/import-libs
 CROSS_SHIM_DIR := $(CURDIR)/target/cross-shims
-ESPEAK_COMPAT_HEADER := $(CROSS_SHIM_DIR)/espeak_windows_compat.h
 WINDOWS_NSIS_TEMPLATE := $(CROSS_SHIM_DIR)/windows-installer.nsi
 TAURI_NSIS_TEMPLATE_SOURCE := $(CURDIR)/.deps/tauri-bundler/2.9.1/installer.nsi
 TAURI_NSIS_TEMPLATE_URL := https://raw.githubusercontent.com/tauri-apps/tauri/e5ae5b93cdd310045191cc0526f253140ad64b87/crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi
@@ -319,7 +318,7 @@ stage-linux-existing:
 	@for file in $(LINUX_ORT_PROVIDER_LIBS); do \
 		source='$(LINUX_ORT_LIB_DIR)/'$$file; \
 		if [ ! -f "$$source" ]; then \
-			printf 'Missing TTS-capable ONNX Runtime provider asset: %s (expected in exact LINUX_ORT_LIB_DIR=%s; set ORT_LIB_PATH to override)\n' "$$file" '$(LINUX_ORT_LIB_DIR)' >&2; \
+			printf 'Missing ONNX Runtime provider asset: %s (expected in exact LINUX_ORT_LIB_DIR=%s; set ORT_LIB_PATH to override)\n' "$$file" '$(LINUX_ORT_LIB_DIR)' >&2; \
 			exit 1; \
 		fi; \
 		install -m 0755 "$$source" '$(LINUX_STAGED_RELEASE_DIR)/'$$file; \
@@ -444,15 +443,14 @@ check-pc-build-tools:
 	@command -v llvm-dlltool >/dev/null || { printf '%s\n' 'Missing llvm-dlltool. Install LLVM tools before running make pc.' >&2; exit 1; }
 	@command -v lld-link >/dev/null || { printf '%s\n' 'Missing lld-link. Install lld before running make pc.' >&2; exit 1; }
 
-prepare-pc-bundle: check-pc-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_LIB) $(VC_RUNTIME_DIR)/.complete $(WINDOWS_NSIS_TEMPLATE)
+prepare-pc-bundle: check-pc-tools $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_LIB) $(VC_RUNTIME_DIR)/.complete $(WINDOWS_NSIS_TEMPLATE)
 	@rm -rf '$(CURDIR)/target/tauri-windows-resources'
 	VOXGOLEM_VC_RUNTIME_DIR='$(VC_RUNTIME_DIR)' bash scripts/prepare-tauri-windows-resources.sh --prepare
 
-pc: check-pc-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_LIB)
+pc: check-pc-tools $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_LIB)
 	bun install --frozen-lockfile
 	PATH='$(WINDOWS_CROSS_BIN)':"$$PATH" \
 	VOXGOLEM_REAL_CLANG_CL='$(REAL_CLANG_CL)' \
-	VOXGOLEM_ESPEAK_COMPAT_HEADER='$(ESPEAK_COMPAT_HEADER)' \
 	CMAKE_GENERATOR=Ninja \
 	RUSTFLAGS="$${RUSTFLAGS:+$${RUSTFLAGS} }-L native=$(IMPORT_LIB_DIR)" \
 	cargo tauri build --runner cargo-xwin --target $(WINDOWS_TARGET) --no-bundle --config '{"bundle":{"resources":[]}}' -- --locked
@@ -461,11 +459,10 @@ pc: check-pc-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPOR
 # Separate diagnostic artifact, never a shipping package or updater input. Reuse
 # the established Linux MSVC cross-build environment; provisioning is explicit.
 .PHONY: pc-benchmark
-pc-benchmark: check-pc-build-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_LIB)
+pc-benchmark: check-pc-build-tools $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_LIB)
 	cd apps/desktop-tauri/src-tauri && \
 	PATH='$(WINDOWS_CROSS_BIN)':"$$PATH" \
 	VOXGOLEM_REAL_CLANG_CL='$(REAL_CLANG_CL)' \
-	VOXGOLEM_ESPEAK_COMPAT_HEADER='$(ESPEAK_COMPAT_HEADER)' \
 	CMAKE_GENERATOR=Ninja \
 	VITE_VOXGOLEM_BENCHMARK=1 \
 	CARGO_NET_OFFLINE=true \
@@ -491,7 +488,7 @@ pc-dist: pc
 	@$(MAKE) --no-print-directory verify-pc-dist
 	@printf 'Staged Windows release files: %s\n' '$(WINDOWS_STAGED_RELEASE_DIR)'
 
-pc-installer: check-pc-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_LIB) $(VC_RUNTIME_DIR)/.complete $(WINDOWS_NSIS_TEMPLATE)
+pc-installer: check-pc-tools $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_LIB) $(VC_RUNTIME_DIR)/.complete $(WINDOWS_NSIS_TEMPLATE)
 	@test -n '$(APP_VERSION)' || { printf '%s\n' 'Failed to generate application version.' >&2; exit 1; }
 	@case '$(APP_VERSION)' in *[!0-9A-Za-z.-]*|'') printf 'Invalid APP_VERSION: %s\n' '$(APP_VERSION)' >&2; exit 1;; esac
 	@rm -rf '$(WINDOWS_NSIS_DIR)'
@@ -499,7 +496,6 @@ pc-installer: check-pc-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRE
 	VOXGOLEM_VC_RUNTIME_DIR='$(VC_RUNTIME_DIR)' bash scripts/prepare-tauri-windows-resources.sh --prepare
 	PATH='$(WINDOWS_CROSS_BIN)':"$$PATH" \
 	VOXGOLEM_REAL_CLANG_CL='$(REAL_CLANG_CL)' \
-	VOXGOLEM_ESPEAK_COMPAT_HEADER='$(ESPEAK_COMPAT_HEADER)' \
 	CMAKE_GENERATOR=Ninja \
 	RUSTFLAGS="$${RUSTFLAGS:+$${RUSTFLAGS} }-L native=$(IMPORT_LIB_DIR)" \
 	cargo tauri build --runner cargo-xwin --target $(WINDOWS_TARGET) --bundles nsis --config '{"version":"$(APP_VERSION)","bundle":{"createUpdaterArtifacts":false}}' -- --locked
@@ -521,15 +517,6 @@ verify-pc-dist:
 
 clean:
 	rm -rf '$(CURDIR)/dist' '$(CURDIR)/package' '$(CURDIR)/target' '$(CURDIR)/frontend/app/dist'
-
-$(ESPEAK_COMPAT_HEADER):
-	@mkdir -p '$(CROSS_SHIM_DIR)'
-	@printf '%s\n' \
-		'#include <io.h>' \
-		'#include <fcntl.h>' \
-		'#ifdef _WIN32' \
-		'#pragma comment(lib, "advapi32")' \
-		'#endif' > '$@'
 
 $(TAURI_NSIS_TEMPLATE_SOURCE):
 	@command -v curl >/dev/null || { printf '%s\n' 'Missing curl. Install curl before preparing the NSIS template.' >&2; exit 1; }

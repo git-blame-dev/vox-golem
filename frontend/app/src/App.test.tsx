@@ -5146,13 +5146,13 @@ describe('Settings-only desktop speech diagnostics', () => {
   it('shows reported providers and static speech failures in Settings, not chat', async () => {
     const capabilities = completeCapabilities().map((item) => item['id'] === 'parakeet'
       ? { ...item, state: 'unavailable', reason: 'Synthetic STT model missing', actual_provider: null }
-      : item['id'] === 'tts' ? { ...item, actual_provider: 'cuda' } : item)
+      : item['id'] === 'wake_word' ? { ...item, actual_provider: 'cuda' } : item)
     window.__TAURI_INTERNALS__ = { invoke: async (command) => {
       if (command === 'get_app_snapshot') return appSnapshot([], {}, { capabilities })
       if (command === 'get_startup_state') return readyStartupState({ capabilities, voice_input_available: false, voice_input_error: 'Synthetic STT model missing',
         speech_services: {
           stt: { configured_engine: 'Parakeet', runtime_engine: null, configured_model: null, configured_voice: null, configured_locale: null },
-          tts: { configured_engine: 'Piper ONNX', runtime_engine: 'Piper ONNX', configured_model: null, configured_voice: null, configured_locale: null },
+          tts: { configured_engine: 'Neural TTS', runtime_engine: 'Neural TTS', configured_model: null, configured_voice: null, configured_locale: null },
         },
       })
       return null
@@ -5166,7 +5166,7 @@ describe('Settings-only desktop speech diagnostics', () => {
     expect(dialog.textContent).toContain('Parakeet')
     expect(dialog.textContent).toContain('Local processing')
     expect(dialog.textContent).toContain('CUDA')
-    expect(dialog.textContent).toContain('Piper ONNX')
+    expect(dialog.textContent).toContain('Neural TTS')
     expect(dialog.textContent).toContain('Model identity not reported')
     expect(dialog.textContent).toContain('Voice identity not reported')
   })

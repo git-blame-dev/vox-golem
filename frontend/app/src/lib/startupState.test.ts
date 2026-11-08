@@ -45,13 +45,13 @@ describe('parseStartupState', () => {
       message: 'Synthetic model warming',
       speech_services: {
         stt: { configured_engine: 'Parakeet', runtime_engine: 'Parakeet', configured_model: null, configured_voice: null, configured_locale: null },
-        tts: { configured_engine: 'Piper ONNX', runtime_engine: null, configured_model: 'Synthetic voice model', configured_voice: 'Synthetic voice', configured_locale: 'en-US' },
+        tts: { configured_engine: 'Neural TTS', runtime_engine: null, configured_model: 'Synthetic voice model', configured_voice: 'Synthetic voice', configured_locale: 'en-US' },
       },
     })
     expect(state).toMatchObject({
       speechServices: {
         stt: { configuredEngine: 'Parakeet', runtimeEngine: 'Parakeet', configuredModel: null, configuredVoice: null, configuredLocale: null },
-        tts: { configuredEngine: 'Piper ONNX', runtimeEngine: null, configuredModel: 'Synthetic voice model', configuredVoice: 'Synthetic voice', configuredLocale: 'en-US' },
+        tts: { configuredEngine: 'Neural TTS', runtimeEngine: null, configuredModel: 'Synthetic voice model', configuredVoice: 'Synthetic voice', configuredLocale: 'en-US' },
       },
     })
   })

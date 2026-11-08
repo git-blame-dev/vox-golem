@@ -18,22 +18,16 @@ printf '%s\n' \
   'set -eu' \
   'printf "%s\n" "$@" > "$VOXGOLEM_COMPILER_ARGS_LOG"' > "$temp_dir/compiler/clang-cl"
 chmod 0755 "$temp_dir/compiler/clang-cl"
-printf '%s\n' '#include <io.h>' '#include <fcntl.h>' > "$temp_dir/espeak-compat.h"
 VOXGOLEM_REAL_CLANG_CL="$temp_dir/compiler/clang-cl" \
-  VOXGOLEM_ESPEAK_COMPAT_HEADER="$temp_dir/espeak-compat.h" \
   VOXGOLEM_COMPILER_ARGS_LOG="$temp_dir/compiler-args" \
   "$root/scripts/windows-cross/clang-cl" -nologo -c -- "$temp_dir/unrelated.c"
-if grep -Fq '/FI' "$temp_dir/compiler-args"; then
-  printf '%s\n' 'Windows compiler wrapper modified an unrelated source.' >&2
-  exit 1
-fi
-VOXGOLEM_REAL_CLANG_CL="$temp_dir/compiler/clang-cl" \
-  VOXGOLEM_ESPEAK_COMPAT_HEADER="$temp_dir/espeak-compat.h" \
-  VOXGOLEM_COMPILER_ARGS_LOG="$temp_dir/compiler-args" \
-  "$root/scripts/windows-cross/clang-cl" -nologo -c -- "$temp_dir/espeak-ng/src/espeak-ng.c"
 mapfile -t compiler_args < "$temp_dir/compiler-args"
+test "${#compiler_args[@]}" -eq 5
 test "${compiler_args[0]}" = '--driver-mode=cl'
-test "${compiler_args[1]}" = "/FI$temp_dir/espeak-compat.h"
+test "${compiler_args[1]}" = '-nologo'
+test "${compiler_args[2]}" = '-c'
+test "${compiler_args[3]}" = '--'
+test "${compiler_args[4]}" = "$temp_dir/unrelated.c"
 
 # The generated stub retains these variables for its own runtime.
 # shellcheck disable=SC2016

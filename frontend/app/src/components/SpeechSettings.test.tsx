@@ -5,7 +5,7 @@ import { parseStartupState, CAPABILITY_IDS } from '../lib/startupState'
 import { parseAndroidVoiceStatus } from '../lib/androidVoice'
 import { SpeechSettings } from './SpeechSettings'
 
-function startup(speechServices?: unknown, ttsProvider: string | null = 'cuda') {
+function startup(speechServices?: unknown, sttProvider: string | null = 'cuda') {
   return parseStartupState({
     kind: 'ready',
     cue_asset_paths: { start_listening: 'start.wav', stop_listening: 'stop.wav' },
@@ -16,14 +16,14 @@ function startup(speechServices?: unknown, ttsProvider: string | null = 'cuda') 
     selected_response_profile: 'fast',
     supported_response_profiles: ['fast'],
     tts_enabled: true,
-    capabilities: CAPABILITY_IDS.map((id) => ({ id, state: 'available', reason: 'ready', actual_provider: id === 'tts' ? ttsProvider : 'cpu' })),
+    capabilities: CAPABILITY_IDS.map((id) => ({ id, state: 'available', reason: 'ready', actual_provider: id === 'parakeet' ? sttProvider : null })),
     ...(speechServices === undefined ? {} : { speech_services: speechServices }),
   })
 }
 
 const identity = {
   stt: { configured_engine: 'Parakeet', runtime_engine: 'Parakeet', configured_model: null, configured_voice: null, configured_locale: null },
-  tts: { configured_engine: 'Piper ONNX', runtime_engine: 'Piper ONNX', configured_model: null, configured_voice: null, configured_locale: null },
+  tts: { configured_engine: 'Neural TTS', runtime_engine: 'Neural TTS', configured_model: null, configured_voice: null, configured_locale: null },
 }
 
 const speechOptions = {
@@ -123,7 +123,7 @@ describe('SpeechSettings', () => {
       }
       act(() => details.querySelector('summary')!.click())
       expect(details.open).toBe(true)
-      expect(details.textContent).toContain('Runtime engine: Piper ONNX')
+      expect(details.textContent).toContain('Runtime engine: Neural TTS')
     } finally { dispose() }
   })
   it('keeps requested controls and actionable failures outside closed native diagnostics', () => {
@@ -288,16 +288,17 @@ describe('SpeechSettings', () => {
     try {
       expect(phone.container.textContent).toContain('recognition_retirement_failed')
       expect(desktop.container.querySelector('input')).toBeNull()
-      expect(desktop.container.querySelector('select')).toBeNull()
+      expect(desktop.container.querySelector('[aria-label="TTS engine"]')).toBeNull()
+      expect(desktop.container.querySelector('[aria-label="Desktop TTS voice"]')).toBeNull()
     } finally { phone.dispose(); desktop.dispose() }
   })
-  it.each(['cpu', 'cuda'])('shows native engine identity independently of %s execution', (provider) => {
+  it.each(['cpu', 'cuda'])('shows native engine identity independently of %s recognition execution', (provider) => {
     const { container, dispose } = renderSpeech({ android: false, androidStatus: null, statusError: null, startupState: startup(identity, provider) })
     try {
       expect(container.textContent).toContain('Configured engine: Parakeet')
       expect(container.textContent).toContain('Runtime engine: Parakeet')
-      expect(container.textContent).toContain('Configured engine: Piper ONNX')
-      expect(container.textContent).toContain('Runtime engine: Piper ONNX')
+      expect(container.textContent).toContain('Configured engine: Neural TTS')
+      expect(container.textContent).toContain('Runtime engine: Neural TTS')
       expect(container.textContent).toContain(`Reported execution provider: ${provider.toUpperCase()}`)
       expect(container.textContent).toContain('Model identity not reported')
       expect(container.textContent).not.toMatch(/Kokoro|PocketTTS|Local synthesis/)
@@ -308,7 +309,7 @@ describe('SpeechSettings', () => {
     const configured = { ...identity, tts: { ...identity.tts, runtime_engine: null, configured_model: 'Synthetic model', configured_voice: 'Synthetic voice', configured_locale: 'en-US' } }
     const { container, dispose } = renderSpeech({ android: false, androidStatus: null, statusError: null, startupState: startup(configured, null) })
     try {
-      expect(container.textContent).toContain('Configured engine: Piper ONNX')
+      expect(container.textContent).toContain('Configured engine: Neural TTS')
       expect(container.textContent).toContain('Runtime engine: Not loaded')
       expect(container.textContent).toContain('Configured model: Synthetic model')
       expect(container.textContent).toContain('Configured voice: Synthetic voice')
@@ -320,7 +321,7 @@ describe('SpeechSettings', () => {
     const { container, dispose } = renderSpeech({ android: false, androidStatus: null, statusError: null, startupState: startup() })
     try {
       expect(container.textContent).toContain('Engine identity not reported')
-      expect(container.textContent).not.toMatch(/Configured engine:|Runtime engine:|Kokoro|PocketTTS|Piper|Parakeet/)
+      expect(container.textContent).not.toMatch(/Configured engine:|Runtime engine:|Kokoro|PocketTTS|Neural TTS|Parakeet/)
     } finally { dispose() }
   })
 
@@ -335,7 +336,7 @@ describe('SpeechSettings', () => {
     } })
     try {
       expect(container.textContent).toContain('warming · Synthetic TTS warming')
-      expect(container.textContent).toContain('Runtime engine: Piper ONNX')
+      expect(container.textContent).toContain('Runtime engine: Neural TTS')
       expect(container.textContent).toContain('Reported execution provider: CUDA')
       expect(container.textContent).not.toContain('Runtime engine: CUDA')
     } finally { dispose() }
@@ -349,7 +350,7 @@ describe('SpeechSettings', () => {
       expect(container.textContent).toContain('Runtime engine: Not loaded')
       expect(container.textContent).toContain('Locale not reported')
       expect(container.textContent).toContain('Voice identity not reported')
-      expect(container.textContent).not.toMatch(/Piper|Parakeet|en-US|Kokoro|PocketTTS/)
+      expect(container.textContent).not.toMatch(/Neural TTS|Parakeet|en-US|Kokoro|PocketTTS/)
     } finally { dispose() }
   })
 
@@ -359,7 +360,7 @@ describe('SpeechSettings', () => {
     try {
       expect(container.textContent).toContain(androidStatus.recognitionRoute)
       expect(container.textContent).toContain(androidStatus.ttsRoute)
-      expect(container.textContent).not.toMatch(/Piper|Parakeet|Configured engine/)
+      expect(container.textContent).not.toMatch(/Neural TTS|Parakeet|Configured engine/)
     } finally { dispose() }
   })
 

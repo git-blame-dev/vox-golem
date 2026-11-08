@@ -57,8 +57,8 @@ actual attempts and their disposition in the outer history.
 | Platform/profile | Input and output | Budget / result boundary |
 | --- | --- | --- |
 | Android A17 shared arithmetic | Finite synthesized PCM into the real recognizer; real semantic Ask, frontend Channel, canonical/UI answer and native TTS | One explicitly authorized live trial; exact answer and separate retirement/profile proofs; overall unverified, exit 2 on a valid workflow |
-| Linux shared arithmetic offline | Normal synthetic capture, wake/VAD/Parakeet; real Piper/backend through private ALSA null output | Zero live admissions, one fake-model admission; schema-3 offline qualification is not acoustic acceptance; shared exit 2 |
-| Native Windows shared arithmetic diagnostic | Staged finite PCM and real native voice flow; WASAPI render diagnostic | Zero live admissions; schema 4 stays diagnostic-only, `passed=false`, no live qualification; completed diagnostic maps to shared exit 2 |
+| Desktop synthetic voice | Retired Piper arithmetic profiles | Unsupported, including `--list`; exit 2 before runtime access |
+| Native Windows typed speech | Normal composer and existing Neural service; WASAPI render diagnostic | Zero live admissions; schema 4 stays diagnostic-only, `passed=false`, no live qualification; completed diagnostic maps to shared exit 2 |
 | Wear legacy synthetic voice | Existing **four-word** fixture, recognizer, native model/presentation/TTS | Separate protocol-1 one-trial profile; earlier physical acceptance does not qualify shared arithmetic |
 
 Only arithmetic has additive `voice` metadata in `scenarios.json`.
@@ -75,7 +75,7 @@ python3 tools/benchmark/benchmark.py --platform desktop --workload synthetic-voi
 ```
 
 The generated relative path is `voxgolem-benchmark/arithmetic-voice.json`.
-Listing is transport- and artifact-write-free. The desktop runner's
+Listing is transport- and artifact-write-free; desktop synthetic voice reports unsupported. The desktop runner's
 `fixtures.arithmetic_profile()` consumes this same contract. Fixture generation
 and preparation are not part of Activity-relative or submit-to-output timing.
 
@@ -224,55 +224,23 @@ verify the facade/asset are absent and restore the compatible ordinary optimized
 APK by authorized in-place update, preserving app data. Keep candidate, installed
 comparison and ordinary APK copies outside Git.
 
-### Synthetic voice: shared desktop entry
+### Synthetic voice: retired desktop entry
 
-Build/staging and platform prerequisites are in `tools/app-bench/README.md`.
-Use a fresh output path outside Git whose parent already exists; the authoritative
-child runner creates/protects it. The common wrapper does not apply Unix chmod or
-require Git metadata on Windows. Never supply old `--offline-evidence` to this profile.
+Desktop `--workload synthetic-voice` is unsupported, including `--list`: it
+returns exit 2 with `desktop_synthetic_voice_profile_retired_use_neural_typed_speech_windows`
+before asset, transport or runtime access. The former Linux `voice-arithmetic`
+and Windows `voice-arithmetic-windows` Piper profiles and schema-1 Windows staging
+are retired; `--tts-model` is removed. Historical qualification is not Neural
+evidence. Android and Wear synthetic voice retain their existing contracts.
 
-```sh
-python3 tools/benchmark/benchmark.py --platform desktop --workload synthetic-voice \
-  --desktop-platform linux --max-live-calls 0 --model custom-luna-none --repetitions 1 \
-  --binary "$BINARY" --tools "$BENCH_TOOLS" --config "$SOURCE_CONFIG" \
-  --tts-model "$TTS_MODEL" --wake-phrase "$SYNTHETIC_WAKE_PHRASE" --output "$FRESH_RUN"
-```
-
-Native Windows PowerShell, from the explicitly staged checkout and existing private
-Python environment with Selenium (not Linux Python invoking a guessed bridge):
-
-```powershell
-& $PRIVATE_PYTHON tools/benchmark/benchmark.py --platform desktop --workload synthetic-voice `
-  --desktop-platform windows --max-live-calls 0 --model custom-luna-none --repetitions 1 `
-  --binary $BINARY --tools $WINDOWS_DRIVERS --config $SOURCE_CONFIG `
-  --tts-model $TTS_MODEL --wake-phrase $SYNTHETIC_WAKE_PHRASE `
-  --windows-manifest $WINDOWS_MANIFEST --output $FRESH_RUN
-```
-
-`--desktop-platform` defaults only within this desktop voice adapter to the actual
-native Linux/Windows host; explicit mismatches fail closed. The four new desktop
-voice options are rejected for typed, Android and Wear workloads. Desktop voice
-requires **exactly zero live budget**, not the default seven: `--live`, physical
-flags, old qualification evidence, history, cases, stage/UI-probe and port controls
-are rejected. It delegates to the existing single arithmetic runner profile, not
-the legacy three-case/fixed-12 live ledger. Neither desktop profile is live-eligible.
-
-The wrapper reads only bounded child `report.json` metadata and prints a content-free
-summary; it does not rewrite the child report or create a second qualification.
-Linux child exit 0 plus offline qualification maps to shared `unverified` / exit 2.
-Windows child exit 1 is expected even for a completed diagnostic; only a valid
-schema-4 workflow with owned cleanup maps to shared exit 2. Failures, unexpected
-exits, missing/malformed reports and timeout exit 1 with cleanup unverified where
-proof is absent. The 900-second desktop observation watchdog has a separate
-at-most-10-second local reap allowance; killing the runner proves no app cleanup.
-
-Phone schema-2 and Wear schema-1 reports share outer `artifacts/benchmarks/voice/`
-retention: private files, 128 KiB/report, 90 days, 100 files, 8 MiB. Desktop uses
-its existing marked child-report collection (90 days, 128 files, 8 MiB); the common
-wrapper refuses child reports above 128 KiB. See desktop docs for the distinct
-16 MiB fixture-bundle limit and retained private profiles. Export only safe hashes,
-categorical stages/outcomes and bounded counters/offsets: no raw content, tokens,
-device IDs, credentials, provider bodies or endpoints.
+For desktop reply speech use the explicit Windows `--workload typed-speech`
+diagnostic below. Its schema-2 staging and schema-4 reports preserve Job/private
+storage, identity and cleanup checks, without claiming live qualification.
+Desktop child reports retain their existing bounded marked collection (90 days,
+128 files, 8 MiB); the wrapper refuses reports above 128 KiB. Phone schema-2 and
+Wear schema-1 reports retain their outer voice collection (90 days, 100 files,
+8 MiB). Export only safe hashes, categories and bounded counters, without content,
+credentials, provider bodies or endpoints.
 
 ### Synthetic voice: legacy Wear pipeline (preserved profile)
 

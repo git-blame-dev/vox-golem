@@ -271,8 +271,6 @@ static ENTRY: OnceLock<&'static str> = OnceLock::new();
 fn parse_entry(entry: Option<&str>, automatic: bool) -> Result<&'static str, String> {
     match (entry.unwrap_or("voice"), automatic) {
         ("voice", _) => Ok("voice"),
-        ("voice-arithmetic", false) => Ok("voice-arithmetic"),
-        ("voice-arithmetic-windows", false) => Ok("voice-arithmetic-windows"),
         ("typed-speech-windows", false) => Ok("typed-speech-windows"),
         ("typed", false) => Ok("typed"),
         ("typed", true) => Err("Typed entry cannot queue automatic capture diagnostics".into()),
@@ -365,17 +363,15 @@ fn validate_environment_inner() -> Result<(), String> {
         std::env::var_os("VOXGOLEM_BENCH_AUTO_DIAGNOSTIC_CASE").is_some(),
     )?;
     let _ = ENTRY.set(entry);
-    if cfg!(target_os = "windows")
-        && !matches!(entry, "voice-arithmetic-windows" | "typed-speech-windows")
-    {
-        return Err("Windows benchmark supports only the offline arithmetic diagnostic".into());
+    if cfg!(target_os = "windows") && entry != "typed-speech-windows" {
+        return Err(
+            "Windows benchmark supports only the offline Neural typed-speech diagnostic".into(),
+        );
     }
-    if matches!(
-        entry,
-        "voice-arithmetic" | "voice-arithmetic-windows" | "typed-speech-windows"
-    ) && std::env::var("VOXGOLEM_BENCH_MODE").as_deref() != Ok("offline")
+    if entry == "typed-speech-windows"
+        && std::env::var("VOXGOLEM_BENCH_MODE").as_deref() != Ok("offline")
     {
-        return Err("Arithmetic benchmark has no live allowance".into());
+        return Err("Typed-speech benchmark has no live allowance".into());
     }
     if !matches!(
         std::env::var("VOXGOLEM_BENCH_MODE").as_deref(),
@@ -384,17 +380,13 @@ fn validate_environment_inner() -> Result<(), String> {
         return Err("Benchmark mode must be explicit".into());
     }
     let root = root()?;
-    if entry == "voice-arithmetic" {
-        validate_null_output(&root)?;
-    }
-    if matches!(entry, "voice-arithmetic-windows" | "typed-speech-windows") {
+    if entry == "typed-speech-windows" {
         validate_windows_storage(&root)?;
     }
     if entry == "typed-speech-windows" {
         let config = voxgolem_core::config::load_runtime_config(None)
             .map_err(|_| "Typed speech configuration unavailable")?;
-        if config.local_tts.provider != voxgolem_core::config::TtsProvider::Neural
-            || !config.local_tts.enabled
+        if !config.local_tts.enabled
             || !config.local_tts.start_command.is_empty()
             || config.local_tts.voice.is_empty()
             || config.wake_word_model_path.exists()
@@ -483,41 +475,11 @@ fn root() -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
-fn validate_null_output(root: &Path) -> Result<(), String> {
-    if !cfg!(target_os = "linux") || Path::new("/dev/snd").exists() {
-        return Err("Arithmetic output requires isolated Linux software ALSA".into());
-    }
-    let path = PathBuf::from(
-        std::env::var_os("ALSA_CONFIG_PATH").ok_or("Arithmetic ALSA configuration missing")?,
-    );
-    if path.is_symlink()
-        || path.canonicalize().ok().as_deref() != Some(root.join("alsa-null.conf").as_path())
-    {
-        return Err("Arithmetic ALSA configuration is not private".into());
-    }
-    if fs::metadata(&path)
-        .map_err(|_| "Arithmetic ALSA configuration unavailable")?
-        .len()
-        > 64
-        || fs::read(&path).map_err(|_| "Arithmetic ALSA configuration unavailable")?
-            != b"pcm.!default { type null }\n"
-        || std::env::vars_os().any(|(key, _)| {
-            let key = key.to_string_lossy().to_ascii_uppercase();
-            ["PULSE_", "PIPEWIRE_", "JACK_"]
-                .iter()
-                .any(|prefix| key.starts_with(prefix))
-        })
-    {
-        return Err("Arithmetic output route is not software-null only".into());
-    }
-    Ok(())
-}
-
 fn validate_windows_storage(root: &Path) -> Result<(), String> {
     if !cfg!(target_os = "windows")
         || std::env::var("VOXGOLEM_BENCH_OUTPUT_ROUTE").as_deref() != Ok("wasapi-render-diagnostic")
     {
-        return Err("Windows arithmetic is diagnostic-only native render output".into());
+        return Err("Windows typed speech is diagnostic-only native render output".into());
     }
     for (key, folder) in [
         ("APPDATA", "appdata"),
@@ -882,29 +844,19 @@ fn snapshot(app_state: &AppState) -> Result<serde_json::Value, String> {
         "reply_speech": speech_metadata(&events, speech_retired(app_state)),
         "speech_identity": app_state.local_tts_runtime.lock().ok().and_then(|runtime| {
             runtime.as_ref().map(|runtime| {
-                if let Some(client) = runtime.neural_client() {
-                    let capabilities = client.capabilities();
-                    serde_json::json!({"engine":"neural", "backend":capabilities.backend,
-                        "voice":runtime.selected_neural_voice(), "sample_rate_hz":runtime.sample_rate_hz(),
-                        "incremental_audio":capabilities.incremental_audio, "protocol_version":capabilities.protocol_version})
-                } else {
-                    serde_json::json!({"engine":"piper", "sample_rate_hz":runtime.sample_rate_hz()})
-                }
+                let client = runtime.neural_client();
+                let capabilities = client.capabilities();
+                serde_json::json!({"engine":"neural", "backend":capabilities.backend,
+                    "voice":runtime.selected_neural_voice(), "sample_rate_hz":runtime.sample_rate_hz(),
+                    "incremental_audio":capabilities.incremental_audio, "protocol_version":capabilities.protocol_version})
             })
         }),
-        "tts_actual_provider": app_state.local_tts_runtime.lock().ok()
-            .and_then(|runtime| runtime.as_ref().and_then(|runtime| runtime.actual_provider()))
-            .map(|provider| match provider {
-                tts::TtsActualProvider::Cpu => "cpu",
-                tts::TtsActualProvider::Cuda => "cuda",
-            }),
         "generation": voxgolem_platform::app_benchmark::get_counts(),
     }))
 }
 
 fn fixture_allowed(entry: Option<&str>, fixture: &str) -> bool {
     match entry {
-        Some("voice-arithmetic" | "voice-arithmetic-windows") => fixture == "arithmetic",
         Some("voice") => matches!(fixture, "quick" | "short_research" | "long_research"),
         _ => false,
     }
@@ -956,11 +908,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn generated_arithmetic_environment_loads_real_model_readiness() {
+    fn generated_neural_typed_speech_environment_loads_real_model_readiness() {
         if std::env::var("VOXGOLEM_BENCH_MODE").as_deref() != Ok("offline") {
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .env("VOXGOLEM_BENCH_MODE", "offline")
-                .args(["--exact", "app_benchmark::tests::generated_arithmetic_environment_loads_real_model_readiness"])
+                .args(["--exact", "app_benchmark::tests::generated_neural_typed_speech_environment_loads_real_model_readiness"])
                 .output().unwrap();
             assert!(
                 child.status.success(),
@@ -980,11 +932,9 @@ import pathlib,sys,shutil
 sys.path.insert(0,str(pathlib.Path(sys.argv[1])/'tools/app-bench'))
 import runner
 root=pathlib.Path(sys.argv[2]); source=root/'synthetic-source.toml'
-asset=root/'synthetic-model.onnx';asset.write_bytes(b'synthetic-not-initialized')
-asr=root/'synthetic-asr';asr.mkdir()
-source.write_text('\n'.join(f'{k} = "{p}"' for k,p in [('wake_word_model_path',asset),('silero_vad_model',asset),('parakeet_model_dir',asr)]))
+source.write_text('[tts]\nendpoint="http://127.0.0.1:19765"\nvoice="synthetic-a"\nstart_command=[]\n')
 run=root/'run';run.mkdir()
-runner.isolated_environment(run,source,'http://127.0.0.1:32123/responses',entry='voice-arithmetic',tts_model=asset)
+runner.isolated_environment(run,source,'http://127.0.0.1:32123/responses',entry='typed-speech',output_route='windows-diagnostic')
 shutil.copytree(run/'config',root/'VoxGolem')
 "#])
             .arg(repo).arg(directory.path()).output().unwrap();
@@ -996,6 +946,13 @@ shutil.copytree(run/'config',root/'VoxGolem')
         let path = super::super::application_config_path().unwrap();
         let config = voxgolem_core::config::load_runtime_config(Some(&path)).unwrap();
         let capabilities = super::super::configured_capabilities(&config);
+        assert!(config.local_tts.enabled);
+        assert_eq!(config.local_tts.endpoint, "http://127.0.0.1:19765");
+        assert_eq!(config.local_tts.voice, "synthetic-a");
+        assert!(config.local_tts.start_command.is_empty());
+        assert!(!config.wake_word_model_path.exists());
+        assert!(!config.parakeet_model_dir.exists());
+        assert!(!config.silero_vad_model.exists());
         assert!(super::super::capability_available(
             &capabilities,
             "custom_provider"
@@ -1040,26 +997,14 @@ shutil.copytree(run/'config',root/'VoxGolem')
         );
     }
     #[test]
-    fn arithmetic_queue_cannot_borrow_legacy_cases_or_typed_admission() {
-        assert!(super::fixture_allowed(
-            Some("voice-arithmetic"),
+    fn typed_speech_cannot_queue_voice_fixtures() {
+        assert!(!super::fixture_allowed(
+            Some("typed-speech-windows"),
             "arithmetic"
         ));
-        assert!(!super::fixture_allowed(Some("voice-arithmetic"), "quick"));
         assert!(!super::fixture_allowed(Some("voice"), "arithmetic"));
-        assert!(super::fixture_allowed(
-            Some("voice-arithmetic-windows"),
-            "arithmetic"
-        ));
-        assert!(!super::fixture_allowed(
-            Some("voice-arithmetic-windows"),
-            "quick"
-        ));
         assert!(!super::fixture_allowed(Some("typed"), "arithmetic"));
-        assert!(!super::fixture_allowed(
-            Some("voice-arithmetic"),
-            "../arithmetic"
-        ));
+        assert!(super::fixture_allowed(Some("voice"), "quick"));
     }
 
     #[test]
@@ -1169,13 +1114,9 @@ shutil.copytree(run/'config',root/'VoxGolem')
             (None, false, Some("voice")),
             (None, true, Some("voice")),
             (Some("voice"), true, Some("voice")),
-            (Some("voice-arithmetic"), false, Some("voice-arithmetic")),
+            (Some("voice-arithmetic"), false, None),
             (Some("voice-arithmetic"), true, None),
-            (
-                Some("voice-arithmetic-windows"),
-                false,
-                Some("voice-arithmetic-windows"),
-            ),
+            (Some("voice-arithmetic-windows"), false, None),
             (Some("voice-arithmetic-windows"), true, None),
             (
                 Some("typed-speech-windows"),

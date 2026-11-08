@@ -33,18 +33,12 @@ inference_provider = "auto" # auto, cuda, or cpu
 
 [tts]
 enabled = false
-# Transitional default: "piper". Select "neural" for the local Neural TTS service.
-provider = "piper"
-# Neural settings; the service owns its installed voices and models.
+# Desktop uses the separately installed Neural TTS service and its voice catalog.
 endpoint = "http://127.0.0.1:8765"
 voice = ""
 # Optional trusted executable + literal arguments; empty means externally managed.
 start_command = []
-# Piper settings remain available until Neural desktop acceptance.
-model_path = "models/tts/jarvis.onnx"
-worker_count = 1
-max_queue = 8
-sample_rate_hz = 22050
+# The service handshake supplies the actual audio sample rate.
 max_duration_s = 300
 output_gain_db = 3
 

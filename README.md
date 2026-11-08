@@ -23,7 +23,7 @@ Linux builds and tests do not establish Windows, Android or Wear runtime readine
 
 ## Desktop speech
 
-Desktop can select `provider = "neural"` under `[tts]` in the runtime config.
+Desktop speech uses Neural TTS exclusively, configured under `[tts]` in the runtime config.
 Neural TTS supplies synthesis and its installed voice catalog over loopback;
 Vox owns bounded native playback, Stop, cues and output drain. Settings exposes
 voice selection and an explicit service reconnect. Android and Wear continue to
@@ -37,8 +37,14 @@ Vox releases only its own session when exiting and never terminates another clie
 service. Service startup and inference can delay the first reply. Current Qwen
 produces complete utterances; framed PCM transport does not imply incremental model
 audio. Fixed spoken cues prepare outside microphone admission, with embedded cues
-available immediately. Piper remains the transitional default until Windows Neural
-acceptance; `provider = "piper"` keeps the existing model configuration usable.
+available immediately. The service handshake supplies the actual audio sample rate;
+Vox retains bounded audio duration, buffer size and output gain.
+
+New configurations omit `provider` and all Piper tuning keys (`model_path`,
+`worker_count`, `max_queue`, `sample_rate_hz`). Existing explicit `provider = "neural"`
+files still load, discarding those obsolete tuning keys. Explicit `provider = "piper"`
+is rejected with migration guidance; install/configure Neural and remove the old
+provider and tuning keys before enabling desktop speech.
 
 ## Desktop local diagnostics
 
@@ -170,10 +176,10 @@ The default OpenCode location is `$HOME/.opencode/bin/opencode`, followed by WSL
 
 ## WSL2/WSLg setup
 
-Install Bun 1.3.9, Rust 1.95.0, Tauri CLI 2.11.1, and the Ubuntu WebKitGTK/GTK, audio, CMake, Ninja, Clang/LLVM, and eSpeak development packages. WSLg supplies the Linux GUI and microphone integration; verify those manually on your machine.
+Install Bun 1.3.9, Rust 1.95.0, Tauri CLI 2.11.1, and the Ubuntu WebKitGTK/GTK, audio, CMake, Ninja, and Clang/LLVM development packages. WSLg supplies the Linux GUI and microphone integration; verify those manually on your machine.
 
 ```bash
-sudo apt-get install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev libxdo-dev libespeak-dev cmake ninja-build clang lld llvm pkg-config p7zip-full xdg-utils
+sudo apt-get install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev libxdo-dev cmake ninja-build clang lld llvm pkg-config p7zip-full xdg-utils
 cargo install tauri-cli --version 2.11.1 --locked
 ```
 
