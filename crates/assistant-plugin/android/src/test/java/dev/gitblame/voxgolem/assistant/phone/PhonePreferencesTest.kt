@@ -21,7 +21,7 @@ class PhonePreferencesTest {
         val initializedReads = reads
         assertTrue(initializedReads > 0)
         preferences.initialize()
-        repeat(3) { assertEquals("slate", preferences.read("custom-sol-high").getString("ui_theme")) }
+        repeat(3) { assertEquals("dark", preferences.read("custom-sol-high").getString("ui_theme")) }
         assertEquals(initializedReads, reads)
     }
     @Test fun pendingCommitAndRollbackNeverBlockReadersOrPublishFailedValues() {
@@ -52,7 +52,7 @@ class PhonePreferencesTest {
             assertEquals("dark", preferences.read("custom-sol-high").getString("ui_theme"))
             val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
             try {
-                val write = executor.submit<Unit> { preferences.write(PhonePreferences.defaults().put("ui_theme", "slate")) }
+                val write = executor.submit<Unit> { preferences.write(PhonePreferences.defaults().put("ui_theme", "light")) }
                 assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
                 val read = executor.submit<String> { preferences.read("custom-sol-high").getString("ui_theme") }
                 try { assertEquals("dark", read.get(1, java.util.concurrent.TimeUnit.SECONDS)) }
@@ -67,11 +67,11 @@ class PhonePreferencesTest {
                         write.get(5, java.util.concurrent.TimeUnit.SECONDS)
                     }.cause is AssistantPhoneFailure)
                 }
-                assertEquals(if (succeed) "slate" else "dark", preferences.read("custom-sol-high").getString("ui_theme"))
+                assertEquals(if (succeed) "light" else "dark", preferences.read("custom-sol-high").getString("ui_theme"))
             } finally { release.countDown(); rollbackRelease.countDown(); executor.shutdownNow() }
         }
     }
-    @Test fun acceptsAllThemesAndKeepsDarkDefaultWithoutAcceptingAliases() {
+    @Test fun acceptsCanonicalThemesAndLegacySlateButRejectsUnknownValues() {
         assertEquals("dark", PhonePreferences.defaults().getString("ui_theme"))
         for (theme in listOf("dark", "slate", "light")) {
             PhonePreferences.validate(PhonePreferences.defaults().put("ui_theme", theme))
@@ -82,6 +82,29 @@ class PhonePreferencesTest {
             }
             assertEquals("invalid_input", error.code)
         }
+    }
+    @Test fun legacyProposalPersistsAndPublishesDarkWithoutMutatingInputOrPartialInvalidWrites() {
+        val storage = org.robolectric.RuntimeEnvironment.getApplication().getSharedPreferences("synthetic-theme-migration", 0)
+        storage.edit().clear().commit()
+        val preferences = PhonePreferences(storage).apply { initialize() }
+        preferences.write(PhonePreferences.defaults().put("ui_theme", "light"))
+        val invalid = PhonePreferences.defaults().put("ui_theme", "slate").put("completion", true)
+        assertThrows(AssistantPhoneFailure::class.java) { preferences.write(invalid) }
+        assertEquals("light", preferences.read("custom-sol-high").getString("ui_theme"))
+        assertEquals("light", storage.getString("ui_theme", null))
+        val legacy = PhonePreferences.defaults().put("ui_theme", "slate")
+        preferences.write(legacy)
+        assertEquals("slate", legacy.getString("ui_theme"))
+        assertEquals("dark", preferences.read("custom-sol-high").getString("ui_theme"))
+        assertEquals("dark", storage.getString("ui_theme", null))
+        assertEquals("dark", PhonePreferences(storage).apply { initialize() }.read("custom-sol-high").getString("ui_theme"))
+    }
+    @Test fun unknownStoredThemeCannotBePublished() {
+        val storage = org.robolectric.RuntimeEnvironment.getApplication().getSharedPreferences("synthetic-invalid-theme", 0)
+        storage.edit().clear().putString("ui_theme", "sepia").commit()
+        val preferences = PhonePreferences(storage)
+        assertThrows(AssistantPhoneFailure::class.java) { preferences.initialize() }
+        assertThrows(AssistantPhoneFailure::class.java) { preferences.read("custom-sol-high") }
     }
     @Test fun retainsAllLegacyKeysAndEnumSpellings() {
         val value = PhonePreferences.defaults().put("deep", "custom-luna-low").put("review", "custom-luna-low").put("ui_text_size", "extra_large")

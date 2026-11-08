@@ -23,12 +23,12 @@ class MainActivity : TauriActivity(), PhoneStartupTimingOwner, PhoneUiThemeOwner
   override val startupTiming by lazy { PhoneStartupTiming(this) }
 
   override fun applyUiTheme(theme: String) {
-    if (isFinishing || isDestroyed || theme == lastUiTheme) return
-    if (theme != "dark" && theme != "slate" && theme != "light") return
-    val dark = theme != "light"
+    val canonical = dev.gitblame.voxgolem.assistant.phone.PhonePreferences.normalizeUiTheme(theme) ?: return
+    if (isFinishing || isDestroyed || canonical == lastUiTheme) return
+    val dark = canonical != "light"
     val bars = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT) { dark }
     enableEdgeToEdge(statusBarStyle = bars, navigationBarStyle = bars)
-    lastUiTheme = theme
+    lastUiTheme = canonical
   }
 
   override fun onWebViewCreate(webView: WebView) {

@@ -170,13 +170,13 @@ class EnginePhonePreferencesTest {
                 succeed
             }
             var terminal: Result<Any?>? = null
-            val input = f.backend.nativePreferences().put("ui_theme", "slate").put("web_enabled", false)
+            val input = f.backend.nativePreferences().put("ui_theme", "light").put("web_enabled", false)
             var observerTheme: String? = null
             val observer = f.engine.subscribe { state ->
                 if (!state.webEnabled) observerTheme = f.backend.nativePreferences().getString("ui_theme")
             }
             f.queueUpdate(input) {
-                assertEquals(if (succeed) "slate" else "dark", f.backend.nativePreferences().getString("ui_theme"))
+                assertEquals(if (succeed) "light" else "dark", f.backend.nativePreferences().getString("ui_theme"))
                 terminal = it
             }
             val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
@@ -206,21 +206,21 @@ class EnginePhonePreferencesTest {
 
     @Test fun enqueuedInputAndReturnedOutputCannotMutateAcknowledgedPublication() {
         Fixture(false).use { f ->
-            val input = f.backend.nativePreferences().put("ui_theme", "slate")
+            val input = f.backend.nativePreferences().put("ui_theme", "light")
             var replies = 0
             f.queueUpdate(input) { result ->
                 val output = result.getOrThrow() as JSONObject
-                assertEquals("slate", f.backend.nativePreferences().getString("ui_theme"))
+                assertEquals("light", f.backend.nativePreferences().getString("ui_theme"))
                 assertFalse(f.backend.busy())
-                output.put("ui_theme", "light")
+                output.put("ui_theme", "dark")
                 replies++
             }
-            input.put("ui_theme", "light")
+            input.put("ui_theme", "dark")
             assertEquals("dark", f.backend.nativePreferences().getString("ui_theme"))
             assertEquals(0, replies)
             f.drain()
             assertEquals(1, replies)
-            assertEquals("slate", f.backend.nativePreferences().getString("ui_theme"))
+            assertEquals("light", f.backend.nativePreferences().getString("ui_theme"))
         }
     }
 
@@ -315,7 +315,7 @@ class EnginePhonePreferencesTest {
         }
     }
 
-    @Test fun sonnetLowRoundTripsWithoutLosingSlateOrEnablingUnsupportedCapabilities() {
+    @Test fun sonnetLowRoundTripsWhileMigratingSlateWithoutEnablingUnsupportedCapabilities() {
         Fixture(false).use { f ->
             val input = f.backend.nativePreferences().put("instant", "agy-sonnet-low")
                 .put("deep", "agy-sonnet-low").put("review", "agy-sonnet-low").put("ui_theme", "slate")
@@ -323,29 +323,30 @@ class EnginePhonePreferencesTest {
             val restored = PhonePreferences(f.context).apply { initialize() }.read("agy-sonnet-low")
             for (value in listOf(result, f.backend.nativePreferences(), restored)) {
                 for (key in listOf("instant", "deep", "review")) assertEquals("agy-sonnet-low", value.getString(key))
-                assertEquals("slate", value.getString("ui_theme"))
+                assertEquals("dark", value.getString("ui_theme"))
                 assertFalse(value.getBoolean("deep_enabled")); assertFalse(value.getBoolean("review_enabled"))
             }
             assertEquals(listOf("agy-sonnet-low"), f.prewarmed)
         }
     }
 
-    @Test fun allThemesRoundTripThroughNativePublicationAndStorageWithoutInvalidWrites() {
+    @Test fun canonicalThemesAndLegacyMigrationPublishAndPersistWithoutInvalidWrites() {
         Fixture(false).use { f ->
             assertEquals("dark", f.backend.nativePreferences().getString("ui_theme"))
             for (theme in listOf("slate", "light", "dark", "slate")) {
                 val result = f.update(f.backend.nativePreferences().put("ui_theme", theme)).getOrThrow() as JSONObject
-                assertEquals(theme, result.getString("ui_theme"))
-                assertEquals(theme, f.backend.nativePreferences().getString("ui_theme"))
-                assertEquals(theme, f.persisted().getString("ui_theme"))
+                val canonical = if (theme == "slate") "dark" else theme
+                assertEquals(canonical, result.getString("ui_theme"))
+                assertEquals(canonical, f.backend.nativePreferences().getString("ui_theme"))
+                assertEquals(canonical, f.persisted().getString("ui_theme"))
             }
             assertTrue(f.update(f.backend.nativePreferences().put("ui_theme", "sepia")).isFailure)
-            assertEquals("slate", f.backend.nativePreferences().getString("ui_theme"))
-            assertEquals("slate", f.persisted().getString("ui_theme"))
+            assertEquals("dark", f.backend.nativePreferences().getString("ui_theme"))
+            assertEquals("dark", f.persisted().getString("ui_theme"))
             f.rejectModelWrite = true
             assertTrue(f.update(f.backend.nativePreferences().put("instant", "agy-flash-high").put("ui_theme", "light")).isFailure)
-            assertEquals("slate", f.backend.nativePreferences().getString("ui_theme"))
-            assertEquals("slate", f.persisted().getString("ui_theme"))
+            assertEquals("dark", f.backend.nativePreferences().getString("ui_theme"))
+            assertEquals("dark", f.persisted().getString("ui_theme"))
         }
     }
 

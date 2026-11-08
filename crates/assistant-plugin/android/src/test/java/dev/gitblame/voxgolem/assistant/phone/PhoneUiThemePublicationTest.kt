@@ -23,7 +23,7 @@ class PhoneUiThemePublicationTest {
         for (theme in listOf("dark", "slate", "light")) {
             val owner = Owner()
             PhoneUiThemePublication(owner).publishResult(snapshot(theme), preferences = false)
-            assertEquals(listOf(theme), owner.applied)
+            assertEquals(listOf(if (theme == "slate") "dark" else theme), owner.applied)
         }
     }
 
@@ -34,7 +34,7 @@ class PhoneUiThemePublicationTest {
         publication.publishResult(preferences("light"), preferences = true)
         publication.publishResult(snapshot("dark"), preferences = false)
         publication.publishResult(preferences("slate"), preferences = true)
-        assertEquals(listOf("dark", "light", "slate"), owner.applied)
+        assertEquals(listOf("dark", "light", "dark"), owner.applied)
     }
 
     @Test fun failedWriteDoesNotApplyOrBlockInitialSnapshot() {
@@ -43,7 +43,17 @@ class PhoneUiThemePublicationTest {
         publication.publishResult(Result.failure(IllegalStateException("synthetic write failure")), preferences = true)
         assertEquals(emptyList<String>(), owner.applied)
         publication.publishResult(snapshot("slate"), preferences = false)
-        assertEquals(listOf("slate"), owner.applied)
+        assertEquals(listOf("dark"), owner.applied)
+    }
+
+    @Test fun directLegacyPublicationNormalizesBeforeDeduplicationAndClosesSnapshotGate() {
+        val owner = Owner()
+        val publication = PhoneUiThemePublication(owner)
+        publication.publish("sepia", preferences = true)
+        publication.publish("dark", preferences = false)
+        publication.publish("slate", preferences = true)
+        publication.publish("light", preferences = false)
+        assertEquals(listOf("dark"), owner.applied)
     }
 
     @Test fun invalidResultsAreIgnoredAndDuplicatesStillCloseSnapshotGate() {

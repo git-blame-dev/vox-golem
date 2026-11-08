@@ -644,8 +644,8 @@ impl ResponseProfile {
 #[serde(rename_all = "snake_case")]
 pub enum UiTheme {
     Light,
+    #[serde(alias = "slate")]
     Dark,
-    Slate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1707,18 +1707,30 @@ mod tests {
     }
 
     #[test]
-    fn preferences_round_trip_all_themes_and_reject_unknown_values() {
-        for theme in ["dark", "slate", "light"] {
+    fn preferences_normalize_legacy_theme_and_reject_unknown_values() {
+        for (theme, canonical) in [("dark", "dark"), ("slate", "dark"), ("light", "light")] {
             let mut wire = serde_json::to_value(preferences()).unwrap();
             wire["ui_theme"] = theme.into();
             let parsed: ValidatedPreferences = serde_json::from_value(wire).unwrap();
-            assert_eq!(serde_json::to_value(parsed).unwrap()["ui_theme"], theme);
+            assert_eq!(serde_json::to_value(parsed).unwrap()["ui_theme"], canonical);
         }
         for theme in ["sepia", "dim", "sleek-dark"] {
             let mut wire = serde_json::to_value(preferences()).unwrap();
             wire["ui_theme"] = theme.into();
             assert!(serde_json::from_value::<ValidatedPreferences>(wire).is_err());
         }
+    }
+
+    #[test]
+    fn legacy_theme_in_persisted_preferences_normalizes_before_toml_write() {
+        let legacy = toml::to_string(&preferences())
+            .unwrap()
+            .replace("ui_theme = \"dark\"", "ui_theme = \"slate\"");
+        let parsed: ValidatedPreferences = toml::from_str(&legacy).unwrap();
+        assert_eq!(parsed, preferences());
+        let canonical = toml::to_string(&parsed).unwrap();
+        assert!(canonical.contains("ui_theme = \"dark\""));
+        assert!(!canonical.contains("slate"));
     }
 
     #[test]
