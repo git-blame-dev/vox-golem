@@ -67,6 +67,30 @@ def build_identity(adb, args):
             'version_code':int(version[1]), 'installed_apk_sha256':digest, 'provided_apk_sha256':local}
 
 
+def safe_native_diagnostics(details):
+    if type(details) is not dict:
+        return {}
+    flags = ('send_present', 'send_visible', 'send_enabled', 'latest_present', 'latest_visible',
+        'latest_enabled', 'latest_requested', 'latest_acked', 'root_target', 'screen_interactive',
+        'keyguard_locked', 'primary_enabled', 'engine_foreground', 'context_ready', 'busy', 'failed',
+        'credential_ready', 'error_present', 'readiness_complete')
+    safe = {key:details[key] for key in flags if type(details.get(key)) is bool}
+    if type(details.get('branch_count')) is int and 0 <= details['branch_count'] <= 128:
+        safe['branch_count'] = details['branch_count']
+    categories = {
+        'primary_action': ('SEND', 'STOP', 'ASK', 'TALK'),
+        'credential_reason': ('READY', 'MISSING', 'EXPIRED', 'INVALID', 'UNAUTHORIZED', 'FORBIDDEN', 'UNKNOWN'),
+        'failure_reason': ('none', 'engine_error', 'engine_busy', 'context_not_ready', 'credential_not_ready',
+                           'refresh_timeout', 'turn_incomplete', 'canonical_validation_failed'),
+        'error_code': ('auth_expired', 'auth_unavailable', 'unauthorized', 'forbidden', 'background',
+                       'interrupted', 'unsupported_model', 'choose_continuation', 'unknown'),
+    }
+    for key, allowed in categories.items():
+        if type(details.get(key)) is str and details[key] in allowed:
+            safe[key] = details[key]
+    return safe
+
+
 def decode_response(raw, sequence):
     def unique(pairs):
         result = {}
@@ -83,17 +107,7 @@ def decode_response(raw, sequence):
             raise ValueError('sequence')
         if value.get('status') == 'failed' and value.get('phase') in FAILURE_PHASES:
             error = Blocked('wear_native_' + value['phase'] + '_failed')
-            details = value.get('readiness_diagnostics')
-            if type(details) is dict:
-                flags = ('send_present', 'send_visible', 'send_enabled', 'latest_present', 'latest_visible',
-                    'latest_enabled', 'latest_requested', 'latest_acked', 'root_target', 'screen_interactive',
-                    'keyguard_locked', 'primary_enabled', 'engine_foreground')
-                safe = {key:details[key] for key in flags if type(details.get(key)) is bool}
-                if type(details.get('branch_count')) is int and 0 <= details['branch_count'] <= 128:
-                    safe['branch_count'] = details['branch_count']
-                if details.get('primary_action') in ('SEND', 'STOP', 'ASK', 'TALK'):
-                    safe['primary_action'] = details['primary_action']
-                error.native_diagnostics = safe
+            error.native_diagnostics = safe_native_diagnostics(value.get('readiness_diagnostics'))
             raise error
         if value.get('status') not in ('configured', 'ready', 'complete', 'blocked', 'cleaned'):
             raise ValueError('result')
@@ -284,6 +298,16 @@ class NativeSuiteDriver:
 
     async def exercise(self, model, prompt, **kwargs):
         await kwargs['confirm_ready']()
+        try:
+            ready = await self.mailbox.command('await_ready')
+        except BaseException:
+            self.failed = True
+            raise
+        if ready.get('readiness_complete') is not True:
+            self.failed = True
+            error = Blocked('wear_native_await_ready_failed')
+            error.native_diagnostics = safe_native_diagnostics(ready)
+            raise error
         # Conservatively count an attempt before handing control to the native
         # runner; its independent budget is consumed before any UI action.
         await kwargs['submission_observer']()
@@ -302,7 +326,9 @@ class NativeSuiteDriver:
             self.failed = True
             if result.get('ancestry_valid') is False:
                 raise Blocked('wear_native_canonical_ancestry_failed')
-            raise Blocked('wear_native_turn_not_complete')
+            error = Blocked('wear_native_turn_not_complete')
+            error.native_diagnostics = safe_native_diagnostics(result)
+            raise error
         request = result.get('request')
         if type(request) is not str or not re.fullmatch(r'turn-[1-9][0-9]?', request) or request in self.requests:
             self.failed = True

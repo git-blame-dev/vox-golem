@@ -143,7 +143,11 @@ object PhoneSyntheticVoiceBenchmark {
         instrumentation.runOnMainSync {
             val speech = current.voice
             val state = current.handle.engine.snapshot()
-            if (state.error != null || (!current.diagnostic && speech?.status()?.isNull("error") == false)) current.failed = true
+            if (state.error != null) {
+                current.engineError = safeEngineError(state.error)
+                current.fail("engine")
+            }
+            if (!current.diagnostic && speech?.status()?.isNull("error") == false) current.fail("speech")
             idle = speech != null && !speech.active() && !state.busy
             if (current.profileObserved && !current.failed) current.observeDom()
         }
@@ -234,6 +238,12 @@ object PhoneSyntheticVoiceBenchmark {
         val counts = ConcurrentHashMap<String, AtomicInteger>()
         val observed = ConcurrentHashMap<String, Long>()
         @Volatile var failed = false
+        @Volatile var engineError = "none"
+        @Volatile private var failureStage = "none"
+        @Synchronized fun fail(stage: String) {
+            if (!failed) failureStage = stage
+            failed = true
+        }
         @Volatile var activity: WeakReference<Activity>? = null
         @Volatile var webView: WeakReference<WebView>? = null
         @Volatile var profileObserved = false
@@ -260,6 +270,9 @@ object PhoneSyntheticVoiceBenchmark {
         private var uiRows = 0
         private var clicked = false
         private var domPending = false
+        private var domReplyKind = "unobserved"
+        private var domFailureStep = "none"
+        private var nativeSpeechFacts: Map<String, Boolean> = emptyMap()
         private val directory = requireNotNull(profile).nativeDirectory(token)
         private val applicationContext = application
         private val journal = AssistantDiagnosticJournal.forContext(application)
@@ -269,7 +282,7 @@ object PhoneSyntheticVoiceBenchmark {
                 if (event.kind == AssistantTiming.Kind.BEGIN && event.operation == AssistantTiming.Operation.GENERATION) increment("generation")
                 val stage = event.stage
                 if (event.kind == AssistantTiming.Kind.MARK && stage != null) {
-                    if (stage == AssistantTiming.Stage.RETIREMENT_FAILED) failed = true
+                    if (stage == AssistantTiming.Stage.RETIREMENT_FAILED) fail("retirement")
                     val key = "${event.operation.name}_${stage.name}"
                     increment(key); observed.putIfAbsent(key, event.observedNanos)
                 }
@@ -299,7 +312,7 @@ object PhoneSyntheticVoiceBenchmark {
                     modelAvailable = selectedModelAvailable(snapshot)
                     credentialReason = safeCredentialReason(handle.engine.snapshot())
                     projectionObserved = true
-                } catch (_: Exception) { failed = true }
+                } catch (_: Exception) { fail("projection") }
                 finally { projectionPending.set(false); done() }
             }
         }
@@ -326,7 +339,7 @@ object PhoneSyntheticVoiceBenchmark {
         fun constructSpeech() {
             check(Looper.myLooper() == Looper.getMainLooper() && !admission.isRetiring() && voice == null)
             val factory = FixtureRecognizerFactory(context, pcm, contract,
-                onFinal = { increment("finals") }, onRejected = { failed = true },
+                onFinal = { increment("finals") }, onRejected = { fail("recognition") },
                 onObservedFinal = { match, eof, words ->
                     counts["fixture_words_match"] = AtomicInteger(if (match) 1 else 0)
                     counts["fixture_eof_observed"] = AtomicInteger(if (eof) 1 else 0)
@@ -356,11 +369,11 @@ object PhoneSyntheticVoiceBenchmark {
             increment("frontend_submit_observed"); mark("FRONTEND_SUBMIT_OBSERVED")
         }
         override fun terminal(requestId: String, result: Result<Any?>) {
-            if (this.requestId != requestId) { failed = true; return }
+            if (this.requestId != requestId) { fail("terminal_identity"); return }
             val value = result.getOrNull() as? JSONObject
-            if (value == null || value.optString("kind") != "completed" || value.has("warning")) { failed = true; return }
+            if (value == null || value.optString("kind") != "completed" || value.has("warning")) { fail("terminal_outcome"); return }
             canonicalAnswer = runCatching { value.getJSONObject("turn").getJSONObject("answer").getJSONObject("content").getString("text").trim() }.getOrNull()
-            if (canonicalAnswer != contract.answer) failed = true
+            if (canonicalAnswer != contract.answer) fail("answer")
         }
         fun observeDom() {
             if (admission.isRetiring()) return
@@ -373,17 +386,41 @@ object PhoneSyntheticVoiceBenchmark {
             view.evaluateJavascript(script) { raw ->
                 domPending = false
                 if (admission.isRetiring()) return@evaluateJavascript
+                domReplyKind = when {
+                    raw == null -> "absent"
+                    raw == "null" -> "null"
+                    raw.startsWith("{") -> "object"
+                    else -> "other"
+                }
+                var step = "reply"
                 try {
-                    check(raw != null && raw.length <= 512)
-                    val value = JSONObject(raw)
+                    val value = if (inspectOnly) readinessReply(raw) ?: return@evaluateJavascript else {
+                        check(raw != null && raw.length <= 512)
+                        JSONObject(raw)
+                    }
+                    step = "keys"
                     if (inspectOnly) {
                         check(value.keys().asSequence().toSet() == setOf("count", "enabled", "visible", "ready", "modelMatches", "modelAvailable"))
+                        step = "count"
                         check(value.opt("count") is Int && value.getInt("count") in 0..2)
+                        step = "types"
                         for (key in listOf("enabled", "visible", "ready", "modelMatches", "modelAvailable")) check(value.opt(key) is Boolean)
+                        step = "fields"
                         askCount = value.getInt("count"); askEnabled = value.getBoolean("enabled")
                         documentVisible = value.getBoolean("visible"); frontendReady = value.getBoolean("ready")
                         uiModelMatches = value.getBoolean("modelMatches"); uiModelAvailable = value.getBoolean("modelAvailable")
                         domObserved = true
+                        if (diagnostic && frontendReady && nativeSpeechFacts.isEmpty()) {
+                            runCatching { voice?.status() }.getOrNull()?.let { speech ->
+                                nativeSpeechFacts = mapOf(
+                                    "native_input_available" to speech.optBoolean("available"),
+                                    "native_missing_speech_services" to speech.optBoolean("missingSpeechServices"),
+                                    "native_input_foreground" to speech.optBoolean("inputForeground"),
+                                    "capture_admission_ready" to AssistantRuntime.captureResourceAdmissionReady(),
+                                    "microphone_permission_granted" to (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED),
+                                )
+                            }
+                        }
                     } else if (!clicked) {
                         check(value.keys().asSequence().toSet() == setOf("clicked", "count"))
                         check(value.opt("clicked") is Boolean && value.opt("count") is Int && value.getInt("count") in 0..2)
@@ -395,7 +432,7 @@ object PhoneSyntheticVoiceBenchmark {
                         uiEqual = value.getBoolean("exact") && uiRows == 1
                         if (uiEqual) mark("PRESENTATION_DOM_OBSERVED")
                     }
-                } catch (_: Exception) { failed = true }
+                } catch (_: Exception) { domFailureStep = step; fail("dom_contract") }
             }
         }
         private fun increment(key: String) { counts.computeIfAbsent(key) { AtomicInteger() }.incrementAndGet() }
@@ -406,13 +443,17 @@ object PhoneSyntheticVoiceBenchmark {
                 count("GENERATION_DURABLE_COMMITTED") == 1 && count("GENERATION_SETTLED") == 1 && count("VOICE_FLOW_SETTLED") == 1 &&
                 count("TTS_UTTERANCE_ON_START") >= 1 && count("TTS_UTTERANCE_ON_DONE") >= 1 && canonicalAnswer == contract.answer && uiEqual && idle
             return Bundle().apply {
-                val diagnosed = diagnostic && projectionObserved && domObserved && askCount == 1 && uiModelMatches && profileObserved
+                val diagnosed = diagnostic && projectionObserved && domObserved && askCount == 1 &&
+                    uiModelMatches && uiModelAvailable && profileObserved && modelAvailable && frontendReady && askEnabled && documentVisible
                 putInt("synthetic_protocol", 2)
                 if (!diagnostic) putInt("synthetic_trial", 1)
                 putString("stage", if (failed) "failed" else if (diagnosed) "readiness_observed" else if (complete) "complete" else "running")
                 putString("model", "custom-luna-none"); putString("contract_sha256", contractHash)
                 putBoolean("profile_mapping_verified", profileObserved); putBoolean("frontend_ask_clicked", clicked)
                 putString("credential_reason", credentialReason); putBoolean("model_projection_observed", projectionObserved)
+                putString("failure_stage", failureStage); putString("engine_error_category", engineError)
+                putString("dom_reply_kind", domReplyKind); putString("dom_failure_step", domFailureStep)
+                nativeSpeechFacts.forEach { (key, value) -> putBoolean(key, value) }
                 putBoolean("private_model_available", modelAvailable); putBoolean("frontend_ready_to_send", frontendReady)
                 putBoolean("ui_selected_model_matches", uiModelMatches); putBoolean("ui_selected_model_available", uiModelAvailable)
                 putInt("ask_present_count", askCount); putBoolean("ask_enabled", askEnabled); putBoolean("document_visible", documentVisible)
@@ -437,6 +478,21 @@ object PhoneSyntheticVoiceBenchmark {
     }
     internal fun safeCredentialReason(state: AssistantState): String =
         state.credential?.reason?.name?.lowercase(java.util.Locale.ROOT) ?: "unknown"
+
+    internal fun safeEngineError(error: String?): String = when (error) {
+        null -> "none"
+        "storage_error", "domain_error", "unsupported_model", "unsupported_speech_language",
+        "unsupported_tts_provider", "unsupported_tts_voice", "invalid_speech_selection",
+        "unauthorized", "forbidden", "rate_limited", "timeout", "transport",
+        "provider_failure", "retirement_failed" -> error
+        else -> "other"
+    }
+
+    internal fun readinessReply(raw: String?): JSONObject? {
+        if (raw == null || raw == "null") return null
+        check(raw.length <= 512)
+        return JSONObject(raw)
+    }
 
     internal class ScopedContext(base: Context, private val directory: File) : ContextWrapper(base),
         dev.gitblame.voxgolem.voice.AndroidBackgroundAdmissionOwner {

@@ -54,6 +54,25 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(raised.exception.native_diagnostics,
             {'send_visible':False, 'latest_acked':True, 'primary_action':'SEND', 'branch_count':0})
 
+    def test_credential_failure_diagnostics_drop_raw_errors_and_generations(self):
+        value = json.dumps({'sequence':1, 'status':'failed', 'phase':'await_ready', 'readiness_diagnostics':{
+            'credential_ready':False, 'credential_reason':'INVALID', 'failure_reason':'credential_not_ready',
+            'context_ready':True, 'busy':False, 'failed':False, 'error_present':False,
+            'error_code':'secret payload', 'generation':'secret payload', 'error':'secret payload'}})
+        with self.assertRaises(wear.Blocked) as raised:
+            wear.decode_response(value, 1)
+        self.assertEqual(raised.exception.native_diagnostics, {
+            'credential_ready':False, 'credential_reason':'INVALID', 'failure_reason':'credential_not_ready',
+            'context_ready':True, 'busy':False, 'failed':False, 'error_present':False})
+
+    def test_failure_diagnostic_categories_require_known_strings_and_exact_boolean_types(self):
+        for unknown in ('synthetic raw payload', [], {}, True, 1, None):
+            with self.subTest(value=unknown):
+                self.assertEqual(wear.safe_native_diagnostics({
+                    'credential_reason':unknown, 'failure_reason':unknown, 'error_code':unknown}), {})
+        self.assertEqual(wear.safe_native_diagnostics({'credential_ready':1, 'error_present':'true',
+            'context_ready':[], 'branch_count':True}), {})
+
     def test_installed_optimized_artifact_must_match(self):
         digest = hashlib.sha256(b'synthetic apk').hexdigest()
         class ADB:
@@ -97,6 +116,8 @@ class NativeDriverTests(unittest.IsolatedAsyncioTestCase):
                 self.commands.append((operation, args))
                 if operation == 'setup_case':
                     return {'status':'configured', 'tts':False, 'configuration':'isolated_policy_not_ui'}
+                if operation == 'await_ready':
+                    return {'status':'ready', 'readiness_complete':True}
                 if operation == 'status':
                     return {'status':'ready', 'busy':uncertain and self.turn > 0 and not self.cleaned, 'failed':False}
                 if operation == 'submit':
@@ -153,6 +174,56 @@ class NativeDriverTests(unittest.IsolatedAsyncioTestCase):
             await common.run_suite(None, self.args(), report, driver=driver)
         self.assertTrue(mailbox.cleaned)
         self.assertEqual(mailbox.turn, 1)
+
+    async def test_missing_credential_gate_spends_no_submission_and_never_sends(self):
+        mailbox = self.mailbox()
+        mailbox.command = AsyncMock(return_value={'status':'blocked', 'readiness_complete':False,
+            'credential_ready':False, 'credential_reason':'MISSING', 'failure_reason':'credential_not_ready'})
+        driver = wear.NativeSuiteDriver(mailbox, common, {})
+        submitted = AsyncMock()
+        with self.assertRaisesRegex(common.Blocked, 'wear_native_await_ready_failed') as raised:
+            await driver.exercise(mailbox.model, 'Synthetic fixture', confirm_ready=AsyncMock(),
+                submission_observer=submitted)
+        self.assertEqual(raised.exception.native_diagnostics['credential_reason'], 'MISSING')
+        submitted.assert_not_awaited()
+        mailbox.command.assert_awaited_once_with('await_ready')
+
+    async def test_native_readiness_failure_preserves_diagnostics_and_cleanup(self):
+        mailbox = self.mailbox()
+        original = mailbox.command
+        async def command(operation, **args):
+            if operation == 'await_ready':
+                return wear.decode_response(json.dumps({'sequence':1, 'status':'failed', 'phase':'await_ready',
+                    'readiness_diagnostics':{'credential_ready':False, 'credential_reason':'INVALID',
+                        'failure_reason':'credential_not_ready', 'error':'synthetic raw payload'}}), 1)
+            return await original(operation, **args)
+        mailbox.command = command
+        report = {'cases':[], 'cleanup':{}, 'status':'fail'}
+        driver = wear.NativeSuiteDriver(mailbox, common, report)
+        with self.assertRaisesRegex(common.Blocked, 'wear_native_await_ready_failed') as raised:
+            await common.run_suite(None, self.args(), report, driver=driver)
+        self.assertEqual(report['admissions']['submitted'], 0)
+        self.assertEqual(mailbox.turn, 0)
+        self.assertTrue(mailbox.cleaned)
+        self.assertEqual(raised.exception.native_diagnostics['credential_reason'], 'INVALID')
+
+    async def test_blocked_turn_retains_only_categorical_native_diagnostics(self):
+        result = {'status':'blocked', 'submitted':True, 'execution_valid':False,
+            'credential_ready':False, 'credential_reason':'MISSING', 'error_present':True,
+            'failure_reason':'engine_error', 'error_code':'auth_unavailable',
+            'error':'secret payload', 'canonical_answer':'secret payload', 'generation':'secret payload'}
+        mailbox = self.mailbox()
+        mailbox.command = AsyncMock(side_effect=[{'status':'ready', 'readiness_complete':True}, result])
+        driver = wear.NativeSuiteDriver(mailbox, common, {})
+        observed = AsyncMock()
+        with self.assertRaisesRegex(common.Blocked, 'wear_native_turn_not_complete') as raised:
+            await driver.exercise(mailbox.model, 'Synthetic fixture', confirm_ready=AsyncMock(),
+                submission_observer=observed, admission_observer=AsyncMock(), terminal_observer=AsyncMock())
+        self.assertEqual(raised.exception.native_diagnostics, {
+            'credential_ready':False, 'credential_reason':'MISSING', 'error_present':True,
+            'failure_reason':'engine_error', 'error_code':'auth_unavailable'})
+        self.assertEqual(observed.await_count, 1)
+        self.assertEqual(mailbox.command.await_count, 2)
 
     async def test_uncertain_submission_is_never_retried_and_requires_retirement(self):
         mailbox = self.mailbox(uncertain=True)

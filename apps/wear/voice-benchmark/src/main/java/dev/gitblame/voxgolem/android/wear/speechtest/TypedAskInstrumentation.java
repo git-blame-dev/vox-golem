@@ -93,6 +93,8 @@ public final class TypedAskInstrumentation extends Instrumentation {
                     response = dispatch(operation, request);
                 } catch (Exception error) {
                     blocked = true;
+                    try { if (configured && !"await_ready".equals(phase)) captureReadiness(); }
+                    catch (Exception ignored) { /* Preserve the last bounded readiness observation. */ }
                     response = new JSONObject().put("status", "failed").put("failure_class", error.getClass().getName())
                         .put("execution_valid", false).put("phase", phase);
                     if (readinessDiagnostics != null) response.put("readiness_diagnostics", readinessDiagnostics);
@@ -138,6 +140,13 @@ public final class TypedAskInstrumentation extends Instrumentation {
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
                 awaitReady(); configured = true;
                 return json(result);
+            }
+            case "await_ready": {
+                phase = "await_ready";
+                keys(request, "sequence", "command");
+                require(!blocked && configured);
+                awaitReady();
+                return new JSONObject().put("status", "ready").put("readiness_complete", true);
             }
             case "probe": {
                 phase = "prepare_draft";
@@ -187,7 +196,11 @@ public final class TypedAskInstrumentation extends Instrumentation {
                 if (terminal) phase = "canonical_validation";
                 JSONObject result = terminal ? json(invoke("validate", null)) : json(state);
                 boolean valid = terminal && result.optBoolean("execution_valid");
-                if (!valid) blocked = true;
+                if (!valid) {
+                    blocked = true;
+                    if ("none".equals(result.optString("failure_reason")))
+                        result.put("failure_reason", terminal ? "canonical_validation_failed" : "turn_incomplete");
+                }
                 result.put("status", blocked ? "blocked" : "complete").put("submitted", true)
                     .put("native_rate_limit_observed", rateLimited)
                     .put("request", armed.getString("request")).put("execution_valid", valid)
@@ -220,13 +233,9 @@ public final class TypedAskInstrumentation extends Instrumentation {
 
     private void awaitReady() throws Exception {
         phase = "await_ready";
-        long deadline = Math.min(expires, SystemClock.elapsedRealtime() + 15000);
-        do {
-            Bundle state = invoke("status", null);
-            if (state.getBoolean("context_ready") && !state.getBoolean("busy") && !state.getBoolean("failed")) return;
-            SystemClock.sleep(50);
-        } while (SystemClock.elapsedRealtime() < deadline);
-        throw new IllegalStateException("not_ready");
+        Bundle state = invoke("awaitReady", null);
+        readinessDiagnostics = json(state);
+        require(state.getBoolean("readiness_complete"));
     }
 
     private static String boundedPrompt(JSONObject request) throws Exception {
@@ -236,6 +245,7 @@ public final class TypedAskInstrumentation extends Instrumentation {
     }
 
     private void prepareDraft(String prompt) throws Exception {
+        awaitReady();
         phase = "prepare_draft";
         Bundle input = new Bundle(); input.putString("prompt", prompt);
         Bundle prepared = invoke("prepareDraft", input);
@@ -341,6 +351,9 @@ public final class TypedAskInstrumentation extends Instrumentation {
             .put("screen_interactive", screenInteractive()).put("keyguard_locked", keyguardLocked())
             .put("primary_action", state.getString("primary_action")).put("primary_enabled", state.getBoolean("primary_enabled"))
             .put("engine_foreground", state.getBoolean("engine_foreground")).put("branch_count", state.getInt("branch_count"));
+        for (String key : new String[] { "context_ready", "busy", "failed", "credential_ready", "credential_reason",
+                "error_present", "error_code", "failure_reason", "readiness_complete" })
+            if (state.containsKey(key)) facts.put(key, state.get(key));
         readinessDiagnostics = facts;
     }
 

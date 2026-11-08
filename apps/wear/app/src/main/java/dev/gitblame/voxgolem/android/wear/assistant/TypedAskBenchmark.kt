@@ -96,6 +96,22 @@ object TypedAskBenchmark {
         return Bundle().apply { putString("status", "configured"); putString("configuration", "isolated_policy_not_ui"); putBoolean("tts", false) }
     }
 
+    /** Read-only credential refresh on the existing actor; no provider generation or approval mutation. */
+    @androidx.annotation.Keep // Invoked reflectively by the separately packaged instrumentation.
+    @JvmStatic fun awaitReady(instrumentation: Instrumentation): Bundle {
+        authorize(instrumentation)
+        check(Looper.myLooper() != Looper.getMainLooper())
+        val engine = requireNotNull(session).engine
+        val deadline = minOf(expires, SystemClock.elapsedRealtime() + 15_000)
+        val state = TypedBenchmarkReadiness.await(deadline, SystemClock::elapsedRealtime, Thread::sleep) { remaining ->
+            val settled = CountDownLatch(1)
+            var refreshed: AssistantState? = null
+            engine.refresh { refreshed = it; settled.countDown() }
+            if (settled.await(remaining, TimeUnit.MILLISECONDS)) refreshed else null
+        }
+        return TypedBenchmarkReadiness.diagnostics(state)
+    }
+
     internal fun validateDraft(text: String): String {
         require(text.isNotBlank() && AssistantTextInput.accepts(text))
         return text
@@ -127,11 +143,12 @@ object TypedAskBenchmark {
         check(!terminalFailure && turns < maxTurns)
         val text = requireNotNull(arguments.getString("prompt"))
         validateDraft(text)
+        check(awaitReady(instrumentation).getBoolean("readiness_complete"))
         val state = requireNotNull(session).engine.snapshot()
-        check(state.contextReady && !state.busy && state.error == null && state.draft == text)
+        check(TypedBenchmarkReadiness.ready(state) && state.draft == text)
         baseline = canonical(instrumentation).getInt("turn_count")
         val selected = requireNotNull(session).engine.snapshot()
-        check(selected.draft == text && selected.contextReady && !selected.busy && selected.error == null)
+        check(selected.draft == text && TypedBenchmarkReadiness.ready(selected))
         prompt = text
         turns++ // Consume budget before the UI action, including failed/uncertain submissions.
         sendPermit.arm(requireNotNull(session).engine, selected)
@@ -154,9 +171,7 @@ object TypedAskBenchmark {
             presentedDraft = activity?.get()?.typedBenchmarkDraft().orEmpty()
             primary = activity?.get()?.typedBenchmarkPrimary()
         }
-        return Bundle().apply {
-            putBoolean("busy", state.busy); putBoolean("context_ready", state.contextReady)
-            putBoolean("failed", state.error != null)
+        return TypedBenchmarkReadiness.diagnostics(state).apply {
             putString("tool_status", state.toolStatus)
             putString("provisional", presentedProvisional.take(MAX_TEXT))
             putString("presented_draft", presentedDraft.take(MAX_TEXT))
@@ -337,9 +352,53 @@ internal class TypedBenchmarkSendPermit {
         val matches = authorized && client === owner && expected != null &&
             current.draft == expected.draft && current.conversation == expected.conversation &&
             current.selectedHead == expected.selectedHead && current.model == expected.model &&
-            current.webEnabled == expected.webEnabled && current.contextReady && current.foreground &&
-            !current.busy && current.error == null
+            current.webEnabled == expected.webEnabled && current.foreground &&
+            TypedBenchmarkReadiness.ready(current)
         clear()
         return matches
+    }
+}
+
+/** Uses only settled engine observations, never the credential generation/path or raw errors. */
+internal object TypedBenchmarkReadiness {
+    fun ready(state: AssistantState): Boolean = state.contextReady && !state.busy && state.error == null &&
+        state.credential?.reason == ProviderAuthReason.READY
+
+    fun await(deadline: Long, now: () -> Long, pause: (Long) -> Unit,
+        refresh: (Long) -> AssistantState?): AssistantState? {
+        var last: AssistantState? = null
+        while (true) {
+            val budget = deadline - now()
+            if (budget <= 0) return last
+            last = refresh(budget) ?: return null
+            if (ready(last) || last.error != null || last.busy) return last
+            val remaining = deadline - now()
+            if (remaining > 0) pause(minOf(250, remaining))
+        }
+    }
+
+    fun diagnostics(state: AssistantState?): Bundle = Bundle().apply {
+        putBoolean("readiness_complete", state != null && ready(state))
+        putBoolean("credential_ready", state?.credential?.reason == ProviderAuthReason.READY)
+        putString("credential_reason", state?.credential?.reason?.name ?: "UNKNOWN")
+        putBoolean("error_present", state?.error != null)
+        if (state != null) {
+            putBoolean("context_ready", state.contextReady)
+            putBoolean("busy", state.busy)
+            putBoolean("failed", state.error != null)
+        }
+        putString("failure_reason", when {
+            state == null -> "refresh_timeout"
+            state.error != null -> "engine_error"
+            state.busy -> "engine_busy"
+            !state.contextReady -> "context_not_ready"
+            state.credential?.reason != ProviderAuthReason.READY -> "credential_not_ready"
+            else -> "none"
+        })
+        if (state?.error != null) putString("error_code", when (state.error) {
+            "auth_expired", "auth_unavailable", "unauthorized", "forbidden", "background", "interrupted",
+            "unsupported_model", "choose_continuation" -> state.error
+            else -> "unknown"
+        })
     }
 }

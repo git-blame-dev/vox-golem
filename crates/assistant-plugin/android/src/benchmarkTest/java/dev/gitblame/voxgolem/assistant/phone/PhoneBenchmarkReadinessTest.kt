@@ -12,6 +12,22 @@ import org.robolectric.annotation.Config
 @RunWith(PhoneAssistantRunner::class)
 @Config(sdk = [35], manifest = Config.NONE)
 class PhoneBenchmarkReadinessTest {
+    @Test fun nullReadOnlyRepliesRemainUnobservedWhileMalformedRepliesFail() {
+        assertNull(PhoneSyntheticVoiceBenchmark.readinessReply(null))
+        assertNull(PhoneSyntheticVoiceBenchmark.readinessReply("null"))
+        assertEquals(0, PhoneSyntheticVoiceBenchmark.readinessReply("{\"count\":0}")!!.getInt("count"))
+        for (raw in listOf("not json", "[]", "x".repeat(513))) {
+            assertTrue(runCatching { PhoneSyntheticVoiceBenchmark.readinessReply(raw) }.isFailure)
+        }
+    }
+
+    @Test fun engineFailureDiagnosticsNeverExportArbitraryMessages() {
+        assertEquals("none", PhoneSyntheticVoiceBenchmark.safeEngineError(null))
+        assertEquals("storage_error", PhoneSyntheticVoiceBenchmark.safeEngineError("storage_error"))
+        assertEquals("unsupported_tts_voice", PhoneSyntheticVoiceBenchmark.safeEngineError("unsupported_tts_voice"))
+        assertEquals("other", PhoneSyntheticVoiceBenchmark.safeEngineError("synthetic private error details"))
+    }
+
     private fun projection(available: Boolean) = PhoneSnapshotEncoder.encode(
         AssistantState(model = "custom-luna-none"), null,
         PhonePreferences.defaults().put("instant", "custom-luna-none"), emptyMap(), providerAvailable = available)
