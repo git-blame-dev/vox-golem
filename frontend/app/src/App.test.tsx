@@ -13,6 +13,7 @@ import App from './App'
 import { FrontendSession } from './FrontendSession'
 import { sessionAuthority } from './SessionAuthority'
 import { appSnapshot, canonicalTurn, completeCapabilities, defaultAssistantSettings, readyStartupState, savedOutcome } from './test/sessionFixtures'
+import { installHistoryHarness, type TestHistoryHarness } from './test/historyHarness'
 import headerIcon from '../../../apps/desktop-tauri/src-tauri/icons/icon.svg?url'
 
 const startLiveAudioSourceMock = vi.spyOn(liveAudioSourceModule, 'startLiveAudioSource')
@@ -25,30 +26,12 @@ const originalDateNow = Date.now
 const originalMathRandom = Math.random
 const originalRequestAnimationFrame = window.requestAnimationFrame
 const originalCancelAnimationFrame = window.cancelAnimationFrame
-const originalHistoryPushState = window.history.pushState
-const originalHistoryReplaceState = window.history.replaceState
-const originalHistoryBack = window.history.back
-const originalHistoryForward = window.history.forward
 const originalBodyOverflow = document.body.style.getPropertyValue('overflow')
 const originalBodyOverflowPriority = document.body.style.getPropertyPriority('overflow')
 const originalBodyOverflowX = document.body.style.getPropertyValue('overflow-x')
 const originalBodyOverflowXPriority = document.body.style.getPropertyPriority('overflow-x')
 const originalBodyOverflowY = document.body.style.getPropertyValue('overflow-y')
 const originalBodyOverflowYPriority = document.body.style.getPropertyPriority('overflow-y')
-
-interface TestHistoryHarness {
-  entries: unknown[]
-  index: number
-  backCalls: number
-  forwardCalls: number
-  deferBack: boolean
-  settleBack: () => void
-  pushState: typeof window.history.pushState
-  replaceState: typeof window.history.replaceState
-  back: typeof window.history.back
-  forward: typeof window.history.forward
-  setCurrentState: (state: unknown) => void
-}
 
 let historyHarness: TestHistoryHarness | null = null
 const obsoleteRendererAudioCommands = new Set([
@@ -69,79 +52,13 @@ let nativeProjection = {
 }
 let nativeObservationEnabled = false
 
-function installHistoryHarness(): void {
-  const initialState = window.history.state
-  const entries: unknown[] = [initialState]
-  let index = 0
-  let pendingBack = false
-  const expose = (url = window.location.href): void => originalHistoryReplaceState.call(
-    window.history,
-    entries[index] ?? null,
-    '',
-    url,
-  )
-  const traverse = (nextIndex: number): void => {
-    if (nextIndex < 0 || nextIndex >= entries.length) return
-    index = nextIndex
-    harness.index = index
-    expose()
-    const traversedState = entries[index]
-    queueMicrotask(() => window.dispatchEvent(new PopStateEvent('popstate', { state: traversedState })))
-  }
-  const harness: TestHistoryHarness = {
-    entries,
-    index,
-    backCalls: 0,
-    forwardCalls: 0,
-    deferBack: false,
-    settleBack: () => {
-      if (!pendingBack) return
-      pendingBack = false
-      traverse(index - 1)
-    },
-    pushState: ((state: unknown) => {
-      entries.splice(index + 1)
-      entries.push(state)
-      index += 1
-      harness.index = index
-      expose()
-    }) as typeof window.history.pushState,
-    replaceState: ((state: unknown, _unused: string, url?: string | URL | null) => {
-      entries[index] = state
-      expose(url === undefined || url === null ? window.location.href : String(url))
-    }) as typeof window.history.replaceState,
-    back: (() => {
-      harness.backCalls += 1
-      if (harness.deferBack) {
-        pendingBack = true
-      } else {
-        traverse(index - 1)
-      }
-    }) as typeof window.history.back,
-    forward: (() => {
-      harness.forwardCalls += 1
-      traverse(index + 1)
-    }) as typeof window.history.forward,
-    setCurrentState: (state: unknown) => {
-      entries[index] = state
-      expose()
-    },
-  }
-  historyHarness = harness
-  Object.defineProperty(window.history, 'pushState', { configurable: true, value: harness.pushState })
-  Object.defineProperty(window.history, 'replaceState', { configurable: true, value: harness.replaceState })
-  Object.defineProperty(window.history, 'back', { configurable: true, value: harness.back })
-  Object.defineProperty(window.history, 'forward', { configurable: true, value: harness.forward })
-  expose()
-}
-
 beforeEach(() => {
   rendererAudioCalls = []
   nativeObservationEnabled = false
   nativeProjection = { revision: 1, voice: { capture_id: null, state: 'stopped', runtime_phase: 'sleeping',
     auto_stop_on_silence: true, auto_start_available: false, wake_confidence: null, partial_transcript: null, error: null },
     prompt: null, speech: { playback_id: null, playing: false, pending: false } }
-  installHistoryHarness()
+  historyHarness = installHistoryHarness()
 })
 
 afterEach(() => {
@@ -164,10 +81,7 @@ afterEach(() => {
   Math.random = originalMathRandom
   window.requestAnimationFrame = originalRequestAnimationFrame
   window.cancelAnimationFrame = originalCancelAnimationFrame
-  Object.defineProperty(window.history, 'pushState', { configurable: true, value: originalHistoryPushState })
-  Object.defineProperty(window.history, 'replaceState', { configurable: true, value: originalHistoryReplaceState })
-  Object.defineProperty(window.history, 'back', { configurable: true, value: originalHistoryBack })
-  Object.defineProperty(window.history, 'forward', { configurable: true, value: originalHistoryForward })
+  historyHarness?.restore()
   document.body.style.setProperty('overflow', originalBodyOverflow, originalBodyOverflowPriority)
   document.body.style.setProperty('overflow-x', originalBodyOverflowX, originalBodyOverflowXPriority)
   document.body.style.setProperty('overflow-y', originalBodyOverflowY, originalBodyOverflowYPriority)
@@ -178,7 +92,7 @@ afterEach(() => {
   window.localStorage.removeItem('voxgolem.audioInputDeviceId')
   window.localStorage.removeItem('voxgolem.voiceTelemetry')
   Reflect.deleteProperty(window, '__VOXGOLEM_VOICE_TELEMETRY__')
-  originalHistoryReplaceState.call(window.history, null, '', window.location.href)
+  window.history.replaceState(null, '', window.location.href)
   historyHarness = null
   expect(rendererAudioCalls).toEqual([])
 })
@@ -279,7 +193,7 @@ describe('App', () => {
     })
     expect(inline.disabled).toBe(true)
     expect(getSendButton(container).disabled).toBe(true)
-    await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
+    await act(async () => { flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'models'); await Promise.resolve() })
     const settings = container.querySelector<HTMLSelectElement>('#assistantInstantSelect')!
     expect(settings.value).toBe('custom-luna-none')
     expect(settings.disabled).toBe(true)
@@ -575,17 +489,18 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(getConversation(container).textContent).toBe('')
+    expect(getConversation(container).querySelectorAll('.message')).toHaveLength(0)
     expect(container.textContent).toContain('Response cancelled')
     await act(async () => { await vi.advanceTimersByTimeAsync(200) })
-    expect(getConversation(container).textContent).toBe('')
+    expect(getConversation(container).querySelectorAll('.message')).toHaveLength(0)
   })
 
   it('starts with an empty chat transcript', async () => {
     const { container } = await renderApp()
     const conversation = getConversation(container)
 
-    expect(conversation.textContent).toBe('')
+    expect(conversation.querySelectorAll('.message')).toHaveLength(0)
+    expect(conversation.querySelector('[aria-label="New conversation"]')).not.toBeNull()
   })
 
   it('hydrates the canonical transcript and preferences from one native snapshot', async () => {
@@ -608,7 +523,7 @@ describe('App', () => {
 
     const { container } = await renderApp()
     await act(async () => {
-      getButtonByLabel(container, 'Settings').click()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'voice')
       await Promise.resolve()
     })
 
@@ -616,8 +531,10 @@ describe('App', () => {
     expect(getConversation(container).textContent).toContain('Hydrated answer')
     expect(getShell(container).dataset['uiTheme']).toBe('light')
     expect(getShell(container).dataset['uiTextSize']).toBe('large')
-    expect(container.querySelector<HTMLSelectElement>('#assistantInstantSelect')?.value).toBe('custom-sol-high')
     expect(getTtsToggle(container).checked).toBe(true)
+    await act(async () => { getButtonByLabel(container, 'Back to settings').click(); await Promise.resolve() })
+    await act(async () => { navigateSettings(container, 'models') })
+    expect(container.querySelector<HTMLSelectElement>('#assistantInstantSelect')?.value).toBe('custom-sol-high')
     expect(getConversation(container).hasAttribute('aria-live')).toBe(false)
     expect(getResponseAnnouncer(container).textContent).toBe('')
     expect(invokedCommands).not.toContain('get_ui_text_size')
@@ -641,7 +558,7 @@ describe('App', () => {
     const { container } = await renderApp()
     await act(async () => setTextAreaValue(getComposer(container), 'Must remain blocked'))
     await act(async () => {
-      getButtonByLabel(container, 'Settings').click()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'models')
       await Promise.resolve()
     })
     const selected = container.querySelector<HTMLOptionElement>('#assistantInstantSelect option[value="custom-sol-high"]')
@@ -702,7 +619,7 @@ describe('App', () => {
     expect(availability?.querySelector('[aria-label="Retry Custom"]')).toBeNull()
     expect(getSendButton(container).disabled).toBe(true)
     await act(async () => {
-      getButtonByLabel(container, 'Settings').click()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'models')
       await Promise.resolve()
     })
     const selected = container.querySelector<HTMLOptionElement>('#assistantInstantSelect option[value="custom-sol-high"]')
@@ -723,7 +640,7 @@ describe('App', () => {
     const { container } = await renderApp()
     await act(async () => setTextAreaValue(getComposer(container), 'Unavailable omitted model'))
     await act(async () => {
-      getButtonByLabel(container, 'Settings').click()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'models')
       await Promise.resolve()
     })
     const localFast = container.querySelector<HTMLOptionElement>('#assistantInstantSelect option[value="local-fast"]')
@@ -751,7 +668,7 @@ describe('App', () => {
     const { container } = await renderApp()
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1_000)
-      getButtonByLabel(container, 'Settings').click()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'models')
       await Promise.resolve()
     })
     const sol = container.querySelector<HTMLOptionElement>('#assistantInstantSelect option[value="custom-sol-high"]')
@@ -789,7 +706,7 @@ describe('App', () => {
 
     const { container } = await renderApp()
     await act(async () => {
-      getButtonByLabel(container, 'Settings').click()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'models')
       getButtonByLabel(container, 'Retry local profile').click()
     })
     expect(snapshotCalls).toBe(2)
@@ -930,9 +847,9 @@ describe('App', () => {
       finishPrompt?.(savedOutcome(requestId, 'Reconcile during profile switch', 'Canonical answer', '1', '80'))
       await Promise.resolve()
       await Promise.resolve()
-      getButtonByLabel(container, 'Settings').click()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'models')
       await Promise.resolve()
-      setSelectValue(await getResponseProfileSelect(container), 'quality')
+      setSelectValue(container.querySelector<HTMLSelectElement>('#assistantInstantSelect')!, 'quality')
       await Promise.resolve()
     })
     expect(container.querySelector<HTMLSelectElement>('#assistantInstantSelect')?.disabled).toBe(true)
@@ -1259,7 +1176,7 @@ describe('App', () => {
 
     const { container } = await renderApp()
     await act(async () => {
-      getButtonByLabel(container, 'Settings').click()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'voice')
     })
     await closeSettings(container)
     await act(async () => {
@@ -1271,7 +1188,7 @@ describe('App', () => {
       ]))
     })
     await closeSettings(container)
-    await openSettings(container)
+    await openSettings(container); await act(async () => { navigateSettings(container, 'voice') })
     await act(async () => {
       getTtsToggle(container).click()
       await Promise.resolve()
@@ -1360,7 +1277,7 @@ describe('App', () => {
     const { container } = await renderApp()
     expect(container.textContent).toContain('Assistant settings unavailable: legacy settings failed')
     await act(async () => {
-      getButtonByLabel(container, 'Settings').click()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'models')
     })
     await closeSettings(container)
     await act(async () => {
@@ -1368,7 +1285,7 @@ describe('App', () => {
     })
 
     expect(container.textContent).not.toContain('Assistant settings unavailable: legacy settings failed')
-    await openSettings(container)
+    await openSettings(container); await act(async () => { navigateSettings(container, 'models') })
     expect(container.querySelector<HTMLSelectElement>('#assistantInstantSelect')?.disabled).toBe(false)
   })
 
@@ -1523,7 +1440,8 @@ describe('App', () => {
     const { container } = await renderApp()
     await act(async () => {
       changeTheme(container, 'light')
-      getButtonByLabel(container, 'Settings').click()
+      await Promise.resolve()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'text')
       await Promise.resolve()
       getButtonByLabel(container, 'Increase text size').click()
       await Promise.resolve()
@@ -1552,7 +1470,7 @@ describe('App', () => {
 
     const { container } = await renderApp()
     await act(async () => {
-      await openSettings(container)
+      await openSettings(container); await act(async () => { navigateSettings(container, 'voice') })
       getTtsToggle(container).click()
       await Promise.resolve()
       await Promise.resolve()
@@ -1580,7 +1498,7 @@ describe('App', () => {
 
     const { container } = await renderApp()
     await act(async () => {
-      await openSettings(container)
+      await openSettings(container); await act(async () => { navigateSettings(container, 'voice') })
       getTtsToggle(container).click()
       await Promise.resolve()
       await Promise.resolve()
@@ -1607,7 +1525,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    await openSettings(container)
+    await openSettings(container); await act(async () => { navigateSettings(container, 'voice') })
     expect(getTtsToggle(container).checked).toBe(true)
     await act(async () => {
       resolveStartup(readyStartupState({ tts_enabled: false }))
@@ -1615,7 +1533,7 @@ describe('App', () => {
       await Promise.resolve()
     })
     await closeSettings(container)
-    await openSettings(container)
+    await openSettings(container); await act(async () => { navigateSettings(container, 'voice') })
     expect(getTtsToggle(container).checked).toBe(true)
     await act(async () => {
       getTtsToggle(container).click()
@@ -1642,7 +1560,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    await openSettings(container)
+    await openSettings(container); await act(async () => { navigateSettings(container, 'voice') })
     expect(getTtsToggle(container).checked).toBe(false)
     await act(async () => {
       await vi.advanceTimersByTimeAsync(500)
@@ -1672,14 +1590,14 @@ describe('App', () => {
 
     const { container } = await renderApp()
     await act(async () => {
-      await openSettings(container)
+      await openSettings(container); await act(async () => { navigateSettings(container, 'voice') })
       getTtsToggle(container).click()
       await Promise.resolve()
     })
     expect(getTtsToggle(container).checked).toBe(true)
     await closeSettings(container)
     await act(async () => {
-      await openSettings(container)
+      await openSettings(container); await act(async () => { navigateSettings(container, 'voice') })
       getTtsToggle(container).click()
       await Promise.resolve()
     })
@@ -1714,7 +1632,7 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(getConversation(container).textContent).toBe('')
+    expect(getConversation(container).querySelectorAll('.message')).toHaveLength(0)
     expect(container.textContent).not.toContain('New chat failed')
   })
 
@@ -1886,7 +1804,7 @@ describe('App', () => {
     expect(getShell(container).dataset['uiTheme']).toBe('light')
 
     await act(async () => {
-      getButtonByLabel(container, 'Settings').click()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'text')
       await Promise.resolve()
       getButtonByLabel(container, 'Increase text size').click()
     })
@@ -1944,7 +1862,7 @@ describe('App', () => {
     expect(getShell(container).dataset['uiTheme']).toBe('dark')
 
     await act(async () => {
-      getButtonByLabel(container, 'Settings').click()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'text')
       await Promise.resolve()
       getButtonByLabel(container, 'Increase text size').click()
     })
@@ -1958,9 +1876,9 @@ describe('App', () => {
     expect(getShell(container).dataset['uiTextSize']).toBe('medium')
 
     await closeSettings(container)
-    await openSettings(container); await act(async () => { getTtsToggle(container).click() })
+    await openSettings(container); await act(async () => { navigateSettings(container, 'voice') }); await act(async () => { getTtsToggle(container).click() })
     await closeSettings(container)
-    await openSettings(container)
+    await openSettings(container); await act(async () => { navigateSettings(container, 'voice') })
     await act(async () => { getTtsToggle(container).click() })
     await act(async () => {
       rejectFirstTts(new Error('first TTS write failed'))
@@ -2166,7 +2084,10 @@ describe('App', () => {
     }
     const settingsButton = getButtonByLabel(container, 'Settings')
     await act(async () => { settingsButton.click(); await Promise.resolve() })
+    await act(async () => { navigateSettings(container, 'voice') })
     for (const id of ['wake_word', 'vad', 'parakeet', 'tts']) expect(container.querySelector('[role="dialog"]')?.textContent).toContain(`${id} unavailable`)
+    await act(async () => { getButtonByLabel(container, 'Back to settings').click(); await Promise.resolve() })
+    await act(async () => { navigateSettings(container, 'models') })
     const instantSelect = container.querySelector<HTMLSelectElement>('#assistantInstantSelect')
     expect(instantSelect).not.toBeNull()
     expect(Array.from(instantSelect?.options ?? []).every((option) => option.disabled || option.value === 'local-fast')).toBe(true)
@@ -2221,11 +2142,12 @@ describe('App', () => {
     expect(shell.dataset['uiTextSize']).toBe('medium')
 
     await act(async () => {
-      getButtonByLabel(container, 'Settings').click()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'text')
       await Promise.resolve()
     })
 
     expect(container.textContent).toContain('Text size')
+    expect(container.querySelector('[aria-label="Text size preview"]')?.textContent).toContain('A clear view of your conversation')
     expect(container.textContent).toContain('Medium (100%)')
 
     await act(async () => {
@@ -2295,7 +2217,7 @@ describe('App', () => {
     const shell = getShell(container)
 
     await act(async () => {
-      getButtonByLabel(container, 'Settings').click()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'text')
       await Promise.resolve()
     })
 
@@ -2315,7 +2237,7 @@ describe('App', () => {
     expect(shell.dataset['uiTextSize']).toBe('large')
   })
 
-  it('starts in persisted dark mode and roundtrips Slate and Light through Settings', async () => {
+  it('starts in persisted dark mode and roundtrips Dark and Light through Settings', async () => {
     const invoked: Array<{ command: string; args: unknown }> = []
     let theme = 'dark'
 
@@ -2363,13 +2285,9 @@ describe('App', () => {
 
     expect(shell.dataset['uiTheme']).toBe('dark')
     await act(async () => { getButtonByLabel(container, 'Settings').click() })
-    expect(getThemeSelect(container).value).toBe('dark')
+    expect(getThemeRadio(container, 'dark').checked).toBe(true)
 
-    expect(Array.from(getThemeSelect(container).options).map((option) => option.value)).toEqual(['dark', 'slate', 'light'])
-    await act(async () => { changeTheme(container, 'slate'); await Promise.resolve() })
-    expect(shell.dataset['uiTheme']).toBe('slate')
-    expect(getThemeSelect(container).value).toBe('slate')
-    expect(invoked).toContainEqual({ command: 'set_ui_theme', args: { theme: 'slate' } })
+    expect(Array.from(container.querySelectorAll<HTMLInputElement>('input[name="uiTheme"]')).map((radio) => radio.value)).toEqual(['dark', 'light'])
 
     await act(async () => {
       changeTheme(container, 'light')
@@ -2377,7 +2295,7 @@ describe('App', () => {
     })
 
     expect(shell.dataset['uiTheme']).toBe('light')
-    expect(getThemeSelect(container).value).toBe('light')
+    expect(getThemeRadio(container, 'light').checked).toBe(true)
     expect(invoked).toContainEqual({ command: 'set_ui_theme', args: { theme: 'light' } })
   })
 
@@ -2477,10 +2395,10 @@ describe('App', () => {
 
     expect(getShell(container).dataset['uiTheme']).toBe('dark')
     await act(async () => { getButtonByLabel(container, 'Settings').click() })
-    expect(getThemeSelect(container).value).toBe('dark')
+    expect(getThemeRadio(container, 'dark').checked).toBe(true)
   })
 
-  it.each(['light', 'slate'] as const)('reverts %s theme and shows a notice when theme persistence fails', async (theme) => {
+  it.each(['light'] as const)('reverts %s theme and shows a notice when theme persistence fails', async (theme) => {
     window.__TAURI_INTERNALS__ = {
       invoke: async (command) => {
         if (command === 'get_ui_theme') {
@@ -2551,16 +2469,16 @@ describe('App', () => {
     const error = dialog.querySelector('.settings-panel__write-error[role="alert"]')
     expect(error?.textContent).toContain('Theme could not be saved: Synthetic theme failure')
     expect(error?.closest('.settings-panel__header')).not.toBeNull()
-    await act(async () => { changeTheme(container, 'slate') })
-    expect(dialog.querySelector('.settings-panel__write-error')).toBeNull()
     await act(async () => { changeTheme(container, 'light') })
+    expect(dialog.querySelector('.settings-panel__write-error')).toBeNull()
+    await act(async () => { changeTheme(container, 'dark') })
     await act(async () => { rejectEarlier(new Error('Synthetic stale failure')); await Promise.resolve(); await Promise.resolve() })
     expect(writes).toBe(3)
     expect(dialog.querySelector('.settings-panel__write-error')).toBeNull()
-    expect(getShell(container).dataset['uiTheme']).toBe('light')
-    await act(async () => { resolveLatest('light'); await Promise.resolve() })
+    expect(getShell(container).dataset['uiTheme']).toBe('dark')
+    await act(async () => { resolveLatest('dark'); await Promise.resolve() })
     expect(dialog.querySelector('.settings-panel__write-error')).toBeNull()
-    expect(getShell(container).dataset['uiTheme']).toBe('light')
+    expect(getShell(container).dataset['uiTheme']).toBe('dark')
   })
 
   it('reverts text size and shows a notice when settings persistence fails', async () => {
@@ -2600,7 +2518,7 @@ describe('App', () => {
     const shell = getShell(container)
 
     await act(async () => {
-      getButtonByLabel(container, 'Settings').click()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'text')
       await Promise.resolve()
     })
 
@@ -2704,6 +2622,7 @@ describe('App', () => {
     const settingsButton = getButtonByLabel(container, 'Settings')
 
     await act(async () => {
+      settingsButton.closest('details')!.querySelector('summary')!.click()
       settingsButton.click()
       await Promise.resolve()
     })
@@ -2921,7 +2840,7 @@ describe('App', () => {
     expect(shell.dataset['uiTextSize']).toBe('medium')
 
     await act(async () => {
-      getButtonByLabel(container, 'Settings').click()
+      flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'text')
       await Promise.resolve()
     })
 
@@ -3025,7 +2944,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    await openSettings(container)
+    await openSettings(container); await act(async () => { navigateSettings(container, 'voice') })
     const ttsToggle = getTtsToggle(container)
 
     expect(container.textContent).not.toContain('Enter to send, Shift+Enter for newline')
@@ -3081,7 +3000,7 @@ describe('App', () => {
     const microphoneControl = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))
       .find((button) => ['Start mic', 'Stop mic'].includes(button.getAttribute('aria-label') ?? ''))
     expect(microphoneControl?.disabled).toBe(true)
-    await openSettings(container)
+    await openSettings(container); await act(async () => { navigateSettings(container, 'voice') })
     expect(getTtsToggle(container).disabled).toBe(true)
   })
 
@@ -3333,7 +3252,6 @@ describe('App', () => {
     expect(startupStateCallCount).toBe(3)
     expect(nonDiagnosticCommands(invokedCommands)).toEqual([
       'get_startup_state',
-      'chatgpt_auth',
       'switch_response_profile',
       'get_startup_state',
       'get_startup_state',
@@ -3493,7 +3411,7 @@ describe('App', () => {
 
     expect(container.textContent).toContain('Profile state unavailable')
     expect(getSendButton(container).disabled).toBe(true)
-    await openSettings(container)
+    await openSettings(container); await act(async () => { navigateSettings(container, 'models') })
     const settingsSelect = container.querySelector<HTMLSelectElement>('#assistantInstantSelect')
     expect(settingsSelect).not.toBeNull()
     await act(async () => {
@@ -3505,7 +3423,7 @@ describe('App', () => {
       setTextAreaValue(getComposer(container), 'Custom remains blocked')
       getSendButton(container).click()
     })
-    await openSettings(container)
+    await openSettings(container); await act(async () => { navigateSettings(container, 'models') })
     await act(async () => {
       setSelectValue(container.querySelector<HTMLSelectElement>('#assistantInstantSelect') as HTMLSelectElement, 'quality')
       await Promise.resolve()
@@ -3596,7 +3514,7 @@ describe('App', () => {
     expect(getSendButton(container).disabled).toBe(true)
   })
 
-  it('keeps common Model controls before speech and advanced desktop models collapsed', async () => {
+  it('isolates Settings details behind overview rows and preserves theme radio selection on Back', async () => {
     window.__TAURI_INTERNALS__ = { invoke: async (command) => {
       if (command === 'get_startup_state') return readyStartupState({ voice_input_error: 'Synthetic speech initialization failure' })
       if (command === 'get_assistant_settings') return defaultAssistantSettings()
@@ -3604,31 +3522,36 @@ describe('App', () => {
     } }
     const { container } = await renderApp()
     await openSettings(container)
-    const instant = container.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!
-    const theme = getThemeSelect(container)
-    const textSize = getButtonByLabel(container, 'Increase text size')
+    expect(getThemeRadio(container, 'dark').checked).toBe(true)
+    expect(getThemeRadio(container, 'light').checked).toBe(false)
+    expect(container.querySelector('#assistantInstantSelect')).toBeNull()
+    expect(container.querySelector('#tts-toggle')).toBeNull()
+    expect(container.querySelector('[aria-label="Increase text size"]')).toBeNull()
+    expect(Array.from(container.querySelectorAll('[data-settings-page]')).map((row) => row.getAttribute('data-settings-page'))).toEqual(['text', 'models', 'account', 'voice', 'web', 'updates', 'advanced'])
+    await act(async () => { navigateSettings(container, 'models') })
+    expect(container.querySelector('#assistantInstantSelect')).not.toBeNull()
+    expect(container.querySelector('input[name="uiTheme"]')).toBeNull()
+    expect(container.querySelector('#tts-toggle')).toBeNull()
+    expect(container.querySelector('[aria-label="Deep model"]')).toBeNull()
+    expect(container.querySelector('[aria-label="Review model"]')).toBeNull()
+    await act(async () => { getButtonByLabel(container, 'Back to settings').click(); await Promise.resolve() })
+    expect(getThemeRadio(container, 'dark').checked).toBe(true)
+    await act(async () => { navigateSettings(container, 'voice') })
     const speech = container.querySelector('[aria-labelledby="speech-settings-title"]')!
-    expect(instant).not.toBeNull()
-    expect(instant.id).toBe('assistantInstantSelect')
-    expect(speech).not.toBeNull()
-    expect(theme.compareDocumentPosition(instant) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(textSize.compareDocumentPosition(instant) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(instant.compareDocumentPosition(speech) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(instant.closest('details')).toBeNull()
-    const advanced = container.querySelector<HTMLDetailsElement>('details.settings-panel__advanced')!
-    expect(advanced.open).toBe(false)
-    expect(advanced.querySelector('[aria-label="Deep model"]')).toBeNull()
-    expect(advanced.querySelector('[aria-label="Review model"]')).toBeNull()
-    expect(advanced.textContent).toContain('Completion')
-    await act(async () => { advanced.querySelector('summary')!.click() })
-    expect(advanced.open).toBe(true)
-    const diagnostics = Array.from(speech.querySelectorAll('details')).find((details) => details.querySelector('summary')?.textContent === 'Speech details and diagnostics')!
-    expect(diagnostics.open).toBe(false)
     const error = Array.from(speech.querySelectorAll('p')).find((paragraph) => paragraph.textContent === 'Synthetic speech initialization failure')!
     expect(error).toBeDefined()
     expect(error.closest('details')).toBeNull()
+    const diagnostics = Array.from(speech.querySelectorAll('details')).find((details) => details.querySelector('summary')?.textContent === 'Speech details and diagnostics')!
+    expect(diagnostics.open).toBe(false)
     await act(async () => { diagnostics.querySelector('summary')!.click() })
     expect(diagnostics.open).toBe(true)
+    await act(async () => { getButtonByLabel(container, 'Back to settings').click(); await Promise.resolve() })
+    await act(async () => { navigateSettings(container, 'advanced') })
+    const completionLabel = Array.from(container.querySelectorAll('label')).find((label) => label.textContent?.includes('Completion'))!
+    expect(completionLabel.querySelector('input[type="checkbox"][role="switch"]')).not.toBeNull()
+    expect(container.querySelector('#assistantInstantSelect')).toBeNull()
+    expect(container.querySelector('#tts-toggle')).toBeNull()
+    await closeSettings(container)
   })
 
   it('shows the actual Custom capability reason beside disabled direct models', async () => {
@@ -3642,8 +3565,10 @@ describe('App', () => {
       throw new Error(`unexpected command: ${command}`)
     } }
     const { container } = await renderApp()
-    await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
-    expect(container.textContent).toContain('Custom connection: WSL OpenCode auth file is unavailable')
+    await act(async () => { flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'account'); await Promise.resolve() })
+    expect(container.textContent).toContain('WSL OpenCode auth file is unavailable')
+    await act(async () => { getButtonByLabel(container, 'Back to settings').click(); await Promise.resolve() })
+    await act(async () => { navigateSettings(container, 'models') })
     const select = container.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!
     expect(select.querySelector<HTMLOptionElement>('option[value="custom-sol-low"]')?.disabled).toBe(true)
     expect(select.querySelector<HTMLOptionElement>('option[value="custom-luna-none"]')?.disabled).toBe(true)
@@ -3660,9 +3585,11 @@ describe('App', () => {
     } }
     const { container } = await renderApp()
     expect(container.textContent).not.toContain(`Custom connection: ${reason}`)
-    await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
-    expect(container.querySelector('[role="dialog"]')?.textContent).toContain(`Custom connection: ${reason}`)
+    await act(async () => { flushSync(() => getButtonByLabel(container, 'Settings').click()); navigateSettings(container, 'account'); await Promise.resolve() })
+    expect(container.querySelector('[role="dialog"]')?.textContent).toContain(reason)
     expect(container.querySelector('[aria-label="Retry Custom"]')).toBeNull()
+    await act(async () => { getButtonByLabel(container, 'Back to settings').click(); await Promise.resolve() })
+    await act(async () => { navigateSettings(container, 'models') })
     const select = container.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!
     expect(select.querySelector<HTMLOptionElement>('option[value="custom-luna-none"]')?.disabled).toBe(true)
   })
@@ -4971,7 +4898,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    await openSettings(container)
+    await openSettings(container); await act(async () => { navigateSettings(container, 'voice') })
     const autoStop = getAutoStopToggle(container)
 
     expect(startLiveAudioSourceMock).not.toHaveBeenCalled()
@@ -5160,7 +5087,7 @@ describe('Settings-only desktop speech diagnostics', () => {
     const { container } = await renderApp()
     expect(container.textContent).not.toContain('Synthetic STT model missing')
     expect(container.textContent).not.toContain('CUDA')
-    await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    await act(async () => { flushSync(() => container.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click()); navigateSettings(container, 'voice') })
     const dialog = container.querySelector('[role="dialog"]')!
     expect(dialog.textContent).toContain('Synthetic STT model missing')
     expect(dialog.textContent).toContain('Parakeet')
@@ -5285,17 +5212,23 @@ function getSendButton(container: HTMLElement): HTMLButtonElement {
   return button
 }
 
-function getThemeSelect(container: HTMLElement): HTMLSelectElement {
-  const select = container.querySelector<HTMLSelectElement>('select[aria-label="Theme"]')
-  if (!select) throw new Error('Missing Theme selector')
-  return select
+function getThemeRadio(container: HTMLElement, theme: 'dark' | 'light'): HTMLInputElement {
+  const radio = container.querySelector<HTMLInputElement>(`input[name="uiTheme"][value="${theme}"]`)
+  if (!radio) throw new Error(`Missing ${theme} theme radio`)
+  return radio
 }
 
-function changeTheme(container: HTMLElement, theme: 'dark' | 'slate' | 'light'): void {
+function changeTheme(container: HTMLElement, theme: 'dark' | 'light'): void {
   const wasClosed = container.querySelector('[role="dialog"]') === null
   if (wasClosed) flushSync(() => { getButtonByLabel(container, 'Settings').click() })
-  setSelectValue(getThemeSelect(container), theme)
+  getThemeRadio(container, theme).click()
   if (wasClosed) flushSync(() => { getButtonByLabel(container, 'Close settings').click() })
+}
+
+function navigateSettings(container: HTMLElement, page: string): void {
+  const row = container.querySelector<HTMLButtonElement>(`[data-settings-page="${page}"]`)
+  if (row === null) throw new Error(`Missing Settings row: ${page}`)
+  flushSync(() => row.click())
 }
 
 function getButtonByLabel(container: HTMLElement, label: string): HTMLButtonElement {
@@ -5344,8 +5277,8 @@ function assertSettingsClosed(container: HTMLElement): void {
 }
 
 function getAutoStopToggle(container: HTMLElement): HTMLInputElement {
-  const labels = Array.from(container.querySelectorAll<HTMLLabelElement>('.settings-panel label.shell__toggle'))
-  const autoStopLabel = labels.find((label) => label.textContent?.includes('Auto Stop'))
+  const labels = Array.from(container.querySelectorAll<HTMLLabelElement>('.settings-panel label.ui-switch-field'))
+  const autoStopLabel = labels.find((label) => label.textContent?.includes('Stop listening after silence'))
   const toggle = autoStopLabel?.querySelector<HTMLInputElement>('input[type="checkbox"]') ?? null
 
   if (toggle === null) {
@@ -5375,10 +5308,10 @@ async function openSettings(container: HTMLElement): Promise<void> {
 
 async function closeSettings(container: HTMLElement): Promise<void> {
   if (container.querySelector('[role="dialog"]') === null) return
-  await act(async () => {
-    getButtonByLabel(container, 'Close settings').click()
-    await Promise.resolve()
-  })
+  if (container.querySelector('[aria-label="Back to settings"]') !== null) {
+    await act(async () => { getButtonByLabel(container, 'Back to settings').click(); await Promise.resolve() })
+  }
+  await act(async () => { getButtonByLabel(container, 'Close settings').click(); await Promise.resolve() })
   expect(container.querySelector('[role="dialog"]')).toBeNull()
 }
 
@@ -5387,6 +5320,7 @@ async function getResponseProfileSelect(container: HTMLElement): Promise<HTMLSel
     getButtonByLabel(container, 'Settings').click()
     await Promise.resolve()
   })
+  await act(async () => { navigateSettings(container, 'models') })
   const select = container.querySelector<HTMLSelectElement>('#assistantInstantSelect')
 
   if (select === null) {

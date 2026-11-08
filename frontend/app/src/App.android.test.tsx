@@ -2,7 +2,8 @@ import { act } from 'react'
 import { readFileSync } from 'node:fs'
 import { createRoot } from 'react-dom/client'
 import type { Root } from 'react-dom/client'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { installHistoryHarness } from './test/historyHarness'
 
 // Exercise the actual runtime boundary. Partial mocks of the cyclic native/browser
 // adapter graph can leave consumers holding the original desktop export.
@@ -19,6 +20,8 @@ import { getCachedAndroidPreferences, setCachedAndroidPreferences } from './lib/
 let root: Root | null = null
 let container: HTMLElement | null = null
 const initialTimingEnv = import.meta.env['VITE_VOXGOLEM_TIMING'] ?? ''
+
+beforeEach(() => { installHistoryHarness(null) })
 
 afterEach(() => {
   vi.useRealTimers()
@@ -335,8 +338,11 @@ describe('Android App lifecycle', () => {
       await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Voice notes"]')!.click() })
       const notes = container.querySelector('.capture-history')!
       const opener = container.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!
-      await act(async () => { opener.click() })
+      const menu = opener.closest('details')!
+      await act(async () => { menu.querySelector('summary')!.click(); opener.focus(); opener.click() })
       expect(container.querySelector('[role="dialog"]')).not.toBeNull()
+      expect(menu.open).toBe(true)
+      expect(container.querySelector('header')?.hasAttribute('inert')).toBe(true)
       expect(document.activeElement?.getAttribute('aria-label')).toBe('Close settings')
       expect(document.body.style.overflowX).toBe('hidden')
       expect(window.history.state).toMatchObject(previousState)
@@ -345,6 +351,7 @@ describe('Android App lifecycle', () => {
       expect(container.querySelector('.capture-history')).toBe(notes)
       expect(container.querySelector('form.composer')).toBeNull()
       expect(document.activeElement).toBe(opener)
+      expect(container.querySelector('header')?.hasAttribute('inert')).toBe(false)
       expect(window.history.state).toEqual(previousState)
       expect(document.body.style.overflowX).toBe('scroll')
       expect(document.body.style.overflowY).toBe('auto')
@@ -401,8 +408,10 @@ describe('Android App lifecycle', () => {
     expect(toolbar.querySelector('[aria-label="Switch to light mode"]')).toBeNull()
     expect(toolbar.querySelector('[aria-label="Settings"] svg')).not.toBeNull()
     await act(async () => { toolbar.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
-    expect(Array.from(container.querySelectorAll<HTMLOptionElement>('[role="dialog"] [aria-label="Theme"] option')).map((option) => option.value)).toEqual(['dark', 'slate', 'light'])
+    expect(Array.from(container.querySelectorAll<HTMLInputElement>('[role="dialog"] input[name="uiTheme"]')).map((option) => option.value)).toEqual(['dark', 'light'])
+    await navigateSettings(container, 'web')
     expect(container.querySelector<HTMLInputElement>('[role="dialog"] [aria-label="Allow web access"]')?.checked).toBe(true)
+    await backToSettings(container)
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click() })
     expect(container.querySelectorAll('[aria-label="Search mode"]')).toHaveLength(0)
     expect(container.querySelectorAll('button[type="submit"]')).toHaveLength(1)
@@ -439,13 +448,9 @@ describe('Android App lifecycle', () => {
     expect(container.querySelector('.composer__utility-actions [aria-label="New Chat"]')).not.toBeNull()
     expect(input.getAttribute('rows')).toBe('1')
     expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
-    expect(styleFor('.shell__header-actions', container.querySelector('.shell__header-actions')!).flexWrap).toBe('nowrap')
+    expect(styleFor('.shell__header-actions', container.querySelector('.shell__header-actions')!).flexWrap).toBe('wrap')
     const ask = container.querySelector('[aria-label="Ask"]')!
     expect(ask.closest('.composer__utility-row')).not.toBeNull()
-    for (const icon of container.querySelectorAll('.shell__header-actions .shell__icon-control svg')) {
-      const style = styleFor('.shell__header-actions .shell__icon-control svg', icon)
-      expect(style.width).toBe('20px'); expect(style.height).toBe('20px')
-    }
 
     vi.spyOn(window, 'getComputedStyle').mockReturnValue({ lineHeight: '22px', paddingTop: '10px', paddingBottom: '10px', borderTopWidth: '1px', borderBottomWidth: '1px' } as CSSStyleDeclaration)
     Object.defineProperty(input, 'scrollHeight', { configurable: true, value: 104 })
@@ -638,7 +643,7 @@ describe('Android App lifecycle', () => {
     expect(container.querySelector('.shell__logo')?.getAttribute('data-busy')).toBe('false')
   })
 
-  it('keeps full synced conversation titles in an accessible header icon native chooser', async () => {
+  it('keeps full synced conversation titles in the accessible Chats navigation', async () => {
     const id = '11111111-1111-4111-8111-111111111111:1'
     const title = `Synthetic offline conversation ${'long native dropdown title '.repeat(8)}`
     window.__TAURI_INTERNALS__ = { invoke: async (command) => {
@@ -656,12 +661,11 @@ describe('Android App lifecycle', () => {
     sheet.replaceSync(readFileSync('src/App.css', 'utf8'))
     const rules = Array.from(sheet.cssRules).filter((rule): rule is CSSStyleRule => rule instanceof CSSStyleRule)
     const composer = rules.find((rule) => rule.selectorText === '.composer')
-    const select = rules.find((rule) => rule.selectorText === '.shell__conversation-select')
     expect(composer?.style.minWidth).toBe('0')
     expect(chooser.closest('header')).not.toBeNull()
     expect(chooser.closest('.shell__conversation-picker')?.querySelector('svg')).not.toBeNull()
-    expect(select?.style.opacity).toBe('0')
-    expect(chooser.matches(select!.selectorText)).toBe(true)
+    expect(chooser.closest('#conversation-navigation')).not.toBeNull()
+    expect(chooser.classList.contains('shell__conversation-select')).toBe(false)
     expect(container.querySelector('.composer [aria-label="Conversation"]')).toBeNull()
     for (const name of ['Voice notes', 'New Chat']) {
       const button = container.querySelector<HTMLButtonElement>(`button[aria-label="${name}"]`)!
@@ -695,6 +699,7 @@ describe('Android App lifecycle', () => {
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Ask"]')!.click() })
     const polls = invoke.mock.calls.filter(([command]) => command === 'assistant_voice_status').length
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    await navigateSettings(container, 'voice')
     const dialog = container.querySelector('[role="dialog"]')!
     expect(dialog.textContent).toContain(voice.reason)
     expect(dialog.textContent).toContain(voice.recognitionRoute)
@@ -704,6 +709,7 @@ describe('Android App lifecycle', () => {
     await act(async () => { channel({ sessionId, kind: 'dictation', phase: 'partial', draft: 'Synthetic live words in Settings' }); await vi.advanceTimersByTimeAsync(1000) })
     expect(container.querySelector<HTMLTextAreaElement>('#promptComposer')?.value).toBe('Synthetic live words in Settings')
     expect(invoke.mock.calls.filter(([command]) => command === 'assistant_voice_status')).toHaveLength(polls + 1)
+    await backToSettings(container)
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click() })
     expect(container.querySelector('[role="dialog"]')).toBeNull()
     expect(container.textContent).not.toContain(voice.recognitionRoute)
@@ -1362,6 +1368,7 @@ describe('Android App lifecycle', () => {
     root = createRoot(container)
     await act(async () => { root?.render(<App />) })
     await act(async () => { container?.querySelector<HTMLButtonElement>('[aria-label="Settings"]')?.click() })
+    await navigateSettings(container, 'models')
     for (const id of ['composerInstantSelect', 'assistantInstantSelect']) {
       const select = container.querySelector<HTMLSelectElement>(`#${id}`)!
       expect(select).not.toBeNull()
@@ -1416,7 +1423,8 @@ describe('Android App lifecycle', () => {
     expect(container.textContent).toContain(reason)
     expect(container.querySelector('[aria-label="Retry Custom"]')).toBeNull()
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
-    expect(container.textContent).toContain(`Custom connection: ${reason}`)
+    await navigateSettings(container, 'account')
+    expect(container.textContent).toContain(reason)
     expect(container.textContent).not.toMatch(/import.*credential|copy.*credential|renew|log in/i)
   })
 
@@ -1444,7 +1452,10 @@ describe('Android App lifecycle', () => {
     })
     expect(commands).not.toContain('list_audio_input_devices')
     expect(container.querySelector('#audioInputDevice')).toBeNull()
+    await navigateSettings(container, 'models')
     expect(container.querySelector('#assistantInstantSelect')).not.toBeNull()
+    await backToSettings(container)
+    await navigateSettings(container, 'voice')
     expect(container.textContent).toContain('Voice input')
     expect(container.textContent).toContain('Speech output')
     expect(container.querySelector('header button[aria-label="Voice notes"]')).not.toBeNull()
@@ -1902,4 +1913,18 @@ function readyStartupState(): Record<string, unknown> {
     tts_output_gain_db: 3,
     capabilities: capabilities(),
   }
+}
+
+async function navigateSettings(container: HTMLElement, page: string): Promise<void> {
+  const row = container.querySelector<HTMLButtonElement>(`[data-settings-page="${page}"]`)
+  if (row === null) throw new Error(`Missing Settings row: ${page}`)
+  await act(async () => { row.click() })
+}
+
+async function backToSettings(container: HTMLElement): Promise<void> {
+  await act(async () => {
+    container.querySelector<HTMLButtonElement>('[aria-label="Back to settings"]')!.click()
+    if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(0)
+    else await Promise.resolve()
+  })
 }

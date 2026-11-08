@@ -237,11 +237,24 @@ describe('SpeechSettings', () => {
       expect(toggle !== null).toBe(supported)
       expect(container.textContent).not.toContain('recognition_error_7')
       if (toggle) {
+        expect(toggle.getAttribute('role')).toBe('switch')
+        expect(toggle.closest('label')?.textContent).toContain('Allow online speech fallback')
         expect(toggle.checked).toBe(true)
         expect(container.textContent).toContain('not proof of offline processing')
         act(() => toggle.click())
         expect(changed).toBe(false)
       }
+    } finally { dispose() }
+  })
+  it('keeps online fallback unchanged while speech preferences are disabled', () => {
+    const changes: boolean[] = []
+    const { container, dispose } = renderSpeech({ android: true, androidStatus: voiceStatus({ speechOptions }), statusError: null, startupState: startup(), disabled: true, speechNetworkFallback: true, onSpeechNetworkFallbackChange: (value) => changes.push(value) })
+    try {
+      const toggle = container.querySelector<HTMLInputElement>('[aria-label="Allow speech network fallback"]')!
+      expect(toggle.disabled).toBe(true)
+      act(() => toggle.click())
+      expect(toggle.checked).toBe(true)
+      expect(changes).toEqual([])
     } finally { dispose() }
   })
   it('retains actionable retirement failures and never invents desktop fallback controls', () => {

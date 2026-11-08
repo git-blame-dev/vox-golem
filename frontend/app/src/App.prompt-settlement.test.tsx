@@ -1,7 +1,8 @@
 import { act } from 'react'
 import { readFileSync } from 'node:fs'
 import { createRoot } from 'react-dom/client'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { installHistoryHarness } from './test/historyHarness'
 import App from './App'
 import { appSnapshot, canonicalTurn, defaultAssistantSettings, readyStartupState } from './test/sessionFixtures'
 
@@ -9,6 +10,8 @@ const smokeSource = readFileSync('../../scripts/android-e2e-smoke.py', 'utf8')
 const observationQuery = smokeSource.match(/OBSERVE = """([\s\S]*?)"""/)?.[1]
 if (observationQuery === undefined) throw new Error('Smoke helper observation query missing')
 const observe = new Function('window', 'document', `return ${observationQuery}`) as (window: Window, document: Document) => Record<string, unknown>
+
+beforeEach(() => { installHistoryHarness(null) })
 
 afterEach(() => { delete window.__TAURI_INTERNALS__; window.history.replaceState(null, ''); vi.restoreAllMocks() })
 
@@ -57,8 +60,10 @@ describe('prompt terminal presentation and speech', () => {
       expect(observe(window, document)).toMatchObject({ admitted: true, request: requestId, outcome: 'pending', stage: 'running', kind: 'text', nonblank: false })
       if (policy === 'disabled') {
         await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+        await act(async () => { container.querySelector<HTMLButtonElement>('[data-settings-page="voice"]')!.click() })
         await act(async () => { container.querySelector<HTMLInputElement>('#tts-toggle')!.click() })
         expect(ttsEnabled).toBe(false)
+        await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="Back to settings"]')!.click() })
         await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click() })
       } else if (policy === 'stopped') {
         await act(async () => { container.querySelector<HTMLButtonElement>('button[aria-label="Stop"]')!.click() })
@@ -73,7 +78,7 @@ describe('prompt terminal presentation and speech', () => {
       expect(invoke.mock.calls.filter(([command]) => command === 'speak_local_tts')).toHaveLength(0)
       expect(invoke.mock.calls.filter(([command]) => command === 'set_native_audio_active')).toEqual([])
       expect(unexpected).toEqual([])
-      expect(invoke.mock.calls.filter(([command]) => command === 'chatgpt_auth')).toEqual(policy === 'disabled' ? [['chatgpt_auth', { action: 'status' }]] : [])
+      expect(invoke.mock.calls.filter(([command]) => command === 'chatgpt_auth')).toEqual([])
     } finally {
       await act(async () => { root.unmount() }); container.remove()
       expect(invoke.mock.calls.filter(([command]) => command === 'set_native_audio_active')).toEqual([])

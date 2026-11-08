@@ -17,6 +17,50 @@ afterEach(() => {
 })
 
 describe('UpdateSettings revisioned native state', () => {
+  it('shows browser availability without offering update preferences', async () => {
+    const container = await renderUpdates()
+    expect(container.textContent).toContain('Available in the packaged app')
+    expect(container.querySelectorAll('input')).toHaveLength(0)
+    expect(container.querySelectorAll('button')).toHaveLength(0)
+  })
+
+  it('waits for a supported snapshot before showing actual preference values', async () => {
+    const hydration = deferred<unknown>()
+    installTauri({ invoke: async () => hydration.promise })
+    const container = await renderUpdates(false)
+    expect(container.textContent).toContain('Loading update status')
+    expect(container.querySelectorAll('input')).toHaveLength(0)
+
+    await act(async () => {
+      hydration.resolve(snapshot({ auto_download_enabled: false, auto_install_enabled: false }))
+      await hydration.promise
+    })
+    expect(getCheckbox(container, 'Download updates automatically').checked).toBe(false)
+    expect(getCheckbox(container, 'Install downloaded updates automatically').checked).toBe(false)
+  })
+
+  it('hides preferences for an unsupported native snapshot and retains its reason', async () => {
+    installTauri({ invoke: async () => snapshot({ phase: 'unsupported', reason: 'Synthetic platform has no updater.' }) })
+    const container = await renderUpdates()
+    expect(container.textContent).toContain('Synthetic platform has no updater.')
+    expect(container.querySelectorAll('input')).toHaveLength(0)
+    expect(container.querySelectorAll('button')).toHaveLength(0)
+  })
+
+  it('retains hydration failure retry without inventing preference values', async () => {
+    installTauri({ invoke: async (command) => {
+      if (command === 'get_update_snapshot') throw new Error('Synthetic snapshot unavailable')
+      if (command === 'check_for_update') return snapshot({ phase: 'up_to_date' })
+      throw new Error(`unexpected command: ${command}`)
+    } })
+    const container = await renderUpdates()
+    expect(container.textContent).toContain('Update failed: Synthetic snapshot unavailable')
+    expect(container.querySelectorAll('input')).toHaveLength(0)
+    await act(async () => { getButton(container, 'Retry').click(); await Promise.resolve() })
+    expect(container.textContent).toContain('Up to date')
+    expect(container.querySelectorAll('input[role="switch"]')).toHaveLength(2)
+  })
+
   it('registers its listener before hydration and never performs a startup check', async () => {
     const calls: string[] = []
     installTauri({

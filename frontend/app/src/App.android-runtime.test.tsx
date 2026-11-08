@@ -1,10 +1,28 @@
 import { StrictMode, act } from 'react'
 import { createRoot } from 'react-dom/client'
 import type { Root } from 'react-dom/client'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { installHistoryHarness } from './test/historyHarness'
 
 let root: Root | null = null
 let container: HTMLElement | null = null
+
+beforeEach(() => { installHistoryHarness(null) })
+
+async function navigateSettings(page: 'text' | 'models' | 'account' | 'voice' | 'web'): Promise<void> {
+  const row = container!.querySelector<HTMLButtonElement>(`[data-settings-page="${page}"]`)
+  expect(row).not.toBeNull()
+  await act(async () => { row!.click() })
+}
+
+async function backToSettings(): Promise<void> {
+  await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Back to settings"]')!.click() })
+}
+
+async function closeSettings(): Promise<void> {
+  await backToSettings()
+  await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click(); await vi.advanceTimersByTimeAsync(0) })
+}
 
 afterEach(() => {
   act(() => root?.unmount())
@@ -49,7 +67,8 @@ describe('production Android App runtime', () => {
     await act(async () => { root?.render(<App />) })
     expect(authActions).toEqual([])
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
-    const option = () => container!.querySelector<HTMLOptionElement>('#assistantInstantSelect option[value="custom-sol-high"]')!
+    await navigateSettings('account')
+    const option = () => container!.querySelector<HTMLOptionElement>('#composerInstantSelect option[value="custom-sol-high"]')!
     const button = (text: string) => Array.from(container!.querySelectorAll('button')).find((item) => item.textContent === text)!
     expect(option().disabled).toBe(true)
     expect(authActions).toEqual(['status'])
@@ -69,7 +88,7 @@ describe('production Android App runtime', () => {
     window.history.replaceState(null, '')
   })
 
-  it('keeps Instant before speech and omits unsupported Android model controls without invalid preference proposals', async () => {
+  it('keeps model settings before speech and omits unsupported Android model controls without invalid preference proposals', async () => {
     vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'android'); vi.resetModules(); window.history.replaceState(null, '')
     const invoke = vi.fn(async (command: string) => command === 'get_app_snapshot' ? wireSnapshot() : null)
     window.__TAURI_INTERNALS__ = { invoke }
@@ -77,23 +96,26 @@ describe('production Android App runtime', () => {
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<App />) })
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    expect(Array.from(container.querySelectorAll<HTMLInputElement>('input[name="uiTheme"]')).map((radio) => radio.value)).toEqual(['dark', 'light'])
+    const models = container.querySelector('[data-settings-page="models"]')!
+    const speech = container.querySelector('[data-settings-page="voice"]')!
+    expect(models.compareDocumentPosition(speech) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(container.querySelector('[data-settings-page="advanced"]')).toBeNull()
+    await navigateSettings('text')
+    expect(container.querySelector('[aria-label="Increase text size"]')).not.toBeNull()
+    await backToSettings()
+    await navigateSettings('models')
     const instant = container.querySelector<HTMLSelectElement>('#assistantInstantSelect')!
     expect(instant).not.toBeNull()
     expect(instant.closest('details')).toBeNull()
-    for (const control of ['select[aria-label="Theme"]', '[aria-label="Increase text size"]']) {
-      const appearance = container.querySelector(control)!
-      expect(appearance).not.toBeNull()
-      expect(appearance.compareDocumentPosition(instant) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    }
     for (const label of ['Deep', 'Review', 'Completion', 'Prefetch']) {
       expect(Array.from(container.querySelectorAll('label')).find((element) => element.textContent?.trim() === label)).toBeUndefined()
     }
     expect(container.querySelector('[aria-label="Deep model"]')).toBeNull()
     expect(container.querySelector('[aria-label="Review model"]')).toBeNull()
     expect(container.querySelector('.settings-panel__advanced')).toBeNull()
-    const speech = container.querySelector('select[aria-label="Speech language"]')!
-    expect(speech).not.toBeNull()
-    expect(instant.compareDocumentPosition(speech) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    await backToSettings()
+    await navigateSettings('voice')
     const diagnostics = Array.from(container.querySelectorAll('details')).find((details) => details.querySelector('summary')?.textContent === 'Speech details and diagnostics')!
     expect(diagnostics).toBeDefined()
     expect(diagnostics.open).toBe(false)
@@ -357,6 +379,7 @@ describe('production Android App runtime', () => {
     expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
     expect(invoke.mock.calls.some(([command]) => command === 'set_search_mode')).toBe(false)
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    await navigateSettings('web')
     const web = container.querySelector<HTMLInputElement>('[aria-label="Allow web access"]')!
     expect(web.checked).toBe(false)
     window.history.replaceState(null, '')
@@ -428,7 +451,6 @@ describe('production Android App runtime', () => {
     { kind: 'web', label: 'Allow web access', field: 'web_enabled', changed: false, original: true },
   ])('keeps rejected $kind writes visible in Voice notes Settings until a retry resolves them', async ({ kind, label, value, field, changed, original }) => {
     vi.useFakeTimers(); vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'android'); vi.resetModules(); window.history.replaceState(null, '')
-    vi.spyOn(window.history, 'back').mockImplementation(() => { window.history.replaceState(null, ''); window.dispatchEvent(new PopStateEvent('popstate', { state: null })) })
     const baseline: Record<string, unknown> = { ...(wireSnapshot() as { preferences: Record<string, unknown> }).preferences, web_enabled: true, speech_network_fallback: true, speech_language: 'en-AU', speech_tts_provider: 'synthetic.tts.a', speech_tts_voice: 'synthetic-a-local' }
     let preferences = baseline
     const proposals: Record<string, unknown>[] = []
@@ -454,8 +476,9 @@ describe('production Android App runtime', () => {
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Voice notes"]')!.click() })
     const notes = container.querySelector('.capture-history')!
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    await navigateSettings(kind === 'web' ? 'web' : 'voice')
     const dialog = container.querySelector('[role="dialog"]')!
-    const close = dialog.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!
+    const back = dialog.querySelector<HTMLButtonElement>('[aria-label="Back to settings"]')!
     const historyEntry = window.history.state
     const change = async (): Promise<void> => {
       await act(async () => {
@@ -472,7 +495,7 @@ describe('production Android App runtime', () => {
       expect(container!.querySelector('[role="dialog"]')).toBe(dialog)
       expect(window.history.state).toEqual(historyEntry)
       expect(document.body.style.overflowY).toBe('hidden')
-      expect(document.activeElement).toBe(close)
+      expect(document.activeElement).toBe(back)
     }
     const assertWriteError = (message: string): void => {
       const alert = dialog.querySelector('[role="alert"]')
@@ -502,7 +525,7 @@ describe('production Android App runtime', () => {
     expect(window.history.state).toEqual(historyEntry)
     const { invokeTauriCommand } = await import('./lib/tauri')
     expect(await invokeTauriCommand('get_assistant_settings')).toMatchObject({ speech_language: preferences['speech_language'], speech_tts_provider: preferences['speech_tts_provider'], speech_tts_voice: preferences['speech_tts_voice'], web_enabled: preferences['web_enabled'], speech_network_fallback: preferences['speech_network_fallback'] })
-    await act(async () => { close.click(); await vi.advanceTimersByTimeAsync(0) })
+    await closeSettings()
     expect(container.querySelector('.capture-history')).toBe(notes)
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Chat"]')!.click() })
     expect(container.textContent).not.toContain(`Synthetic ${kind} rejection two`)
@@ -510,7 +533,6 @@ describe('production Android App runtime', () => {
   })
   it('does not overlap slow Voice notes status reads or accept their retired result after chat owns newer status', async () => {
     vi.useFakeTimers(); vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'android'); vi.resetModules(); window.history.replaceState(null, '')
-    vi.spyOn(window.history, 'back').mockImplementation(() => { window.history.replaceState(null, ''); window.dispatchEvent(new PopStateEvent('popstate', { state: null })) })
     let preferences: Record<string, unknown> = { ...(wireSnapshot() as { preferences: Record<string, unknown> }).preferences, speech_language: 'en-AU', speech_tts_provider: 'synthetic.tts.a', speech_tts_voice: '' }
     const retiredStatus = speechStatus(preferences)
     let calls = 0
@@ -534,12 +556,14 @@ describe('production Android App runtime', () => {
     await act(async () => { root?.render(<App />) })
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Voice notes"]')!.click() })
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    await navigateSettings('voice')
     await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
     expect(calls).toBe(2)
     await act(async () => { const engine = container!.querySelector<HTMLSelectElement>('[aria-label="TTS engine"]')!; engine.value = 'synthetic.tts.b'; engine.dispatchEvent(new Event('change', { bubbles: true })) })
-    await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click(); await vi.advanceTimersByTimeAsync(0) })
+    await closeSettings()
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Chat"]')!.click() })
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    await navigateSettings('voice')
     // The same adapter retains the in-flight read across the view handoff.
     expect(calls).toBe(2)
     await act(async () => { retire(retiredStatus) })
@@ -551,7 +575,6 @@ describe('production Android App runtime', () => {
   })
   it('refreshes speech inventory in Voice notes Settings with one exclusive owner and stops that polling on close', async () => {
     vi.useFakeTimers(); vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'android'); vi.resetModules(); window.history.replaceState(null, '')
-    vi.spyOn(window.history, 'back').mockImplementation(() => { window.history.replaceState(null, ''); window.dispatchEvent(new PopStateEvent('popstate', { state: null })) })
     let preferences: Record<string, unknown> = { ...(wireSnapshot() as { preferences: Record<string, unknown> }).preferences, speech_language: 'en-AU', speech_tts_provider: 'synthetic.tts.a', speech_tts_voice: 'synthetic-a-local' }
     let preparedB = false
     let statusCalls = 0
@@ -568,13 +591,14 @@ describe('production Android App runtime', () => {
     const chatCalls = statusCalls
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Voice notes"]')!.click() })
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    await navigateSettings('voice')
     expect(statusCalls).toBe(chatCalls + 1)
     await act(async () => { const select = container!.querySelector<HTMLSelectElement>('[aria-label="TTS engine"]')!; select.value = 'synthetic.tts.b'; select.dispatchEvent(new Event('change', { bubbles: true })) })
     preparedB = true
     await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
     expect(statusCalls).toBe(chatCalls + 2)
     expect(container.querySelector<HTMLSelectElement>('[aria-label="TTS voice"]')!.querySelector('option[value="synthetic-b-local"]')).not.toBeNull()
-    await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click(); await vi.advanceTimersByTimeAsync(0) })
+    await closeSettings()
     const closedCalls = statusCalls
     await act(async () => { await vi.advanceTimersByTimeAsync(3000) })
     expect(statusCalls).toBe(closedCalls)
@@ -600,6 +624,7 @@ describe('production Android App runtime', () => {
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<App />) })
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    await navigateSettings('voice')
     const choose = async (label: string, value: string): Promise<void> => {
       await act(async () => { const select = container!.querySelector<HTMLSelectElement>(`[aria-label="${label}"]`)!; select.value = value; select.dispatchEvent(new Event('change', { bubbles: true })) })
     }
@@ -644,6 +669,7 @@ describe('production Android App runtime', () => {
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<App />) })
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    await navigateSettings('voice')
     const engine = container.querySelector<HTMLSelectElement>('[aria-label="TTS engine"]')!
     const voice = container.querySelector<HTMLSelectElement>('[aria-label="TTS voice"]')!
     await act(async () => { engine.value = 'synthetic.tts.b'; engine.dispatchEvent(new Event('change', { bubbles: true })) })
@@ -673,6 +699,7 @@ describe('production Android App runtime', () => {
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<App />) })
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    await navigateSettings('voice')
     const fallback = container.querySelector<HTMLInputElement>('[aria-label="Allow speech network fallback"]')!
     expect(fallback.checked).toBe(false); expect(fallback.disabled).toBe(false)
     await act(async () => { fallback.click() })
@@ -697,11 +724,14 @@ describe('production Android App runtime', () => {
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<App />) })
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    await navigateSettings('web')
     const web = container.querySelector<HTMLInputElement>('[aria-label="Allow web access"]')!
-    const speech = container.querySelector<HTMLInputElement>('[aria-label="Allow speech network fallback"]')!
     expect(web.checked).toBe(true)
-    expect(speech.checked).toBe(true)
     await act(async () => { web.click() })
+    await backToSettings()
+    await navigateSettings('voice')
+    const speech = container.querySelector<HTMLInputElement>('[aria-label="Allow speech network fallback"]')!
+    expect(speech.checked).toBe(true)
     await act(async () => { speech.click() })
     expect(preferences).toMatchObject({ web_enabled: false, speech_network_fallback: false, ui_theme: 'dark', instant: 'custom-sol-high' })
     expect(invoke.mock.calls.filter(([command]) => command === 'set_preferences')).toHaveLength(2)
@@ -710,8 +740,10 @@ describe('production Android App runtime', () => {
     await act(async () => { root?.unmount() }); container.remove()
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<App />) })
-    expect(container.querySelector<HTMLInputElement>('[aria-label="Allow web access"]')!.checked).toBe(false)
     expect(container.querySelector<HTMLInputElement>('[aria-label="Allow speech network fallback"]')!.checked).toBe(false)
+    await backToSettings()
+    await navigateSettings('web')
+    expect(container.querySelector<HTMLInputElement>('[aria-label="Allow web access"]')!.checked).toBe(false)
     window.history.replaceState(null, '')
   })
   it('recovers hydration through the real cache-only adapter under StrictMode', async () => {

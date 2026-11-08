@@ -1,4 +1,5 @@
 import { useSessionView } from './FrontendSession'
+import { readUiTheme } from './ui/theme'
 import type { FrontendSession } from './FrontendSession'
 import type { FrontendSessionRuntimeView } from './FrontendSessionRuntime'
 import type { AssistantCapabilities, AssistantOption, AssistantSettings } from './lib/assistantSettings'
@@ -107,10 +108,7 @@ export function parseUiTextSize(value: unknown): UiTextSize {
 }
 
 export function parseUiTheme(value: unknown): UiTheme {
-  if (value === 'light' || value === 'dark' || value === 'slate') {
-    return value
-  }
-  return DEFAULT_UI_THEME
+  return readUiTheme(value) ?? DEFAULT_UI_THEME
 }
 
 export function appUpdateBlocksRuntime(state: UpdateState): boolean {

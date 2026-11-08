@@ -8,14 +8,15 @@ import { AndroidVoiceControlsProvider, AndroidComposerVoiceControl, AndroidVoice
 import { useAndroidVoiceAdapter } from '../lib/useAndroidVoiceAdapter'
 import type { AndroidVoiceAdapterInputs } from '../lib/useAndroidVoiceAdapter'
 import { ControlIcon } from './ControlIcon'
+import { ActionMenu } from '../ui/ActionMenu'
 
 // Integration harness owns the adapter; the rendered controls only consume its view.
-function AndroidVoiceControls(props: AndroidVoiceAdapterInputs & { compact?: boolean; modelControl?: ReactNode }) {
+function AndroidVoiceControls(props: AndroidVoiceAdapterInputs & { compact?: boolean; modelControl?: ReactNode; menu?: boolean }) {
   const voice = useAndroidVoiceAdapter(props)
   // Exercise retained loop and explicit stop adapter entries directly, without reintroducing removed UI controls.
   return <><button aria-label="Test loop adapter entry" onClick={() => { void voice.start(true) }} /><button aria-label="Test manual adapter entry" onClick={() => { void voice.start(false) }} /><button aria-label="Test stop adapter entry" onClick={voice.stop} /><AndroidVoiceControlsProvider voice={voice} disabled={props.disabled} generationAvailable={props.generationAvailable}>
     <AndroidComposerVoiceControl />
-    <AndroidVoiceSecondaryControls />{props.modelControl}
+    {props.menu ? <ActionMenu><AndroidVoiceSecondaryControls /></ActionMenu> : <AndroidVoiceSecondaryControls />}{props.modelControl}
   </AndroidVoiceControlsProvider></>
 }
 
@@ -24,7 +25,7 @@ let container: HTMLElement | null = null
 const wire = { kind: 'voice_status', available: true, reason: 'Synthetic local recognizer', mode: 'dictation', dictation: 'idle', loop: 'idle', ttsEnabled: false, ttsAvailable: false, ttsPhase: 'idle', error: null }
 afterEach(() => { act(() => root?.unmount()); container?.remove(); root = null; container = null; delete window.__TAURI_INTERNALS__; vi.useRealTimers(); vi.restoreAllMocks() })
 
-async function setup(compact = false, initialStatus: Record<string, unknown> = {}, { disabled = false, generationAvailable = true } = {}) {
+async function setup(compact = false, initialStatus: Record<string, unknown> = {}, { disabled = false, generationAvailable = true, menu = false } = {}) {
   let channel: (value: unknown) => void = () => undefined
   let sessionId = ''
   const onDraft = vi.fn()
@@ -41,7 +42,7 @@ async function setup(compact = false, initialStatus: Record<string, unknown> = {
     invoke: native,
   }
   container = document.createElement('div'); document.body.append(container); root = createRoot(container)
-  await act(async () => { root?.render(<AndroidVoiceControls draft="" disabled={disabled} generationAvailable={generationAvailable} stopRef={stopRef} onDraft={onDraft} onSubmit={onSubmit} onActivity={vi.fn()} onInputCancelled={onInputCancelled} onSettled={vi.fn()} compact={compact} modelControl={compact ? <button aria-label="Model"><ControlIcon kind="model" /></button> : undefined} />) })
+  await act(async () => { root?.render(<AndroidVoiceControls menu={menu} draft="" disabled={disabled} generationAvailable={generationAvailable} stopRef={stopRef} onDraft={onDraft} onSubmit={onSubmit} onActivity={vi.fn()} onInputCancelled={onInputCancelled} onSettled={vi.fn()} compact={compact} modelControl={compact ? <button aria-label="Model"><ControlIcon kind="model" /></button> : undefined} />) })
   return { native, onDraft, onSubmit, onInputCancelled, stopRef, ownedSession: () => sessionId, event: (value: Record<string, unknown>) => channel({ sessionId, ...value }) }
 }
 
@@ -332,7 +333,9 @@ describe('Android native voice controls', () => {
       this.querySelector<HTMLElement>('[autofocus]')?.focus()
     })
     const close = vi.spyOn(HTMLDialogElement.prototype, 'close').mockImplementation(function (this: HTMLDialogElement) { this.open = false })
-    const state = await setup(true, { available: false, missingSpeechServices: true })
+    const state = await setup(true, { available: false, missingSpeechServices: true }, { menu: label === 'Speak replies' })
+    const menu = container!.querySelector('details')
+    if (menu) await act(async () => { menu.querySelector('summary')!.click() })
     const invoker = compactButton(label)
     invoker.focus()
     await act(async () => { invoker.click() })
@@ -340,6 +343,9 @@ describe('Android native voice controls', () => {
     expect(dialog).not.toBeNull()
     expect(showModal).toHaveBeenCalledTimes(1)
     expect(dialog.open).toBe(true)
+    expect(invoker.getAttribute('aria-haspopup')).toBe('dialog')
+    expect(invoker.getAttribute('aria-expanded')).toBe('true')
+    if (menu) expect(menu.open).toBe(true)
     expect(document.activeElement?.textContent).toBe('Cancel')
     expect(document.getElementById(dialog.getAttribute('aria-labelledby')!)?.textContent).toBe('Speech Services Required')
     await act(async () => {
@@ -349,6 +355,7 @@ describe('Android native voice controls', () => {
     expect(container!.querySelector('dialog')).toBeNull()
     expect(close).toHaveBeenCalledTimes(1)
     expect(document.activeElement).toBe(invoker)
+    expect(invoker.getAttribute('aria-expanded')).toBe('false')
     expect(state.native.mock.calls.some(([name]) => name === 'start_assistant_voice' || name === 'set_tts_enabled')).toBe(false)
   })
   it('opens unverified shortcut navigation visibly but requires an app Ask tap before microphone admission', async () => {

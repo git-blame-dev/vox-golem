@@ -14,20 +14,42 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
-function renderSelect(options: readonly AssistantOption<InstantChoice>[], disabled = false, canRetry: (value: InstantChoice) => boolean = () => false, variant?: 'default' | 'pill' | 'icon', value: InstantChoice = 'custom-sol-high', fastMode = false, onFastModeChange?: (fastMode: boolean) => void) {
+function renderSelect(options: readonly AssistantOption<InstantChoice>[], disabled = false, canRetry: (value: InstantChoice) => boolean = () => false, value: InstantChoice = 'custom-sol-high', fastMode = false, onFastModeChange?: (fastMode: boolean) => void) {
   const onChange = vi.fn()
   container = document.createElement('div')
   document.body.append(container)
   root = createRoot(container)
-  act(() => root?.render(<InstantModelSelect {...(variant ? { variant } : {})} id="syntheticInstant" label="Instant model" value={value} options={options} disabled={disabled} canRetry={canRetry} onChange={onChange} fastMode={fastMode} {...(onFastModeChange ? { onFastModeChange } : {})} />))
+  act(() => root?.render(<InstantModelSelect id="syntheticInstant" label="Instant model" value={value} options={options} disabled={disabled} canRetry={canRetry} onChange={onChange} fastMode={fastMode} {...(onFastModeChange ? { onFastModeChange } : {})} />))
   const select = container.querySelector('select')!
   return { select, onChange, container }
 }
 
 describe('InstantModelSelect', () => {
+  it('moves listbox focus with arrows and Home/End without selecting until activation', () => {
+    const { container: el, onChange } = renderSelect([
+      { value: 'local-fast', label: 'Synthetic first', available: true },
+      { value: 'custom-sol-high', label: 'Synthetic unavailable', available: false },
+      { value: 'gemini-nano', label: 'Synthetic last', available: true },
+    ], false, undefined, 'local-fast')
+    const trigger = el.querySelector<HTMLButtonElement>('.composer__model-pill-trigger')!
+    trigger.focus()
+    act(() => trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })))
+    const choices = Array.from(el.querySelectorAll<HTMLButtonElement>('[role="option"]'))
+    expect(document.activeElement).toBe(choices[0])
+    act(() => choices[0]!.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })))
+    expect(document.activeElement).toBe(choices[2])
+    act(() => choices[2]!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true })))
+    expect(document.activeElement).toBe(choices[0])
+    act(() => choices[0]!.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true })))
+    expect(document.activeElement).toBe(choices[2])
+    expect(onChange).not.toHaveBeenCalled()
+    act(() => choices[2]!.click())
+    expect(onChange).toHaveBeenCalledWith('gemini-nano')
+  })
+
   it.each(['Escape', 'selection'] as const)('restores actual keyboard focus after %s and keeps closing controls disabled', (reason) => {
     vi.useFakeTimers()
-    const { container: el } = renderSelect([{ value: 'local-fast', label: 'Synthetic model', available: true }], false, undefined, 'pill', 'local-fast')
+    const { container: el } = renderSelect([{ value: 'local-fast', label: 'Synthetic model', available: true }], false, undefined, 'local-fast')
     const trigger = el.querySelector<HTMLButtonElement>('button')!
     trigger.focus()
     act(() => trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })))
@@ -46,7 +68,7 @@ describe('InstantModelSelect', () => {
 
   it('does not steal outside focus and cancels an old close on reopen', () => {
     vi.useFakeTimers()
-    const { container: el } = renderSelect([{ value: 'local-fast', label: 'Synthetic model', available: true }], false, undefined, 'pill', 'local-fast')
+    const { container: el } = renderSelect([{ value: 'local-fast', label: 'Synthetic model', available: true }], false, undefined, 'local-fast')
     const trigger = el.querySelector<HTMLButtonElement>('button')!
     act(() => trigger.click())
     const outside = document.createElement('button')
@@ -64,12 +86,12 @@ describe('InstantModelSelect', () => {
   it('does not restore an unavailable trigger', () => {
     vi.useFakeTimers()
     const options = [{ value: 'local-fast' as const, label: 'Synthetic model', available: true }]
-    const { container: el } = renderSelect(options, false, undefined, 'pill', 'local-fast')
+    const { container: el } = renderSelect(options, false, undefined, 'local-fast')
     const trigger = el.querySelector<HTMLButtonElement>('button')!
     act(() => trigger.click())
     const option = el.querySelector<HTMLButtonElement>('[role="option"]')!
     option.focus()
-    act(() => root?.render(<InstantModelSelect variant="pill" id="syntheticInstant" label="Instant model" value="local-fast" options={options} disabled canRetry={() => false} onChange={vi.fn()} />))
+    act(() => root?.render(<InstantModelSelect id="syntheticInstant" label="Instant model" value="local-fast" options={options} disabled canRetry={() => false} onChange={vi.fn()} />))
     act(() => option.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
     act(() => vi.advanceTimersByTime(160))
     expect(document.activeElement).not.toBe(trigger)
@@ -77,7 +99,7 @@ describe('InstantModelSelect', () => {
 
   it('preserves navigation focus and clears a pending close on unmount', () => {
     vi.useFakeTimers()
-    const { container: el } = renderSelect([{ value: 'local-fast', label: 'Synthetic model', available: true }], false, undefined, 'pill', 'local-fast')
+    const { container: el } = renderSelect([{ value: 'local-fast', label: 'Synthetic model', available: true }], false, undefined, 'local-fast')
     const trigger = el.querySelector<HTMLButtonElement>('button')!
     act(() => trigger.click())
     const option = el.querySelector<HTMLButtonElement>('[role="option"]')!
@@ -102,12 +124,14 @@ describe('InstantModelSelect', () => {
       { value: 'custom-sol-low', label: 'Custom: GPT-6.1 Sol Low', available: true },
       { value: 'agy-argon-high', label: 'Agy: Gemini 4 Argon High', available: true },
       { value: 'agy-argon-low', label: 'Agy: Gemini 4 Argon Low', available: true },
-    ], false, undefined, 'pill', 'custom-sol-high', false, onFastModeChange)
+    ], false, undefined, 'custom-sol-high', false, onFastModeChange)
     const pill = select.closest('.composer__model-pill')!
     expect(pill).not.toBeNull()
     expect(pill.querySelector('.composer__model-pill-label')?.textContent).toBe(label)
     expect(pill.querySelector('.composer__model-pill-chevron')).not.toBeNull()
     expect(select.selectedOptions[0]?.textContent).toBe(label)
+    expect(select.tabIndex).toBe(-1)
+    expect(pill.querySelectorAll('button')).toHaveLength(1)
 
     const trigger = pill.querySelector<HTMLButtonElement>('.composer__model-pill-trigger')!
     expect(trigger).not.toBeNull()
@@ -151,7 +175,7 @@ describe('InstantModelSelect', () => {
       { value: 'custom-luna6-low', label: 'Custom: GPT-6 Luna Low', available: true },
     ]
     const onChange = vi.fn()
-    const { select, container: rootEl } = renderSelect(options, false, undefined, 'pill', 'custom-sol-high')
+    const { select, container: rootEl } = renderSelect(options, false, undefined, 'custom-sol-high')
     const trigger = select.closest('.composer__model-pill')!.querySelector<HTMLButtonElement>('.composer__model-pill-trigger')!
     act(() => trigger.click())
 
@@ -159,11 +183,11 @@ describe('InstantModelSelect', () => {
     expect(popupBefore).not.toBeNull()
     expect(popupBefore.getAttribute('data-state')).toBe('open')
 
-    act(() => root?.render(<InstantModelSelect variant="pill" id="syntheticInstant" label="Instant model" value="custom-luna6-high" options={options} disabled={true} canRetry={() => false} onChange={onChange} />))
+    act(() => root?.render(<InstantModelSelect id="syntheticInstant" label="Instant model" value="custom-luna6-high" options={options} disabled={true} canRetry={() => false} onChange={onChange} />))
     expect(rootEl.querySelector('.composer__model-popup')).toBe(popupBefore)
     expect(rootEl.querySelector('.composer__model-popup')?.getAttribute('data-state')).toBe('open')
 
-    act(() => root?.render(<InstantModelSelect variant="pill" id="syntheticInstant" label="Instant model" value="custom-luna6-high" options={options} disabled={false} canRetry={() => false} onChange={onChange} />))
+    act(() => root?.render(<InstantModelSelect id="syntheticInstant" label="Instant model" value="custom-luna6-high" options={options} disabled={false} canRetry={() => false} onChange={onChange} />))
     expect(rootEl.querySelector('.composer__model-popup')).toBe(popupBefore)
     expect(rootEl.querySelector('.composer__model-popup')?.getAttribute('data-state')).toBe('open')
   })
@@ -173,7 +197,7 @@ describe('InstantModelSelect', () => {
     const { select, container: rootEl } = renderSelect([
       { value: 'agy-argon-high', label: 'Agy: Gemini 4 Argon High', available: true },
       { value: 'agy-argon-low', label: 'Agy: Gemini 4 Argon Low', available: true },
-    ], false, undefined, 'pill', 'agy-argon-high', true, onFastModeChange)
+    ], false, undefined, 'agy-argon-high', true, onFastModeChange)
     const trigger = select.closest('.composer__model-pill')!.querySelector<HTMLButtonElement>('.composer__model-pill-trigger')!
     act(() => trigger.click())
     expect(rootEl.querySelector('.composer__model-popup-fast-row')).toBeNull()
@@ -183,23 +207,24 @@ describe('InstantModelSelect', () => {
     const { select } = renderSelect([
       { value: 'custom-sol-high', label: 'Custom: GPT-6.1 Sol High', available: true },
       { value: 'custom-sol-low', label: 'Custom: GPT-6.1 Sol Low', available: true },
-    ], false, undefined, 'pill', 'custom-sol-high', true)
+    ], false, undefined, 'custom-sol-high', true)
     expect(select.closest('.composer__model-pill')?.querySelector('.composer__model-pill-label')?.textContent).toBe('GPT-6.1 Sol High · Fast')
   })
 
   it('keeps an absent selected value visibly unavailable without silently selecting another model', () => {
-    const { select } = renderSelect([{ value: 'local-fast', label: 'Synthetic other model', available: true }], false, undefined, 'pill')
+    const { select } = renderSelect([{ value: 'local-fast', label: 'Synthetic other model', available: true }], false, undefined)
     expect(select.closest('.composer__model-pill')?.querySelector('.composer__model-pill-label')?.textContent).toBe('Selected model unavailable')
     expect(select.value).toBe('')
   })
 
-  it.each([false, true].flatMap((disabled) => (['icon', 'pill'] as const).map((variant) => ({ disabled, variant }))))('keeps native $variant availability, retry and disabled guards (disabled: $disabled)', ({ disabled, variant }) => {
+  it.each([false, true])('keeps native fallback availability, retry and disabled guards (disabled: %s)', (disabled) => {
     const { select, onChange } = renderSelect([
       { value: 'custom-sol-high', label: 'Synthetic selected model', available: true },
       { value: 'local-fast', label: 'Synthetic retry model', available: false, reason: 'Synthetic warming' },
       { value: 'custom-luna-none', label: 'Synthetic unavailable model', available: false },
-    ], disabled, (value) => value === 'local-fast', variant)
+    ], disabled, (value) => value === 'local-fast')
     expect(select.closest('.native-icon-select')?.querySelector('svg')).toBeTruthy()
+    expect(select.disabled).toBe(disabled)
     expect(select.getAttribute('aria-label')).toBe('Instant model')
     expect(select.title).toBe('Synthetic selected model')
     act(() => { select.value = 'local-fast'; select.dispatchEvent(new Event('change', { bubbles: true })) })
@@ -211,6 +236,7 @@ describe('InstantModelSelect', () => {
     expect(select.value).toBe('')
     expect(select.selectedOptions[0]?.textContent).toBe('Models unavailable')
     expect(select.selectedOptions[0]?.disabled).toBe(true)
+    expect(container?.querySelector<HTMLButtonElement>('.composer__model-pill-trigger')?.disabled).toBe(true)
     expect(onChange).not.toHaveBeenCalled()
   })
 

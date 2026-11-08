@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties } from 'react'
 import type { AssistantOption, InstantChoice } from '../lib/assistantSettings'
 import { MODEL_CATALOG } from '../lib/modelCatalog'
 import { ControlIcon } from './ControlIcon'
@@ -12,7 +11,6 @@ interface InstantModelSelectProps {
   readonly disabled: boolean
   readonly canRetry: (value: InstantChoice) => boolean
   readonly onChange: (value: InstantChoice) => void
-  readonly variant?: 'default' | 'pill' | 'icon'
   readonly fastMode?: boolean
   readonly onFastModeChange?: (enabled: boolean) => void
 }
@@ -30,7 +28,7 @@ const effortShortLabels: Record<string, string> = {
 
 const EXIT_ANIMATION_MS = 160
 
-export function InstantModelSelect({ id, label, value, options, disabled, canRetry, onChange, variant = 'default', fastMode, onFastModeChange }: InstantModelSelectProps) {
+export function InstantModelSelect({ id, label, value, options, disabled, canRetry, onChange, fastMode, onFastModeChange }: InstantModelSelectProps) {
   const [popupPhase, setPopupPhase] = useState<'closed' | 'open' | 'closing'>('closed')
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
@@ -191,16 +189,16 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
     option?.focus()
   }, [isPopupOpen, disabled])
 
-  const renderNativeSelect = (extraClassName?: string, nonInteractive = false) => (
+  const renderNativeSelect = () => (
     <select
       id={id}
       aria-label={label || 'Model'}
       title={selectedLabel}
       value={selectedOption ? value : ''}
       disabled={disabled || options.length === 0}
-      className={extraClassName}
-      tabIndex={nonInteractive ? -1 : undefined}
-      style={nonInteractive ? { pointerEvents: 'none' } : undefined}
+      className="sr-only composer__model-native-fallback"
+      tabIndex={-1}
+      style={{ pointerEvents: 'none' }}
       onChange={(event) => {
         if (disabled) return
         const val = event.target.value
@@ -228,163 +226,170 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
     </select>
   )
 
-  if (variant === 'default') {
-    return renderNativeSelect()
-  }
-
-  if (variant === 'pill') {
-    return (
-      <div className="composer__model-selectors">
-        <div className="composer__model-pill native-icon-select" title={selectedLabel}>
-          <button
-            ref={triggerRef}
-            type="button"
-            className="composer__model-pill-trigger"
-            aria-haspopup="dialog"
-            aria-expanded={isPopupOpen}
-            disabled={disabled || options.length === 0}
-            onKeyDown={(event) => {
-              if (['ArrowDown', 'Enter', ' '].includes(event.key) && !disabled && options.length > 0) {
-                event.preventDefault()
-                openPopup(true)
-              }
-            }}
-            onClick={(event) => {
-              if (disabled || options.length === 0) return
-              if (isPopupOpen) closePopup()
-              else openPopup(event.detail === 0 && document.activeElement === event.currentTarget)
-            }}
-          >
-            <span className="composer__model-pill-label">{pillDisplayLabel}</span>
-            <svg className="composer__model-pill-chevron" data-open={isPopupOpen ? 'true' : undefined} viewBox="0 0 16 16" aria-hidden="true" focusable="false">
-              <path d="M4 6l4 4 4-4" />
-            </svg>
-          </button>
-          {renderNativeSelect('sr-only composer__model-native-fallback', true)}
-        </div>
-        {isPopupVisible ? (
-          <>
-            <div
-              className="composer__model-backdrop"
-              data-state={effectivePhase}
-              aria-hidden="true"
-              onClick={() => closePopup()}
-            />
-            <div
-              ref={popupRef}
-              className="composer__model-popup"
-              inert={!isPopupOpen}
-              data-state={effectivePhase}
-              role="dialog"
-              aria-label="Select model and reasoning effort"
-            >
-              <div className="composer__model-popup-list" role="listbox" aria-label="Models">
-                {familyOptions.map(({ familyId, isCurrentFamily, modelCount, repOption, available, displayLabel }, index) => (
-                  <button
-                    key={familyId}
-                    type="button"
-                    role="option"
-                    aria-selected={isCurrentFamily}
-                    className="composer__model-popup-item"
-                    data-selected={isCurrentFamily ? 'true' : undefined}
-                    style={{ '--item-index': index } as CSSProperties}
-                    disabled={!isPopupOpen || disabled || !available}
-                    title={repOption.reason}
-                    onClick={() => {
-                      if (!isPopupOpen || disabled || !available) return
-                      if (repOption.value !== value) {
-                        onChange(repOption.value)
-                      }
-                      if (isCurrentFamily || modelCount <= 1) {
-                        closePopup('restore')
-                      }
-                    }}
-                  >
-                    <span className="composer__model-popup-item-name">{displayLabel}</span>
-                    {isCurrentFamily ? (
-                      <span className="composer__model-popup-item-check" aria-hidden="true">
-                        <ControlIcon kind="check" />
-                      </span>
-                    ) : null}
-                  </button>
-                ))}
-              </div>
-              <div className="composer__model-popup-efforts" role="group" aria-label="Reasoning effort">
-                <div className="composer__model-popup-effort-row">
-                  {familyEfforts.map(({ effort, option }) => {
-                    const isCurrentEffort = option.value === value || (familyEfforts.length === 1 && effort === currentEffort)
-                    const effortAvailable = option.available || canRetry(option.value)
-                    const chipLabel = familyEfforts.length === 1 && effort === 'none'
-                      ? 'Standard'
-                      : (effortShortLabels[effort] ?? effort)
-                    return (
-                      <button
-                        key={option.value}
-                        type="button"
-                        className="composer__model-popup-effort-chip"
-                        data-active={isCurrentEffort ? 'true' : undefined}
-                        aria-pressed={isCurrentEffort}
-                        disabled={!isPopupOpen || disabled || !effortAvailable}
-                        title={option.reason}
-                        onClick={() => {
-                          if (!isPopupOpen || disabled || !effortAvailable) return
-                          if (option.value !== value) {
-                            onChange(option.value)
-                          }
-                          closePopup('restore')
-                        }}
-                      >
-                        {chipLabel}
-                      </button>
-                    )
-                  })}
-                </div>
-                {supportsFast && onFastModeChange !== undefined ? (
-                  <div className="composer__model-popup-fast-row" role="group" aria-label="Fast mode">
-                    <span className="composer__model-popup-fast-label">Fast</span>
-                    <div className="composer__model-popup-fast-chips">
-                      {([
-                        { label: 'Off', nextFast: false },
-                        { label: 'On', nextFast: true },
-                      ] as const).map(({ label: optLabel, nextFast }) => {
-                        const isActive = Boolean(fastMode) === nextFast
-                        const isDisabled = !isPopupOpen || disabled || (!selectedOption?.available && !canRetry(value))
-                        return (
-                          <button
-                            key={optLabel}
-                            type="button"
-                            className="composer__model-popup-effort-chip composer__model-popup-fast-chip"
-                            data-active={isActive ? 'true' : undefined}
-                            aria-pressed={isActive}
-                            aria-label={`Fast ${optLabel}`}
-                            disabled={isDisabled}
-                            onClick={() => {
-                              if (isDisabled) return
-                              if (Boolean(fastMode) !== nextFast) {
-                                onFastModeChange(nextFast)
-                              }
-                              closePopup('restore')
-                            }}
-                          >
-                            {optLabel}
-                          </button>
-                        )
-                      })}
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            </div>
-          </>
-        ) : null}
-      </div>
-    )
-  }
-
   return (
-    <span className="native-icon-select shell__icon-control" title={selectedLabel}>
-      <ControlIcon kind="model" />
-      {renderNativeSelect()}
-    </span>
+    <div className="composer__model-selectors">
+      <div className="composer__model-pill native-icon-select" title={selectedLabel}>
+        <button
+          ref={triggerRef}
+          type="button"
+          className="composer__model-pill-trigger"
+          aria-label={`${label}: ${pillDisplayLabel}`}
+          aria-haspopup="dialog"
+          aria-controls={`${id}-popup`}
+          aria-expanded={isPopupOpen}
+          disabled={disabled || options.length === 0}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape' && isPopupOpen) {
+              event.preventDefault()
+              event.stopPropagation()
+              closePopup('restore')
+              return
+            }
+            if (['ArrowDown', 'Enter', ' '].includes(event.key) && !disabled && options.length > 0) {
+              event.preventDefault()
+              openPopup(true)
+            }
+          }}
+          onClick={(event) => {
+            if (disabled || options.length === 0) return
+            if (isPopupOpen) closePopup()
+            else openPopup(event.detail === 0 && document.activeElement === event.currentTarget)
+          }}
+        >
+          <span className="composer__model-pill-label">{pillDisplayLabel}</span>
+          <svg className="composer__model-pill-chevron" data-open={isPopupOpen ? 'true' : undefined} viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+            <path d="M4 6l4 4 4-4" />
+          </svg>
+        </button>
+        {renderNativeSelect()}
+      </div>
+      {isPopupVisible ? (
+        <>
+          <div
+            className="composer__model-backdrop"
+            data-state={effectivePhase}
+            aria-hidden="true"
+            onClick={() => closePopup()}
+          />
+          <div
+            ref={popupRef}
+            id={`${id}-popup`}
+            className="composer__model-popup"
+            inert={!isPopupOpen}
+            data-state={effectivePhase}
+            role="dialog"
+            aria-label="Select model and reasoning effort"
+            onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closePopup('restore') } }}
+          >
+            <div className="composer__model-popup-list" role="listbox" aria-label="Models" onKeyDown={(event) => {
+              if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
+              const choices = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="option"]:not(:disabled)'))
+              const index = choices.indexOf(document.activeElement as HTMLButtonElement)
+              if (index < 0 || choices.length === 0) return
+              event.preventDefault()
+              const next = event.key === 'Home' ? 0 : event.key === 'End' ? choices.length - 1
+                : (index + (event.key === 'ArrowDown' ? 1 : -1) + choices.length) % choices.length
+              choices.forEach((choice, position) => { choice.tabIndex = position === next ? 0 : -1 })
+              choices[next]?.focus()
+            }}>
+              {familyOptions.map(({ familyId, isCurrentFamily, modelCount, repOption, available, displayLabel }, index) => (
+                <button
+                  key={familyId}
+                  type="button"
+                  role="option"
+                  aria-selected={isCurrentFamily}
+                  tabIndex={isCurrentFamily || (!selectedOption && index === familyOptions.findIndex((option) => option.available)) ? 0 : -1}
+                  className="composer__model-popup-item"
+                  data-selected={isCurrentFamily ? 'true' : undefined}
+                  disabled={!isPopupOpen || disabled || !available}
+                  title={repOption.reason}
+                  onClick={() => {
+                    if (!isPopupOpen || disabled || !available) return
+                    if (repOption.value !== value) {
+                      onChange(repOption.value)
+                    }
+                    if (isCurrentFamily || modelCount <= 1) {
+                      closePopup('restore')
+                    }
+                  }}
+                >
+                  <span className="composer__model-popup-item-name">{displayLabel}</span>
+                  {isCurrentFamily ? (
+                    <span className="composer__model-popup-item-check" aria-hidden="true">
+                      <ControlIcon kind="check" />
+                    </span>
+                  ) : null}
+                </button>
+              ))}
+            </div>
+            <div className="composer__model-popup-efforts" role="group" aria-label="Reasoning effort">
+              <div className="composer__model-popup-effort-row">
+                {familyEfforts.map(({ effort, option }) => {
+                  const isCurrentEffort = option.value === value || (familyEfforts.length === 1 && effort === currentEffort)
+                  const effortAvailable = option.available || canRetry(option.value)
+                  const chipLabel = familyEfforts.length === 1 && effort === 'none'
+                    ? 'Standard'
+                    : (effortShortLabels[effort] ?? effort)
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      className="composer__model-popup-effort-chip"
+                      data-active={isCurrentEffort ? 'true' : undefined}
+                      aria-pressed={isCurrentEffort}
+                      disabled={!isPopupOpen || disabled || !effortAvailable}
+                      title={option.reason}
+                      onClick={() => {
+                        if (!isPopupOpen || disabled || !effortAvailable) return
+                        if (option.value !== value) {
+                          onChange(option.value)
+                        }
+                        closePopup('restore')
+                      }}
+                    >
+                      {chipLabel}
+                    </button>
+                  )
+                })}
+              </div>
+              {supportsFast && onFastModeChange !== undefined ? (
+                <div className="composer__model-popup-fast-row" role="group" aria-label="Fast mode">
+                  <span className="composer__model-popup-fast-label">Fast</span>
+                  <div className="composer__model-popup-fast-chips">
+                    {([
+                      { label: 'Off', nextFast: false },
+                      { label: 'On', nextFast: true },
+                    ] as const).map(({ label: optLabel, nextFast }) => {
+                      const isActive = Boolean(fastMode) === nextFast
+                      const isDisabled = !isPopupOpen || disabled || (!selectedOption?.available && !canRetry(value))
+                      return (
+                        <button
+                          key={optLabel}
+                          type="button"
+                          className="composer__model-popup-effort-chip composer__model-popup-fast-chip"
+                          data-active={isActive ? 'true' : undefined}
+                          aria-pressed={isActive}
+                          aria-label={`Fast ${optLabel}`}
+                          disabled={isDisabled}
+                          onClick={() => {
+                            if (isDisabled) return
+                            if (Boolean(fastMode) !== nextFast) {
+                              onFastModeChange(nextFast)
+                            }
+                            closePopup('restore')
+                          }}
+                        >
+                          {optLabel}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </>
+      ) : null}
+    </div>
   )
 }

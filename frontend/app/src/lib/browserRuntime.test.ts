@@ -261,7 +261,7 @@ describe('browser preview runtime', () => {
       fastMode: false,
       responseProfile: 'fast',
       ttsEnabled: false,
-      uiTheme: theme,
+      uiTheme: theme === 'slate' ? 'dark' : theme,
       uiTextSize: 'large',
       webEnabled: true,
       speechNetworkFallback: true,
@@ -271,7 +271,7 @@ describe('browser preview runtime', () => {
     returned['ui_theme'] = 'dark'
     await expect(runtime.invoke('set_preferences', { preferences: { ui_theme: 'dark' } })).rejects.toMatchObject({ code: 'invalid_input' })
     expect(parseAppSnapshot(await runtime.invoke('get_app_snapshot')).preferences).toMatchObject({
-      uiTheme: theme,
+      uiTheme: theme === 'slate' ? 'dark' : theme,
       uiTextSize: 'large',
     })
   })

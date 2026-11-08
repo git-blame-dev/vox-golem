@@ -76,13 +76,13 @@ describe('AnswerStage', () => {
     })
 
     const details = container.querySelector('details')
-    expect(details?.querySelector('summary')?.textContent).toBe('Sources')
+    expect(details?.querySelector('summary')?.textContent).toBe('Answer details')
     expect(details?.querySelectorAll('h3')[1]?.textContent).toBe('Before review')
     expect(details?.textContent).toContain('old <b>answer</b>')
     expect(details?.textContent).toContain('final')
     expect(details?.querySelector('b')).toBeNull()
     expect(container.querySelector('[data-status="kept"]')).toBeTruthy()
-    expect(container.querySelector('summary')?.getAttribute('role')).toBeNull()
+    expect(container.querySelector('summary')?.getAttribute('role')).toBe('button')
   })
 
   it('omits history when no prior versions were recorded', () => {
@@ -97,7 +97,7 @@ describe('AnswerStage', () => {
   ])('uses one Sources disclosure for %s metadata', (_name, metadata) => {
     const container = render({ answer: 'answer', stages: [], ...metadata })
     expect(container.querySelectorAll('details')).toHaveLength(1)
-    expect(container.querySelector('summary')?.textContent).toBe('Sources')
+    expect(container.querySelector('summary')?.textContent).toBe('sources' in metadata ? 'Sources' : 'Answer details')
   })
 
   it('consolidates sources, correction detail, and prior versions without nesting disclosures', () => {

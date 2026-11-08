@@ -1,3 +1,4 @@
+import { createCaptureDraftMemory } from '../lib/useCaptureHistory'
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import type { Root } from 'react-dom/client'
@@ -32,6 +33,63 @@ beforeEach(() => {
 })
 
 describe('CaptureHistory', () => {
+  it.each(['before-remount', 'after-remount', 'rejected'] as const)('settles an owned correction save across navigation: %s', async (outcome) => {
+    const memory = createCaptureDraftMemory()
+    const initial = { ...capture(), finalText: 'Synthetic A', transcriptVersion: 4 }
+    const saved = { ...initial, finalText: 'Synthetic B', transcriptVersion: 5 }
+    const snapshot = (record: CaptureRecord) => ({ available: true, notesFolderUri: null, captures: [record], error: null })
+    captureMocks.loadCaptureSnapshot.mockResolvedValue(snapshot(initial))
+    let resolve!: (record: CaptureRecord) => void
+    let reject!: (error: Error) => void
+    captureMocks.updateCaptureTranscript.mockImplementationOnce(() => new Promise((yes, no) => { resolve = yes; reject = no }))
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    const renderHistory = () => root!.render(<CaptureHistory draftMemory={memory} onBack={() => undefined} />)
+    const button = (label: string) => Array.from(container!.querySelectorAll('button')).find((item) => item.textContent === label)!
+    const edit = (text: string) => {
+      const editor = container!.querySelector('textarea')!
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(editor, text)
+      editor.dispatchEvent(new Event('input', { bubbles: true }))
+    }
+    await act(async () => { renderHistory() })
+    await act(async () => { container!.querySelector<HTMLButtonElement>('.capture-history__record')!.click() })
+    await act(async () => { edit('Synthetic B') })
+    await act(async () => { button('Save correction').click() })
+    await act(async () => { edit('Synthetic C') })
+    await act(async () => { root!.render(<div>Chat</div>) })
+    captureMocks.loadCaptureSnapshot.mockResolvedValue(snapshot(outcome === 'rejected' ? initial : saved))
+    if (outcome === 'after-remount') await act(async () => { renderHistory() })
+    await act(async () => {
+      if (outcome === 'rejected') reject(new Error('Synthetic save failed'))
+      else resolve(saved)
+    })
+    if (outcome !== 'after-remount') await act(async () => { renderHistory() })
+    expect(container!.querySelector('textarea')!.value).toBe('Synthetic C')
+    expect(button('Save correction').disabled).toBe(false)
+    if (outcome === 'rejected') expect(container!.textContent).toContain('Synthetic save failed')
+    await act(async () => { button('Save correction').click() })
+    expect(captureMocks.updateCaptureTranscript).toHaveBeenLastCalledWith(initial.captureId, 'Synthetic C', outcome === 'rejected' ? 4 : 5)
+  })
+
+  it('retains an edited correction when leaving and remounting history without keeping its polling mounted', async () => {
+    const memory = createCaptureDraftMemory()
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [capture()], error: null })
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    await act(async () => { root!.render(<CaptureHistory draftMemory={memory} onBack={() => undefined} />) })
+    await act(async () => { container!.querySelector<HTMLButtonElement>('.capture-history__record')!.click() })
+    const editor = container.querySelector('textarea')!
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(editor, 'Synthetic retained correction')
+      editor.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => { root!.render(<div>Chat</div>) })
+    const calls = captureMocks.loadCaptureSnapshot.mock.calls.length
+    await act(async () => { window.dispatchEvent(new Event('focus')) })
+    expect(captureMocks.loadCaptureSnapshot).toHaveBeenCalledTimes(calls)
+    await act(async () => { root!.render(<CaptureHistory draftMemory={memory} onBack={() => undefined} />) })
+    expect(container.querySelector('textarea')!.value).toBe('Synthetic retained correction')
+    expect(captureMocks.updateCaptureTranscript).not.toHaveBeenCalled()
+  })
+
   it.each(['own', 'stale', 'external', 'external-before', 'reselect', 'unmount', 'reject', 'wrong-capture', 'wrong-version'])('fences a deferred correction acknowledgement: %s', async (outcome) => {
     const initial = { ...capture(), finalText: 'Synthetic A', transcriptVersion: 4 }
     const saved = { ...initial, finalText: 'Synthetic B', previewText: 'Synthetic B', transcriptVersion: 5 }
@@ -55,6 +113,8 @@ describe('CaptureHistory', () => {
     await act(async () => { edit('Synthetic C') })
     if (outcome === 'reselect') {
       await act(async () => { container!.querySelectorAll<HTMLButtonElement>('.capture-history__record')[1]!.click() })
+      expect(container!.textContent).toContain('Your correction has not been saved')
+      await act(async () => { button('Discard correction and open capture').click() })
       await act(async () => { select() })
       await act(async () => { edit('Synthetic B') })
     }

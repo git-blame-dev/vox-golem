@@ -1,3 +1,4 @@
+import { Disclosure } from '../ui/controls'
 import type { ReactNode } from 'react'
 import { isCoreWhitespaceOnly } from '../lib/wire'
 import type { SourceLink as AnswerSource } from '../lib/answerSources'
@@ -35,6 +36,7 @@ export interface AnswerStageProps {
   readonly className?: string
   readonly compact?: boolean
   readonly thinkingStatus?: string
+  readonly footer?: ReactNode
 }
 
 const stageLabels: Record<AnswerStageName, string> = {
@@ -54,11 +56,7 @@ const statusLabels: Record<AnswerStageStatus, string> = {
   stale: 'stale',
 }
 
-function PlainText({ children }: { readonly children: string }): ReactNode {
-  return children
-}
-
-export function AnswerStage({ answer, contentKind = 'text', stages, priorVersions = [], sources = [], className, compact = false, thinkingStatus }: AnswerStageProps) {
+export function AnswerStage({ answer, contentKind = 'text', stages, priorVersions = [], sources = [], className, compact = false, thinkingStatus, footer }: AnswerStageProps) {
   const rootClassName = className === undefined ? 'answer-stage' : `answer-stage ${className}`
   const stageDetails = stages.filter(({ detail }) => typeof detail === 'string' && detail.trim() !== '')
   const hasDetails = sources.length > 0 || stageDetails.length > 0 || priorVersions.length > 0
@@ -68,7 +66,8 @@ export function AnswerStage({ answer, contentKind = 'text', stages, priorVersion
   return (
     <section className={rootClassName} aria-label={contentKind === 'refusal' ? 'Assistant refusal' : compact ? 'Assistant answer' : 'Current answer'} data-content-kind={contentKind}>
       {!compact || contentKind === 'refusal' ? <h2>{contentKind === 'refusal' ? 'Assistant refusal' : 'Current answer'}</h2> : null}
-      <p className="answer-stage__answer">{isCoreWhitespaceOnly(answer) ? pending ? <span className="message__thinking message__status-pill">{thinkingStatus ?? 'Thinking…'}</span> : 'No response was returned.' : <PlainText>{answer}</PlainText>}</p>
+      <p className="answer-stage__answer">{isCoreWhitespaceOnly(answer) ? pending ? <span className="message__thinking message__status-pill">{thinkingStatus ?? 'Thinking…'}</span> : 'No response was returned.' : answer}</p>
+      {footer}
       {!compact || visibleStages.length > 0 ? <ul className="answer-stage__statuses" aria-label="Answer stage status">
          {visibleStages.map(({ stage, status }, index) => (
           <li key={`${stage}-${status}-${index}`} data-stage={stage} data-status={status}>
@@ -80,25 +79,24 @@ export function AnswerStage({ answer, contentKind = 'text', stages, priorVersion
         ))}
       </ul> : null}
 
-      {hasDetails ? <details className="answer-stage__details">
-        <summary>Sources</summary>
+      {hasDetails ? <Disclosure className="answer-stage__details" title={sources.length > 0 ? 'Sources' : 'Answer details'}>
         {sources.length === 0 ? null : <ul className="answer-stage__sources" aria-label="Sources">
           {sources.map((source, index) => <li key={`${source.url}-${index}`}><a href={source.url} target="_blank" rel="noreferrer">{source.title}</a></li>)}
         </ul>}
          {stageDetails.length === 0 ? null : <section aria-label="Stage details">
-           {stageDetails.map(({ stage, status, detail }, index) => <p key={`${stage}-${status}-${index}`}><strong>{stageLabels[stage]} ({statusLabels[status]}):</strong> <PlainText>{detail ?? ''}</PlainText></p>)}
+           {stageDetails.map(({ stage, status, detail }, index) => <p key={`${stage}-${status}-${index}`}><strong>{stageLabels[stage]} ({statusLabels[status]}):</strong> {detail ?? ''}</p>)}
         </section>}
         {priorVersions.length === 0 ? null : <section aria-label="Prior answer versions">
           <ol>
             {priorVersions.map(({ id, text, label }) => (
               <li key={id}>
                 <h3>{label ?? `Version ${id}`}</h3>
-                <p><PlainText>{text}</PlainText></p>
+                <p>{text}</p>
               </li>
             ))}
           </ol>
         </section>}
-      </details> : null}
+      </Disclosure> : null}
     </section>
   )
 }

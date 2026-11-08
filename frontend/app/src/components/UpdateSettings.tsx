@@ -1,3 +1,4 @@
+import { Button, SwitchField } from '../ui/controls'
 import type { JSX } from 'react'
 import type { UpdateSnapshot } from '../lib/appUpdates'
 import { retryCurrentOperation } from '../lib/useAppUpdates'
@@ -13,46 +14,40 @@ export function UpdateSettings({ updates, installationDisabled = false }: Update
   const presentation = updatePresentation(updates, snapshot, installationDisabled)
 
   return (
-    <section className="settings-panel__updates" aria-labelledby="updates-title">
-      <label className="settings-panel__update-toggle">
-        <input
-          type="checkbox"
-          checked={snapshot?.autoDownloadEnabled ?? true}
-          disabled={updates.autoDownloadSaving || snapshot === null}
+    <section className="settings-panel__updates ui-setting-section" aria-labelledby="updates-title">
+      <h3 id="updates-title">Update preferences</h3>
+      {snapshot !== null && snapshot.phase !== 'unsupported' ? <>
+        <SwitchField label="Download updates automatically"
+          checked={snapshot.autoDownloadEnabled}
+          disabled={updates.autoDownloadSaving}
           onChange={(event) => void updates.setAutoDownloadEnabled(event.currentTarget.checked)}
         />
-        Download updates automatically
-      </label>
-      <label className="settings-panel__update-toggle">
-        <input
-          type="checkbox"
-          checked={snapshot?.autoInstallEnabled ?? true}
-          disabled={updates.autoInstallSaving || snapshot === null}
+        <SwitchField label="Install downloaded updates automatically"
+          checked={snapshot.autoInstallEnabled}
+          disabled={updates.autoInstallSaving}
           onChange={(event) => void updates.setAutoInstallEnabled(event.currentTarget.checked)}
         />
-        Install downloaded updates automatically
-      </label>
+      </> : null}
       {updates.autoDownloadSaving ? <p role="status">Saving automatic update preference...</p> : null}
       {updates.autoDownloadError !== null ? (
         <div className="settings-panel__update-preference-error" role="alert">
           <p>{updates.autoDownloadError}</p>
-          <button type="button" className="shell__control" disabled={updates.autoDownloadSaving} onClick={() => void updates.retryAutoDownloadSave()}>
+          <Button type="button" className="ui-button--utility" disabled={updates.autoDownloadSaving} onClick={() => void updates.retryAutoDownloadSave()}>
             Retry saving
-          </button>
+          </Button>
         </div>
       ) : null}
       {updates.autoInstallSaving ? <p role="status">Saving automatic install preference...</p> : null}
       {updates.autoInstallError !== null ? (
         <div className="settings-panel__update-preference-error" role="alert">
           <p>{updates.autoInstallError}</p>
-          <button type="button" className="shell__control" disabled={updates.autoInstallSaving} onClick={() => void updates.retryAutoInstallSave()}>
+          <Button type="button" className="ui-button--utility" disabled={updates.autoInstallSaving} onClick={() => void updates.retryAutoInstallSave()}>
             Retry saving
-          </button>
+          </Button>
         </div>
       ) : null}
       <div className="settings-panel__update-row">
         <div className="settings-panel__update-copy">
-          <strong id="updates-title">Updates</strong>
           <p className={presentation.error ? 'settings-panel__update-error' : undefined} role={presentation.error ? 'alert' : presentation.pending ? 'status' : undefined}>
             {presentation.status}
           </p>
@@ -72,7 +67,7 @@ function updatePresentation(
   installationDisabled: boolean,
 ): { readonly status: string; readonly action: JSX.Element | null; readonly error?: boolean; readonly pending?: boolean } {
   const action = (label: string, run: () => Promise<void>, disabled = false): JSX.Element => (
-    <button type="button" className="shell__control" onClick={() => void run()} disabled={disabled}>{label}</button>
+    <Button type="button" className="ui-button--utility" onClick={() => void run()} disabled={disabled}>{label}</Button>
   )
   if (updates.state.kind === 'browser') return { status: 'Available in the packaged app', action: null }
   if (updates.state.kind === 'unsupported') return { status: updates.state.reason, action: null }

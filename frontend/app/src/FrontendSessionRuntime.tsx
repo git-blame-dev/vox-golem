@@ -69,6 +69,8 @@ import type {
   UserNotice,
 } from './types/chat'
 import './App.css'
+import './ui/controls.css'
+import './components/SessionSettings.css'
 
 const NOTICE_AUTO_DISMISS_MS = 4_000
 const MAX_NOTICE_QUEUE_LENGTH = 3
@@ -189,7 +191,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const [micActive, setMicActive] = session.fieldState('micActive')
   const [, setAudioInputDevices] = session.fieldState('audioInputDevices')
   const [, setAudioInputDeviceId] = session.fieldState('audioInputDeviceId')
-  const { settingsOpen, settingsButtonRef, settingsPanelRef, settingsCloseButtonRef, openSettings, closeSettings, onSettingsKeyDown } = useSettingsNavigation()
+  const navigation = useSettingsNavigation()
+  const { settingsOpen, closeSettings } = navigation
   const [voiceNotesOpen, setVoiceNotesOpen] = session.fieldState('voiceNotesOpen')
   const [assistantSettingsPending, setAssistantSettingsPending] = session.fieldState('assistantSettingsPending')
   const [snapshotHydrationState, setSnapshotHydrationState] = session.fieldState('snapshotHydrationState')
@@ -3040,7 +3043,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     actions,
     voice: { ...voice, ...voiceIntents },
     appUpdates,
-    navigation: { settingsOpen, settingsButtonRef, settingsPanelRef, settingsCloseButtonRef, openSettings, closeSettings, onSettingsKeyDown },
+    navigation,
   }
 }
 

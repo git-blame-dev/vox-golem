@@ -115,6 +115,10 @@ describe('shared plain-text transcript', () => {
         ),
       )
       const copyResponse = container.querySelector<HTMLButtonElement>('button[aria-label="Copy response"]')!
+      const answer = copyResponse.closest('.answer-stage')!
+      expect(answer).not.toBeNull()
+      const footer = answer.querySelector('.message__footer')!
+      expect(footer.compareDocumentPosition(answer.querySelector('.answer-stage__details')!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
       await act(async () => { copyResponse.click(); await Promise.resolve() })
       expect(writeText).toHaveBeenCalledWith(
         'Grounded synthetic answer.\n\nSources:\n- Synthetic Spec (https://example.test/spec)',
@@ -125,7 +129,7 @@ describe('shared plain-text transcript', () => {
     }
   })
 
-  it('verifies MessageFooter alignment, sizing, speaker control states, and raise measurement', () => {
+  it('verifies MessageFooter alignment, accessible target sizing and speaker control states', () => {
     const container = document.createElement('div')
     const stylesheet = document.createElement('style')
     stylesheet.textContent = styles
@@ -150,20 +154,26 @@ describe('shared plain-text transcript', () => {
         )
       })
 
-      // Check footer alignment classes and copy button margin-inline-start
-      const userFooter = container.querySelector('.message__footer--user')!
-      expect(getComputedStyle(userFooter).justifyContent).toBe('flex-start')
+      // Both roles share a right-edge action with a smaller footer footprint.
+      const userFooter = container.querySelector('.message--user .message__footer')!
+      expect(getComputedStyle(userFooter).justifyContent).toBe('flex-end')
 
-      const assistantFooter = container.querySelector('.message__footer--assistant')!
+      const assistantFooter = container.querySelector('.message--assistant .message__footer')!
       const assistantCopyButton = assistantFooter.querySelector('.message__copy-button')!
-      expect(getComputedStyle(assistantCopyButton).marginInlineStart).toBe('auto')
+      const userCopyButton = userFooter.querySelector('.message__copy-button')!
+      for (const property of ['alignItems', 'paddingBottom', 'position', 'insetInlineEnd', 'bottom'] as const) {
+        expect(getComputedStyle(userCopyButton)[property]).toBe(getComputedStyle(assistantCopyButton)[property])
+      }
+      expect(getComputedStyle(assistantCopyButton).position).toBe('absolute')
+      expect(getComputedStyle(assistantCopyButton).insetInlineEnd).toBe('0')
+      expect(getComputedStyle(assistantFooter).minHeight).toBe('24px')
 
       // Check copy button and svg dimensions (+15%)
       const copyBtn = container.querySelector('.message__copy-button')!
       const copySvg = copyBtn.querySelector('svg')!
       const btnStyle = getComputedStyle(copyBtn)
-      expect(btnStyle.width).toBe('25.3px')
-      expect(btnStyle.height).toBe('25.3px')
+      expect(btnStyle.width).toBe('var(--control-target)')
+      expect(btnStyle.height).toBe('var(--control-target)')
       const svgStyle = getComputedStyle(copySvg)
       expect(svgStyle.width).toBe('20.7px')
       expect(svgStyle.height).toBe('20.7px')
@@ -181,64 +191,4 @@ describe('shared plain-text transcript', () => {
     }
   })
 
-  it('sets data-raised="true" only when the last line of message text leaves >=32px horizontal clearance on the copy button side', () => {
-    const container = document.createElement('div')
-    document.body.append(container)
-    const root = createRoot(container)
-    const paragraphRect = { left: 0, right: 200, top: 0, bottom: 20, width: 200, height: 20, x: 0, y: 0, toJSON: () => ({}) } as DOMRect
-    let lastLineRect = { left: 40, right: 160, top: 0, bottom: 20, width: 120, height: 20, x: 40, y: 0, toJSON: () => ({}) } as DOMRect
-    const boundSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
-      if (this.classList.contains('message__content')) return paragraphRect
-      return { left: 0, right: 0, top: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0, toJSON: () => ({}) } as DOMRect
-    })
-    const originalGetClientRects = Range.prototype.getClientRects
-    Range.prototype.getClientRects = () => {
-      const list = [lastLineRect] as unknown as DOMRectList
-      Object.defineProperty(list, 'item', { value: (index: number) => list[index] ?? null })
-      return list
-    }
-    try {
-      act(() => {
-        root.render(
-          <div>
-            <div className="message message--user">
-              <p className="message__content">Right-indented user line</p>
-              <MessageFooter role="user" text="Right-indented user line" canCopy={true} timingLabel={null} />
-            </div>
-            <div className="message message--assistant">
-              <p className="message__content">Short assistant line</p>
-              <MessageFooter role="assistant" text="Short assistant line" canCopy={true} timingLabel={null} />
-            </div>
-          </div>,
-        )
-      })
-      expect(container.querySelector('.message__footer--user')?.getAttribute('data-raised')).toBe('true')
-      expect(container.querySelector('.message__footer--assistant')?.getAttribute('data-raised')).toBe('true')
-
-      // Now make the last line span nearly the full width (left=10, right=190 -> only 10px clearance on each side)
-      lastLineRect = { left: 10, right: 190, top: 0, bottom: 20, width: 180, height: 20, x: 10, y: 0, toJSON: () => ({}) } as DOMRect
-      act(() => {
-        root.render(
-          <div>
-            <div className="message message--user">
-              <p className="message__content">Full width user line</p>
-              <MessageFooter role="user" text="Full width user line" canCopy={true} timingLabel={null} />
-            </div>
-            <div className="message message--assistant">
-              <p className="message__content">Full width assistant line</p>
-              <MessageFooter role="assistant" text="Full width assistant line" canCopy={true} timingLabel={null} />
-            </div>
-          </div>,
-        )
-      })
-      expect(container.querySelector('.message__footer--user')?.getAttribute('data-raised')).toBeNull()
-      expect(container.querySelector('.message__footer--assistant')?.getAttribute('data-raised')).toBeNull()
-    } finally {
-      boundSpy.mockRestore()
-      if (originalGetClientRects !== undefined) Range.prototype.getClientRects = originalGetClientRects
-      else Reflect.deleteProperty(Range.prototype, 'getClientRects')
-      act(() => root.unmount())
-      container.remove()
-    }
-  })
 })
