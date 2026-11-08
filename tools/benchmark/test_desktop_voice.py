@@ -27,6 +27,16 @@ class DispatchTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(stdout.getvalue(), 'synthetic-voice-arithmetic arithmetic one-trial\n')
 
+    def test_typed_speech_list_requires_no_runtime_and_rejects_other_platforms(self):
+        for platform, expected in (('desktop', 0), ('android', 1), ('wear', 1)):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch('sys.argv', ['benchmark', '--platform', platform, '--workload', 'typed-speech', '--list']), \
+                    redirect_stdout(stdout), redirect_stderr(stderr), \
+                    patch.object(voice, 'launch', side_effect=AssertionError('no transport')):
+                self.assertEqual(benchmark.main(), expected)
+            if platform == 'desktop':
+                self.assertEqual(stdout.getvalue(), 'typed-speech-windows arithmetic one-trial diagnostic\n')
+
 
 def report(platform='linux'):
     windows = platform == 'windows'
@@ -88,6 +98,40 @@ class DesktopVoiceTest(unittest.TestCase):
                 redirect_stdout(stdout):
             result = voice.main(args, self.common)
         return result, json.loads(stdout.getvalue()), launches
+
+    def typed_args(self, extra=()):
+        argv = self.argv.copy()
+        for flag in ('--tts-model', '--wake-phrase'):
+            index = argv.index(flag)
+            del argv[index:index+2]
+        argv[argv.index('--workload')+1] = 'typed-speech'
+        return benchmark.parser().parse_args(argv + ['--desktop-platform', 'windows',
+            '--windows-manifest', str(self.root/'manifest.json')] + list(extra))
+
+    def test_typed_speech_dispatch_and_diagnostic_interpretation(self):
+        value = report('windows')
+        value.update(entry='typed-speech-windows', live_calls=0,
+                     external_shared_service_lifecycle='unverified')
+        value['profile_identity']['profile'] = 'typed-speech-windows-diagnostic-v1'
+        result, summary, launches = self.execute(self.typed_args(), 'windows', value)
+        self.assertEqual(result, 2)
+        self.assertFalse(summary['qualified_for_live'])
+        argv = launches[0][0]
+        self.assertEqual(argv[argv.index('--entry')+1], 'typed-speech')
+        self.assertNotIn('--wake-phrase', argv)
+        self.assertNotIn('--tts-model', argv)
+        for update in ({'live_calls':1}, {'live_calls':True}, {'qualified_for_live':True},
+                       {'external_shared_service_lifecycle':'retired'}, {'entry':'voice-arithmetic-windows'}):
+            with self.assertRaises(benchmark.Blocked):
+                voice.interpret(dict(value, **update), 1, 'windows', workload='typed-speech')
+
+    def test_typed_speech_authorization_forbids_live_voice_assets_and_other_platforms(self):
+        for extra in (['--live'], ['--tts-model', '/synthetic/model'], ['--wake-phrase', 'synthetic'],
+                      ['--max-live-calls', '1'], ['--cases', 'arithmetic']):
+            with patch.object(voice, 'native_platform', return_value='windows'), self.assertRaises(benchmark.Blocked):
+                voice.authorize(self.typed_args(extra))
+        with patch.object(voice, 'native_platform', return_value='linux'), self.assertRaises(benchmark.Blocked):
+            voice.authorize(self.typed_args(['--desktop-platform', 'linux']))
 
     def test_linux_delegates_one_existing_offline_profile_without_live_gate(self):
         result, summary, launches = self.execute(self.args())

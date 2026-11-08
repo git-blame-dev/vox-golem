@@ -47,7 +47,6 @@ fn resolve_live_auth_source(
     }
     Ok(Some(auth))
 }
-#[cfg(not(test))]
 use voxgolem_platform::search::RunEvent;
 
 #[derive(Clone, Serialize)]
@@ -62,6 +61,7 @@ pub(crate) struct Observation {
 struct Trace {
     flow: u64,
     round: u64,
+    first_word: FirstWord,
     events: Vec<Observation>,
     once: HashSet<&'static str>,
     dropped: u64,
@@ -74,6 +74,40 @@ struct Trace {
     burst_emissions: u64,
     commands: BTreeMap<&'static str, CommandStats>,
     native_baseline: NativeAudioCounts,
+}
+
+/// Complete means a nonblank run followed by whitespace, or a completed stream.
+/// No generated text is retained, and work stops after the first boundary.
+#[derive(Default)]
+struct FirstWord {
+    started: bool,
+    complete: bool,
+}
+impl FirstWord {
+    fn text(&mut self, text: &str) -> bool {
+        if self.complete {
+            return false;
+        }
+        for character in text.chars() {
+            if character.is_whitespace() {
+                if self.started {
+                    self.complete = true;
+                    return true;
+                }
+            } else {
+                self.started = true;
+            }
+        }
+        false
+    }
+    fn finish(&mut self) -> bool {
+        if self.started && !self.complete {
+            self.complete = true;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default, Serialize)]
@@ -239,6 +273,7 @@ fn parse_entry(entry: Option<&str>, automatic: bool) -> Result<&'static str, Str
         ("voice", _) => Ok("voice"),
         ("voice-arithmetic", false) => Ok("voice-arithmetic"),
         ("voice-arithmetic-windows", false) => Ok("voice-arithmetic-windows"),
+        ("typed-speech-windows", false) => Ok("typed-speech-windows"),
         ("typed", false) => Ok("typed"),
         ("typed", true) => Err("Typed entry cannot queue automatic capture diagnostics".into()),
         _ => Err("Benchmark entry must be voice or typed".into()),
@@ -282,6 +317,43 @@ pub(crate) fn benchmark_begin_flow(app_state: tauri::State<'_, AppState>) -> Res
 }
 
 pub(crate) fn validate_environment() -> Result<(), String> {
+    let result = validate_environment_inner();
+    // GUI-subsystem Windows processes have no inherited stderr under WebDriver.
+    // Keep a bounded categorical receipt when they exit before WebView exists.
+    if cfg!(target_os = "windows") {
+        if let Ok(root) = root() {
+            let _ = write_startup_validation(&root, result.as_ref().err().map(String::as_str));
+        }
+    }
+    result
+}
+
+fn write_startup_validation(root: &Path, error: Option<&str>) -> std::io::Result<()> {
+    let category = match error {
+        None => "ready",
+        Some("Typed speech configuration unavailable") => "configuration_unavailable",
+        Some(
+            "Typed speech requires an existing Neural service without capture or launch effects",
+        ) => "speech_effects_rejected",
+        Some("Windows storage escapes private run") => "storage_escaped",
+        Some("Windows private storage missing" | "Windows private storage unavailable") => {
+            "storage_unavailable"
+        }
+        Some("Benchmark config unavailable") => "config_path_unavailable",
+        Some("Benchmark config is not isolated") => "config_not_isolated",
+        Some("Benchmark storage escapes the private run") => "storage_not_isolated",
+        Some("Benchmark provider mode or allowance invalid") => "provider_guard_rejected",
+        Some(_) => "other_validation_failure",
+    };
+    let bytes = serde_json::to_vec(&serde_json::json!({"schema": 1, "environment": category}))?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(root.join("startup-validation.json"))?
+        .write_all(&bytes)
+}
+
+fn validate_environment_inner() -> Result<(), String> {
     ORIGIN.get_or_init(Instant::now);
     let entry = match std::env::var("VOXGOLEM_BENCH_ENTRY") {
         Ok(value) => Some(value),
@@ -293,11 +365,15 @@ pub(crate) fn validate_environment() -> Result<(), String> {
         std::env::var_os("VOXGOLEM_BENCH_AUTO_DIAGNOSTIC_CASE").is_some(),
     )?;
     let _ = ENTRY.set(entry);
-    if cfg!(target_os = "windows") && entry != "voice-arithmetic-windows" {
+    if cfg!(target_os = "windows")
+        && !matches!(entry, "voice-arithmetic-windows" | "typed-speech-windows")
+    {
         return Err("Windows benchmark supports only the offline arithmetic diagnostic".into());
     }
-    if matches!(entry, "voice-arithmetic" | "voice-arithmetic-windows")
-        && std::env::var("VOXGOLEM_BENCH_MODE").as_deref() != Ok("offline")
+    if matches!(
+        entry,
+        "voice-arithmetic" | "voice-arithmetic-windows" | "typed-speech-windows"
+    ) && std::env::var("VOXGOLEM_BENCH_MODE").as_deref() != Ok("offline")
     {
         return Err("Arithmetic benchmark has no live allowance".into());
     }
@@ -311,8 +387,22 @@ pub(crate) fn validate_environment() -> Result<(), String> {
     if entry == "voice-arithmetic" {
         validate_null_output(&root)?;
     }
-    if entry == "voice-arithmetic-windows" {
+    if matches!(entry, "voice-arithmetic-windows" | "typed-speech-windows") {
         validate_windows_storage(&root)?;
+    }
+    if entry == "typed-speech-windows" {
+        let config = voxgolem_core::config::load_runtime_config(None)
+            .map_err(|_| "Typed speech configuration unavailable")?;
+        if config.local_tts.provider != voxgolem_core::config::TtsProvider::Neural
+            || !config.local_tts.enabled
+            || !config.local_tts.start_command.is_empty()
+            || config.local_tts.voice.is_empty()
+            || config.wake_word_model_path.exists()
+            || config.parakeet_model_dir.exists()
+            || config.silero_vad_model.exists()
+        {
+            return Err("Typed speech requires an existing Neural service without capture or launch effects".into());
+        }
     }
     let source = std::env::var_os("VOXGOLEM_BENCH_AUTH_SOURCE_CONFIG").map(PathBuf::from);
     let auth = resolve_live_auth_source(
@@ -517,7 +607,6 @@ pub(crate) fn emitted_frame(at: Instant, call_duration: Duration) {
     }
 }
 
-#[cfg(not(test))]
 pub(crate) fn model_event(event: &RunEvent<'_>) {
     use voxgolem_platform::custom_openai::tools::ModelEvent;
     match event {
@@ -525,11 +614,21 @@ pub(crate) fn model_event(event: &RunEvent<'_>) {
             if let Ok(mut trace) = TRACE.lock() {
                 trace.round += 1;
                 trace.once.remove("first_model_text");
+                trace.once.remove("first_model_word");
+                trace.first_word = FirstWord::default();
             }
             mark("generation_dispatched");
         }
-        RunEvent::Model(ModelEvent::TextDelta { text, .. }) if !text.trim().is_empty() => {
-            mark_once("first_model_text")
+        RunEvent::Model(ModelEvent::TextDelta { text, .. }) => {
+            if !text.trim().is_empty() {
+                mark_once("first_model_text");
+            }
+            let complete = TRACE
+                .lock()
+                .is_ok_and(|mut trace| trace.first_word.text(text));
+            if complete {
+                mark_once("first_model_word");
+            }
         }
         RunEvent::Model(ModelEvent::AuthRevision(_)) => mark("credential_checked"),
         RunEvent::ToolStarted { name, .. } => mark(if *name == "web_fetch" {
@@ -559,6 +658,16 @@ pub(crate) fn model_event(event: &RunEvent<'_>) {
             mark("tool_failed");
         }
         _ => {}
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) fn finish_model_word() {
+    let complete = TRACE
+        .lock()
+        .is_ok_and(|mut trace| trace.first_word.finish());
+    if complete {
+        mark_once("first_model_word");
     }
 }
 
@@ -771,6 +880,18 @@ fn snapshot(app_state: &AppState) -> Result<serde_json::Value, String> {
         "native_audio": native_audio,
         "handler_call_metadata": commands,
         "reply_speech": speech_metadata(&events, speech_retired(app_state)),
+        "speech_identity": app_state.local_tts_runtime.lock().ok().and_then(|runtime| {
+            runtime.as_ref().map(|runtime| {
+                if let Some(client) = runtime.neural_client() {
+                    let capabilities = client.capabilities();
+                    serde_json::json!({"engine":"neural", "backend":capabilities.backend,
+                        "voice":runtime.selected_neural_voice(), "sample_rate_hz":runtime.sample_rate_hz(),
+                        "incremental_audio":capabilities.incremental_audio, "protocol_version":capabilities.protocol_version})
+                } else {
+                    serde_json::json!({"engine":"piper", "sample_rate_hz":runtime.sample_rate_hz()})
+                }
+            })
+        }),
         "tts_actual_provider": app_state.local_tts_runtime.lock().ok()
             .and_then(|runtime| runtime.as_ref().and_then(|runtime| runtime.actual_provider()))
             .map(|provider| match provider {
@@ -819,6 +940,20 @@ fn speech_metadata(events: &[Observation], retired: bool) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_validation_receipt_is_categorical_and_never_overwrites() {
+        let directory = tempfile::tempdir().unwrap();
+        super::write_startup_validation(directory.path(), Some("synthetic private provider body"))
+            .unwrap();
+        let path = directory.path().join("startup-validation.json");
+        let first = std::fs::read(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(value["environment"], "other_validation_failure");
+        assert!(!String::from_utf8_lossy(&first).contains("synthetic"));
+        assert!(super::write_startup_validation(directory.path(), None).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), first);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn generated_arithmetic_environment_loads_real_model_readiness() {
@@ -1042,6 +1177,12 @@ shutil.copytree(run/'config',root/'VoxGolem')
                 Some("voice-arithmetic-windows"),
             ),
             (Some("voice-arithmetic-windows"), true, None),
+            (
+                Some("typed-speech-windows"),
+                false,
+                Some("typed-speech-windows"),
+            ),
+            (Some("typed-speech-windows"), true, None),
             (Some("typed"), false, Some("typed")),
             (Some("typed"), true, None),
             (Some(""), false, None),
@@ -1049,6 +1190,74 @@ shutil.copytree(run/'config',root/'VoxGolem')
         ] {
             assert_eq!(parse_entry(entry, automatic).ok(), expected);
         }
+    }
+
+    #[test]
+    fn whitespace_only_model_events_complete_the_first_word_at_its_boundary() {
+        use voxgolem_platform::custom_openai::{tools::ModelEvent, CustomOpenAiContentType};
+        use voxgolem_platform::search::RunEvent;
+        *super::TRACE.lock().unwrap() = super::Trace::default();
+        let feed = |text| {
+            super::model_event(&RunEvent::Model(ModelEvent::TextDelta {
+                text,
+                content_type: CustomOpenAiContentType::OutputText,
+            }))
+        };
+        feed("Hello");
+        assert!(!super::TRACE
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| event.stage == "first_model_word"));
+        feed(" ");
+        {
+            let trace = super::TRACE.lock().unwrap();
+            assert_eq!(
+                trace
+                    .events
+                    .iter()
+                    .filter(|event| event.stage == "first_model_text")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                trace
+                    .events
+                    .iter()
+                    .filter(|event| event.stage == "first_model_word")
+                    .count(),
+                1
+            );
+        }
+        feed("world");
+        assert_eq!(
+            super::TRACE
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| event.stage == "first_model_word")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn first_word_is_bounded_across_unicode_chunks_and_single_word_completion() {
+        let mut trace = super::Trace::default();
+        let boundary = &mut trace.first_word;
+        assert!(!boundary.text(" \n"));
+        assert!(!boundary.text("Syn"));
+        assert!(!boundary.text("thetic"));
+        assert!(boundary.text("\u{2003}rest"));
+        assert!(!boundary.text("more "));
+        assert!(!boundary.finish());
+        let mut single = super::FirstWord::default();
+        assert!(!single.text("210"));
+        assert!(single.finish());
+        assert!(!single.finish());
+        assert!(!super::FirstWord::default().finish());
     }
 
     #[test]

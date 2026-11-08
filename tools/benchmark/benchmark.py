@@ -386,7 +386,7 @@ class BenchmarkParser(argparse.ArgumentParser):
 def parser():
     p = BenchmarkParser(description=__doc__)
     p.add_argument('--platform', required=True, choices=['android', 'desktop', 'wear'])
-    p.add_argument('--workload', choices=['typed', 'synthetic-voice'], default='typed')
+    p.add_argument('--workload', choices=['typed', 'synthetic-voice', 'typed-speech'], default='typed')
     p.add_argument('--list', action='store_true', help='List synthetic scenarios without transport access')
     p.add_argument('--cases', nargs='+', choices=SCENARIO_IDS, help='Android/Wear subset, executed in canonical suite order')
     p.add_argument('--live', action='store_true')
@@ -1265,12 +1265,18 @@ async def run_android(args, report):
 
 def main():
     args = parser().parse_args()
-    if not (args.platform == 'desktop' and args.workload == 'synthetic-voice'):
+    if not (args.platform == 'desktop' and args.workload in ('synthetic-voice', 'typed-speech')):
         try:
             reject_desktop_voice_options(args)
         except Blocked as error:
             print(str(error), file=sys.stderr)
             return 1
+    if args.workload == 'typed-speech':
+        if args.platform != 'desktop':
+            print('typed_speech_requires_desktop_windows', file=sys.stderr)
+            return 1
+        import desktop_voice
+        return desktop_voice.main(args, sys.modules[__name__])
     if args.workload == 'synthetic-voice':
         if args.platform == 'desktop':
             import desktop_voice

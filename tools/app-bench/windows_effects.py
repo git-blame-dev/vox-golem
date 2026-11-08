@@ -7,6 +7,7 @@ No breakaway flags, inherited handles, global process-name termination or instal
 """
 import ctypes as C
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -18,6 +19,8 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.request
+from urllib.parse import urlsplit
 
 # Fixed-width Windows ABI types also make layout tests meaningful on Linux.
 DWORD = C.c_uint32
@@ -71,8 +74,15 @@ class FileTime(C.Structure):
 
 def validate_options(args, host=None):
     is_win32 = (sys.platform if host is None else host) == 'win32' or getattr(args, '_test_win32', False)
-    if not is_win32 or getattr(args, 'live', False) or getattr(args, 'entry', 'voice-arithmetic') != 'voice-arithmetic':
+    if not is_win32 or getattr(args, 'live', False) or getattr(args, 'entry', 'voice-arithmetic') not in ('voice-arithmetic', 'typed-speech'):
         raise ValueError('Windows supports only native offline arithmetic diagnostics')
+    if getattr(args, 'entry', None) == 'typed-speech' and (
+            getattr(args, 'cases', ['arithmetic']) != ['arithmetic'] or
+            getattr(args, 'tts_model', None) is not None or getattr(args, 'wake_phrase', None) is not None or
+            any(getattr(args, key, False) for key in ('extended', 'shared_suite', 'wake_diagnostics',
+                'event_loop_diagnostic', 'driver_free_diagnostic', 'hold_native_observer', 'readiness_diagnostic')) or
+            getattr(args, 'poll_interval', 0.1) != 0.1):
+        raise ValueError('Typed speech requires one offline arithmetic case without voice assets or probes')
     if getattr(args, 'windows_manifest', None) is None:
         raise ValueError('Windows requires a verified staged fixture/asset manifest')
 
@@ -140,9 +150,14 @@ def validate_pe(path):
             raise ValueError('Windows x64 PE32+ executable required')
 
 
-def application_capability(binary):
+def application_capability(binary, user_data_folder=None):
     # Same Selenium/Tauri protocol as Linux, not a second WebDriver client.
-    return {'application': str(binary.resolve())}
+    value = {'application': str(binary.resolve())}
+    if user_data_folder is not None:
+        # EdgeDriver otherwise replaces WEBVIEW2_USER_DATA_FOLDER with its own
+        # temporary profile, which the native exact-folder guard rejects.
+        value['webviewOptions'] = {'userDataFolder': str(user_data_folder.resolve())}
+    return value
 
 
 def powershell(script, extra=None):
@@ -408,12 +423,24 @@ class WindowsJob:
                 'breakaway_processes': 'unverified'}
 
 
-def load_manifest(path, profile):
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('Duplicate descriptor or manifest key')
+        result[key] = value
+    return result
+
+
+def load_manifest(path, profile, entry='voice-arithmetic'):
+    typed_speech = entry == 'typed-speech'
     reject_reparse(path)
     if not path.is_file() or path.stat().st_size > 256*1024:
         raise ValueError('Bounded Windows staging manifest required')
-    value = json.loads(path.read_text(encoding='utf-8'))
-    if (value.get('schema') != 1 or value.get('contract_sha256') != profile.contract_sha256 or
+    value = json.loads(path.read_text(encoding='utf-8'),
+                       object_pairs_hook=unique_object if typed_speech else dict)
+    if (not isinstance(value, dict) or type(value.get('schema')) is not int or value.get('schema') != (2 if typed_speech else 1) or
+            (typed_speech and value.get('entry') != 'typed-speech-windows') or value.get('contract_sha256') != profile.contract_sha256 or
             value.get('application_id') != 'dev.gitblame.voxgolem.benchmark' or
             not re.fullmatch('[0-9a-f]{64}', value.get('native_source_sha256', '')) or
             not isinstance(value.get('files'), dict) or not 1 <= len(value['files']) <= 4096):
@@ -436,6 +463,8 @@ def load_manifest(path, profile):
     required = {'binary', 'tauri_driver', 'native_driver', 'config', 'fixture',
                 'wake_word_model_path', 'silero_vad_model', 'parakeet_model_dir',
                 'tts_model', 'espeak_data_dir'}
+    if typed_speech:
+        required = {'binary', 'tauri_driver', 'native_driver', 'config'}
     if set(roles) != required:
         raise ValueError('Windows manifest roles incomplete')
     resolved = {}
@@ -463,6 +492,9 @@ def load_manifest(path, profile):
         if resolved[key].suffix.lower() != '.exe':
             raise ValueError('Windows driver and app roles require explicit .exe paths')
         validate_pe(resolved[key])
+    if typed_speech:
+        neural_configuration(resolved['config'])
+        return value, resolved
     tts_json = Path(str(resolved['tts_model'])+'.json')
     if tts_json.relative_to(root).as_posix() not in files:
         raise ValueError('Piper configuration is not hash-verified')
@@ -502,6 +534,81 @@ def load_manifest(path, profile):
             any(not (-1 <= sample <= 1) for (sample,) in struct.iter_unpack('<f', data))):
         raise ValueError('Staged PCM contract invalid')
     return value, resolved
+
+
+def valid_neural_id(value):
+    return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,256}', value) is not None
+
+
+def neural_configuration(path):
+    """Synthetic source only: no credentials, launch commands or speech assets."""
+    if path.stat().st_size > 64*1024:
+        raise ValueError('Neural configuration exceeds bounds')
+    config = tomllib.loads(path.read_text(encoding='utf-8'))
+    tts = config.get('tts')
+    if (set(config) != {'tts'} or not isinstance(tts, dict) or
+            set(tts) != {'provider', 'endpoint', 'voice', 'start_command'} or
+            tts['provider'] != 'neural' or tts['start_command'] != [] or
+            not valid_neural_id(tts['voice']) or not isinstance(tts['endpoint'], str) or
+            len(tts['endpoint']) > 2048 or any(ord(c) <= 32 or ord(c) >= 127 for c in tts['endpoint'])):
+        raise ValueError('Synthetic explicit Neural-only configuration required')
+    try:
+        url = urlsplit(tts['endpoint'])
+        if (url.scheme != 'http' or not ipaddress.ip_address(url.hostname).is_loopback or
+                url.username is not None or url.password is not None or url.query or url.fragment or
+                url.path not in ('', '/') or url.port is None or not 1 <= url.port <= 65535 or
+                '?' in tts['endpoint'] or '#' in tts['endpoint']):
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise ValueError('Literal loopback HTTP Neural endpoint with explicit port required') from None
+    return tts
+
+
+def neural_descriptor(value, requested_voice):
+    """Validate the bounded existing-service descriptor; retain public identity only."""
+    if (not isinstance(value, dict) or type(value.get('protocol_version')) is not int or
+            value['protocol_version'] != 1 or value.get('ready') is not True or
+            not valid_neural_id(value.get('backend')) or not valid_neural_id(value.get('default_voice')) or
+            type(value.get('sample_rate_hz')) is not int or not 1 <= value['sample_rate_hz'] <= 96000 or
+            type(value.get('channels')) is not int or value['channels'] != 1 or
+            type(value.get('incremental_audio')) is not bool or
+            not isinstance(value.get('voices'), list) or not 1 <= len(value['voices']) <= 32):
+        raise ValueError('Neural descriptor invalid or not ready')
+    identities, selected = set(), None
+    for voice in value['voices']:
+        if (not isinstance(voice, dict) or not valid_neural_id(voice.get('id')) or
+                not isinstance(voice.get('name'), str) or not 1 <= len(voice['name'].encode()) <= 256 or
+                any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in voice['name']) or
+                not isinstance(voice.get('aliases', []), list) or len(voice.get('aliases', [])) > 32 or
+                type(voice.get('default', False)) is not bool):
+            raise ValueError('Neural voice descriptor invalid')
+        names = [voice['id'], *voice.get('aliases', [])]
+        for name in names:
+            if not valid_neural_id(name) or name in identities:
+                raise ValueError('Neural voice identity invalid or duplicated')
+            identities.add(name)
+        if requested_voice in names:
+            selected = voice['id']
+    if value['default_voice'] not in identities or selected is None:
+        raise ValueError('Neural selected/default voice unavailable')
+    return dict(engine='neural', protocol_version=1, backend=value['backend'], voice=selected,
+                sample_rate_hz=value['sample_rate_hz'], incremental_audio=value['incremental_audio'])
+
+
+def probe_neural_service(config):
+    # GET only: no proxy, redirects, retries, sessions or lifecycle control.
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    url = config['endpoint'].rstrip('/')+'/v1/synthesis/capabilities'
+    with opener.open(url, timeout=5) as response:
+        if response.status != 200:
+            raise ValueError('Existing Neural service is unavailable')
+        raw = response.read(64*1024+1)
+    if len(raw) > 64*1024:
+        raise ValueError('Neural descriptor exceeds bounds')
+    return neural_descriptor(json.loads(raw, object_pairs_hook=unique_object), config['voice'])
 
 
 def refuse_preexisting(paths):
@@ -571,13 +678,14 @@ class WindowsEffects:
         }
 
     def prepare(self, profile, api):
-        self.profile_identity = dict(profile='voice-arithmetic-windows-diagnostic-v1',
+        self.profile_identity = dict(profile='typed-speech-windows-diagnostic-v1' if getattr(self.args, 'entry', None) == 'typed-speech' else 'voice-arithmetic-windows-diagnostic-v1',
                                      contract_sha256=profile.contract_sha256,
                                      implementation_sha256=profile.implementation_sha256)
         args = self.args
-        value, roles = load_manifest(args.windows_manifest, profile)
+        typed_speech = getattr(args, 'entry', None) == 'typed-speech'
+        value, roles = load_manifest(args.windows_manifest, profile, 'typed-speech' if typed_speech else 'voice-arithmetic')
         if (args.binary.resolve() != roles['binary'] or args.config.resolve() != roles['config'] or
-                args.tts_model.resolve() != roles['tts_model'] or
+                (not typed_speech and args.tts_model.resolve() != roles['tts_model']) or
                 args.tools.resolve() != roles['tauri_driver'].parent):
             raise ValueError('CLI paths do not match verified staging roles')
         api.validate_benchmark_binary(roles['binary'])
@@ -593,6 +701,14 @@ class WindowsEffects:
         for folder in ('home', 'config', 'data', 'state', 'cache', 'runtime', 'temp',
                        'appdata', 'localappdata', 'webview', 'fixtures'):
             private_directory(run/folder)
+        if typed_speech:
+            self.stage = 'windows_neural_descriptor'
+            speech = probe_neural_service(neural_configuration(roles['config']))
+            identity = dict(profile='typed-speech-windows-diagnostic-v1',
+                contract_sha256=profile.contract_sha256, implementation_sha256=profile.implementation_sha256,
+                speech_identity=speech, external_shared_service_lifecycle='unverified')
+            self.profile_identity = identity
+            return {}, speech, identity
         shutil.copyfile(roles['fixture'], run/'fixtures/arithmetic.pcm')
         if file_hash(run/'fixtures/arithmetic.pcm') != value['fixture_metadata']['arithmetic']['sha256']:
             raise ValueError('Copied PCM does not match the staged identity')
@@ -619,7 +735,8 @@ class WindowsEffects:
             'PROCESSOR_ARCHITECTURE', 'PROCESSOR_IDENTIFIER', 'PROCESSOR_LEVEL', 'PROCESSOR_REVISION'}
         source = {key: value for key, value in os.environ.items() if key.upper() in system_keys}
         env = api.isolated_environment(run, roles['config'], endpoint,
-            entry='voice-arithmetic', tts_model=roles['tts_model'], output_route='windows-diagnostic',
+            entry='typed-speech' if getattr(args, 'entry', None) == 'typed-speech' else 'voice-arithmetic',
+            tts_model=roles.get('tts_model'), output_route='windows-diagnostic',
             base_environment=source)
         env.update(APPDATA=str(run/'appdata'), LOCALAPPDATA=str(run/'localappdata'),
             USERPROFILE=str(run/'home'), TEMP=str(run/'temp'), TMP=str(run/'temp'),
@@ -627,6 +744,9 @@ class WindowsEffects:
             PIPER_ESPEAKNG_DATA_DIRECTORY=str(run/'appdata/VoxGolem/models/tts'),
             VOXGOLEM_BENCH_ENTRY='voice-arithmetic-windows',
             VOXGOLEM_BENCH_OUTPUT_ROUTE='wasapi-render-diagnostic')
+        if getattr(args, 'entry', None) == 'typed-speech':
+            env['VOXGOLEM_BENCH_ENTRY'] = 'typed-speech-windows'
+            env.pop('PIPER_ESPEAKNG_DATA_DIRECTORY', None)
         home = run/'home'
         env.update(HOMEDRIVE=home.drive, HOMEPATH=str(home)[len(home.drive):])
         # No inherited WebView command-line overrides/debug listeners or host proxies.
@@ -665,7 +785,7 @@ class WindowsEffects:
         self.app_observed = True
 
     def application_options(self):
-        return application_capability(self.roles['binary'])
+        return application_capability(self.roles['binary'], self.args.output/'webview')
 
     def shutdown(self, driver, process):
         if self.owner is None:
@@ -678,7 +798,9 @@ class WindowsEffects:
         args = getattr(self, 'args', None)
         manifest = getattr(self, 'manifest', None)
         return {
-            'schema': 4, 'entry': 'voice-arithmetic-windows', 'diagnostic_only': True,
+            **({'external_shared_service_lifecycle': 'unverified', 'live_calls': 0}
+               if getattr(args, 'entry', None) == 'typed-speech' else {}),
+            'schema': 4, 'entry': 'typed-speech-windows' if getattr(args, 'entry', None) == 'typed-speech' else 'voice-arithmetic-windows', 'diagnostic_only': True,
             'overall_status': 'unverified', 'passed': False, 'qualified_for_live': False,
             'offline_profile_qualified': False, 'output_route': 'wasapi-render-diagnostic',
             'os_network_containment': 'unverified', 'acoustic_output': 'unverified',

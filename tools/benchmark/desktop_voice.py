@@ -37,9 +37,13 @@ def authorize(args):
     if (args.platform != 'desktop' or args.live or args.max_live_calls != 0 or
             args.repetitions != 1 or args.model != 'custom-luna-none'):
         raise Blocked('desktop_voice_offline_zero_live_budget_required')
-    if any(getattr(args, name, None) is None for name in ('binary', 'tools', 'config', 'tts_model', 'wake_phrase')):
+    typed_speech = getattr(args, 'workload', None) == 'typed-speech'
+    if typed_speech and (getattr(args, 'tts_model', None) is not None or getattr(args, 'wake_phrase', None) is not None):
+        raise Blocked('typed_speech_forbids_voice_assets')
+    required = ('binary', 'tools', 'config') if typed_speech else ('binary', 'tools', 'config', 'tts_model', 'wake_phrase')
+    if any(getattr(args, name, None) is None for name in required):
         raise Blocked('desktop_voice_explicit_assets_required')
-    if (not isinstance(args.wake_phrase, str) or not 1 <= len(args.wake_phrase.encode()) <= 128 or
+    if not typed_speech and (not isinstance(args.wake_phrase, str) or not 1 <= len(args.wake_phrase.encode()) <= 128 or
             any(ord(c) < 32 for c in args.wake_phrase)):
         raise Blocked('desktop_voice_wake_phrase_invalid')
     if (any(getattr(args, name, None) is not None for name in
@@ -51,6 +55,8 @@ def authorize(args):
             {'--history-seed-turns', '--port', '--turn-timeout', '--build-variant'}):
         raise Blocked('desktop_voice_foreign_controls_unsupported')
     platform = getattr(args, 'desktop_platform', None) or native_platform()
+    if typed_speech and platform != 'windows':
+        raise Blocked('typed_speech_requires_native_windows')
     if platform != native_platform():
         raise Blocked('desktop_voice_native_host_mismatch')
     if platform == 'windows' and getattr(args, 'windows_manifest', None) is None:
@@ -80,7 +86,9 @@ def command(args, common, platform, output):
         raise Blocked('desktop_voice_existing_python_required')
     argv = [interpreter, str(common.ROOT / 'tools/app-bench/runner.py'), '--binary', str(args.binary),
         '--tools', str(args.tools), '--output', str(output), '--config', str(args.config),
-        '--entry', 'voice-arithmetic', '--tts-model', str(args.tts_model), '--wake-phrase', args.wake_phrase]
+        '--entry', 'typed-speech' if getattr(args, 'workload', None) == 'typed-speech' else 'voice-arithmetic']
+    if getattr(args, 'workload', None) != 'typed-speech':
+        argv += ['--tts-model', str(args.tts_model), '--wake-phrase', args.wake_phrase]
     if platform == 'windows':
         argv += ['--desktop-platform', 'windows', '--windows-manifest', str(args.windows_manifest)]
     return argv
@@ -175,20 +183,26 @@ def failure_receipts(value):
     return receipts
 
 
-def interpret(value, code, platform, *, evidence=None):
+def interpret(value, code, platform, *, evidence=None, workload='synthetic-voice'):
     if type(code) is not int:
         raise Blocked('desktop_voice_child_exit_invalid')
     windows = platform == 'windows'
+    typed_speech = workload == 'typed-speech'
+    if typed_speech and not windows:
+        raise Blocked('typed_speech_requires_native_windows')
     expected = {'schema':4 if windows else 3, 'mode':'offline',
-        'entry':'voice-arithmetic-windows' if windows else 'voice-arithmetic',
+        'entry':('typed-speech-windows' if typed_speech else 'voice-arithmetic-windows') if windows else 'voice-arithmetic',
         'requested_model':'custom-luna-none', 'qualified_for_live':False,
         'diagnostic_only':windows, 'output_route':'wasapi-render-diagnostic' if windows else 'alsa-null-software'}
     if any(type(value.get(k)) is not type(v) or value.get(k) != v for k, v in expected.items()):
         raise Blocked('desktop_voice_child_profile_mismatch')
     identity = value.get('profile_identity')
     if (type(identity) is not dict or identity.get('contract_sha256') != voice_contract.contract_sha256() or
-            identity.get('profile') != ('voice-arithmetic-windows-diagnostic-v1' if windows else 'voice-arithmetic-v1')):
+            identity.get('profile') != (('typed-speech-windows-diagnostic-v1' if typed_speech else 'voice-arithmetic-windows-diagnostic-v1') if windows else 'voice-arithmetic-v1')):
         raise Blocked('desktop_voice_child_contract_mismatch')
+    if typed_speech and (type(value.get('live_calls')) is not int or value['live_calls'] != 0 or
+            value.get('external_shared_service_lifecycle') != 'unverified'):
+        raise Blocked('typed_speech_child_lifecycle_or_live_mismatch')
     cleanup = value.get('cleanup')
     if type(cleanup) is not dict:
         raise Blocked('desktop_voice_child_cleanup_missing')
@@ -263,7 +277,7 @@ def interpret(value, code, platform, *, evidence=None):
 def main(args, common):
     if args.list:
         voice_contract.load_contract()
-        print('synthetic-voice-arithmetic arithmetic one-trial')
+        print('typed-speech-windows arithmetic one-trial diagnostic' if getattr(args, 'workload', None) == 'typed-speech' else 'synthetic-voice-arithmetic arithmetic one-trial')
         return 0
     summary = {'status':'fail', 'workflow_completed':False, 'qualified_for_live':False,
         'live_admission_budget':0, 'fake_model_admission_budget':1, 'cleanup':'unverified',
@@ -278,7 +292,7 @@ def main(args, common):
         child_code = launch(argv, common.ROOT)
         summary['child_exit_code'] = child_code
         summary['report_path'] = str(output / 'report.json')
-        summary.update(interpret(child_report(output), child_code, platform, evidence=summary))
+        summary.update(interpret(child_report(output), child_code, platform, evidence=summary, workload=args.workload))
         summary['status'] = 'unverified'
         code = 2
     except Blocked as error:

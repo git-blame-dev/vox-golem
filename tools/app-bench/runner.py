@@ -85,6 +85,12 @@ def arithmetic_speech_passed(speech):
             type(speech.get('failed')) is int and speech['failed'] == 0)
 
 
+def speech_identity_matches(actual, expected):
+    return (isinstance(actual, dict) and actual.keys() == expected.keys() and
+            all(type(actual[key]) is type(value) and actual[key] == value
+                for key, value in expected.items()))
+
+
 def voice_model_readiness(driver, timeout=10):
     """Observe canonical availability and normal UI selection before any fixture.
 
@@ -344,6 +350,8 @@ def live_auth_source_config(run, source_config):
 
 def isolated_environment(run, source_config, endpoint, live=False, reservation=None, entry='voice', tts_model=None,
                          output_route='alsa-null-software', base_environment=None):
+    if entry == 'typed-speech' and (live or reservation is not None):
+        raise ValueError('Typed speech is offline with no live reservation')
     if entry == 'voice-arithmetic':
         validate_arithmetic_options(live, ['arithmetic'], tts_model)
     env = (os.environ if base_environment is None else base_environment).copy()
@@ -368,7 +376,7 @@ def isolated_environment(run, source_config, endpoint, live=False, reservation=N
         env[name] = str(path)
     config_path = run / 'config' / 'config.toml'
     config = []
-    for key in ([] if entry == 'typed' else ['wake_word_model_path', 'parakeet_model_dir', 'silero_vad_model']):
+    for key in ([] if entry in ('typed', 'typed-speech') else ['wake_word_model_path', 'parakeet_model_dir', 'silero_vad_model']):
         path = Path(original[key])
         if not path.is_absolute():
             path = source_config.parent / path
@@ -380,7 +388,7 @@ def isolated_environment(run, source_config, endpoint, live=False, reservation=N
         config.append(f'{key} = {original.get(key, default)}')
     # Custom is selected in assistant settings, not the legacy backend enum.
     # No OpenCode table means no unrelated server is started.
-    arithmetic = entry == 'voice-arithmetic'
+    arithmetic = entry in ('voice-arithmetic', 'typed-speech')
     config += [f'web_enabled = {str(not arithmetic).lower()}', 'response_backend = "opencode"', '[custom_openai]']
     if live:
         env['VOXGOLEM_BENCH_AUTH_SOURCE_CONFIG'] = str(source_config)
@@ -392,7 +400,11 @@ def isolated_environment(run, source_config, endpoint, live=False, reservation=N
                                             'expires': 4102444800000}})
         config += [f'endpoint = {json.dumps(endpoint)}']
     # Omit the optional TTS table: even a disabled table requires model_path.
-    if arithmetic:
+    if entry == 'typed-speech':
+        from windows_effects import neural_configuration
+        neural = neural_configuration(source_config)
+        config += ['[tts]', 'enabled = true'] + [f'{key} = {json.dumps(value)}' for key, value in neural.items()]
+    elif arithmetic:
         config += ['[tts]', 'enabled = true', f'model_path = {json.dumps(str(tts_model.resolve()))}',
                    'worker_count = 1', 'max_queue = 8',
                    'sample_rate_hz = 22050', 'max_duration_s = 300', 'output_gain_db = 0']
@@ -422,7 +434,7 @@ assistant_completion = false
             raise ValueError('Unknown arithmetic output route')
     (config_path.parent / 'state.toml').write_text(state)
     env.update(VOXGOLEM_BENCH_MODE='live' if live else 'offline',
-               VOXGOLEM_BENCH_ENTRY=entry if entry in ('typed', 'voice-arithmetic') else 'voice',
+               VOXGOLEM_BENCH_ENTRY=entry if entry in ('typed', 'voice-arithmetic', 'typed-speech') else 'voice',
                VOXGOLEM_BENCH_ROOT=str(run), VOXGOLEM_CONFIG_PATH=str(config_path),
                TAURI_AUTOMATION='true')
     env.pop('VOXGOLEM_BENCH_AUTO_DIAGNOSTIC_CASE', None)
@@ -433,11 +445,11 @@ assistant_completion = false
     return env
 
 
-def invoke(driver, command, args=None):
+def invoke(driver, command, args=None, observer=False):
     global APP_PID
     value = driver.execute_async_script('''const done = arguments[arguments.length - 1];
 window.__TAURI_INTERNALS__.invoke(arguments[0], arguments[1]).then(
-  value => done({ok:true, value}), () => done({ok:false}));''', command, args or {})
+  value => {if(arguments[2])window.__voxBenchObserve?.speech(value);done({ok:true,value});}, () => done({ok:false}));''', command, args or {}, observer)
     if not isinstance(value, dict) or value.get('ok') is not True:
         raise RuntimeError('Application observation/admission command failed')
     result = value['value']
@@ -624,10 +636,10 @@ def quick_answer_correct(text):
     return len(text.strip()) <= 128 and re.search(r'\b42\b', text) is not None
 
 
-INSTALL_TYPED_OBSERVER = '''
+INSTALL_TYPED_OBSERVER = r'''
 window.__voxBenchObserve?.retire();
 const prior=new Set(arguments[0]);
-const state={submit_ms:null,first_text_ms:null,terminal_ms:null,inflight_text:false,users:0};
+const state={submit_ms:null,first_text_ms:null,first_word_ms:null,speech_observation_ms:null,terminal_ms:null,inflight_text:false,users:0};
 const submit=()=>{if(state.submit_ms===null)state.submit_ms=performance.now()};
 document.addEventListener('submit',submit,true);
 const observe=()=>{
@@ -639,10 +651,14 @@ const observe=()=>{
  if(state.first_text_ms===null&&text?.textContent?.trim()&&!text.querySelector('.message__thinking')){
   state.first_text_ms=performance.now();state.inflight_text=!terminal;
  }
+ if(state.first_word_ms===null&&text&&!text.querySelector('.message__thinking')&&
+    (/^\s*\S+\s/.test(text.textContent)||terminal&&text.textContent.trim()))state.first_word_ms=performance.now();
  if(terminal&&state.terminal_ms===null)state.terminal_ms=performance.now();
 };
 const observer=new MutationObserver(observe);observer.observe(document.body,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['data-turn-outcome','data-stage-status','data-content-kind']});
-window.__voxBenchObserve={read:()=>({...state}),retire:()=>{observer.disconnect();document.removeEventListener('submit',submit,true)}};
+window.__voxBenchObserve={read:()=>({...state}),speech:value=>{
+ if(state.submit_ms!==null&&state.speech_observation_ms===null&&value.events?.some(e=>e.stage==='reply_output_activated'))state.speech_observation_ms=performance.now();
+},retire:()=>{observer.disconnect();document.removeEventListener('submit',submit,true)}};
 '''
 
 
@@ -661,6 +677,13 @@ def stage_breakdown(events):
     def between(start, end):
         a, b = first(start), first(end)
         return (b-a)/1000 if a is not None and b is not None and b >= a else None
+    def speech_between(start, end):
+        a = [(i, e.get('elapsed_us')) for i, e in enumerate(events) if e.get('stage') == start]
+        b = [(i, e.get('elapsed_us')) for i, e in enumerate(events) if e.get('stage') == end]
+        if len(a) != 1 or len(b) != 1:
+            return None
+        (ai, av), (bi, bv) = a[0], b[0]
+        return (bv-av)/1000 if (ai <= bi and type(av) is int and type(bv) is int and 0 <= av <= bv) else None
     tools = []
     for event in events:
         if event['stage'] not in ('search_started', 'read_started'): continue
@@ -674,8 +697,14 @@ def stage_breakdown(events):
     for dispatch in (e for e in events if e['stage'] == 'generation_dispatched'):
         text = next((e for e in events if e['round'] == dispatch['round'] and e['stage'] == 'first_model_text'), None)
         rounds.append({'round': dispatch['round'], 'dispatch_to_first_text_ms':
-                       (text['elapsed_us']-dispatch['elapsed_us'])/1000 if text else None})
-    return {'native_admission_ms': between('prompt_command_started', 'prompt_admitted'),
+                       (text['elapsed_us']-dispatch['elapsed_us'])/1000 if text and text['elapsed_us'] >= dispatch['elapsed_us'] else None})
+    return {'prompt_to_first_model_word_ms': speech_between('prompt_command_started', 'first_model_word'),
+            'prompt_to_first_model_text_ms': speech_between('prompt_command_started', 'first_model_text'),
+            'prompt_to_synthesis_valid_ms': speech_between('prompt_command_started', 'reply_synthesis_valid'),
+            'prompt_to_output_submitted_ms': speech_between('prompt_command_started', 'reply_output_submitted'),
+            'prompt_to_output_activated_ms': speech_between('prompt_command_started', 'reply_output_activated'),
+            'synthesis_request_to_valid_pcm_ms': speech_between('reply_synthesis_requested', 'reply_synthesis_valid'),
+            'native_admission_ms': between('prompt_command_started', 'prompt_admitted'),
             'admission_to_dispatch_ms': between('prompt_admitted', 'generation_dispatched'),
             'provider_and_tools_ms': between('generation_dispatched', 'provider_run_completed'),
             'provider_to_canonical_commit_ms': between('provider_run_completed', 'canonical_turn_committed'),
@@ -683,14 +712,14 @@ def stage_breakdown(events):
             'model_rounds': rounds, 'tools': tools}
 
 
-def typed_checks(case, integrity, native, service, added_once, observed):
+def typed_checks(case, integrity, native, service, added_once, observed, profile=None):
     stages = {e['stage'] for e in native['events']}
     checks = {'canonical_turn_added_once': added_once,
               'canonical_ui_answer_match': integrity['canonical_ui_match'],
               'canonical_sources_retained': integrity.get('canonical_sources_expected', False),
               'no_dropped_observations': native['dropped'] == 0,
               'normal_admission_and_commit': {'prompt_admitted', 'generation_dispatched', 'canonical_turn_committed'} <= stages,
-              'tool_reads_completed': case == 'quick' or (native['readable_pages'] >= 1 and native['tool_failures'] == 0),
+              'tool_reads_completed': profile is not None or case == 'quick' or (native['readable_pages'] >= 1 and native['tool_failures'] == 0),
               'inflight_stream_presented': observed['inflight_text'],
               'ui_sources_preserved': integrity['sources_preserved']}
     if service is not None:
@@ -714,7 +743,7 @@ def typed_eligibility(checks):
     return core, core and checks.get('inflight_stream_presented') is True
 
 
-def exercise_typed(driver, case, services=None, timeout=180, duplicate_click=False):
+def exercise_typed(driver, case, services=None, timeout=180, duplicate_click=False, profile=None):
     before = invoke(driver, 'get_app_snapshot')
     invoke(driver, 'benchmark_begin_flow')
     if services:
@@ -723,7 +752,7 @@ def exercise_typed(driver, case, services=None, timeout=180, duplicate_click=Fal
         services.expect_history(before['transcript'])
     baseline = driver.execute_script('return Array.from(document.querySelectorAll("[data-turn-role=user][data-request-id]")).map(e=>e.dataset.requestId)')
     driver.execute_script(INSTALL_TYPED_OBSERVER, baseline)
-    fill_composer(driver, CASES[case])
+    fill_composer(driver, (profile.cases if profile else CASES)[case])
     host_started = time.perf_counter()
     button = driver.find_element('css selector', '.composer button[type=submit]')
     if duplicate_click:
@@ -736,6 +765,8 @@ def exercise_typed(driver, case, services=None, timeout=180, duplicate_click=Fal
     while time.monotonic() < deadline:
         observation = driver.execute_script('return window.__voxBenchObserve.read()')
         if services and observation['inflight_text']: services.release_stream()
+        if profile:
+            invoke(driver, 'benchmark_snapshot', observer=True)
         state = driver.execute_script(OBSERVE, baseline)
         if state.get('outcome') == 'completed' and state.get('stage') == 'completed' and state.get('kind') == 'text':
             final = state
@@ -744,33 +775,48 @@ def exercise_typed(driver, case, services=None, timeout=180, duplicate_click=Fal
             break
         time.sleep(0.05)
     host_completed = time.perf_counter()
+    if profile:
+        # Canonical text completion and physical local retirement are distinct.
+        native = invoke(driver, 'benchmark_snapshot', observer=True)
+        while time.monotonic() < deadline and not arithmetic_speech_passed(native.get('reply_speech')):
+            if native.get('reply_speech', {}).get('failed', 0) and native['reply_speech'].get('retired'):
+                break
+            time.sleep(0.05)
+            native = invoke(driver, 'benchmark_snapshot', observer=True)
     observation = driver.execute_script('return window.__voxBenchObserve.read()')
     driver.execute_script('window.__voxBenchObserve.retire()')
     if services:
         services.release_stream()
         if not services.wait_quiescent(): raise RuntimeError('Synthetic generation did not retire')
     after = invoke(driver, 'get_app_snapshot')
-    native = invoke(driver, 'benchmark_snapshot')
+    native = native if profile else invoke(driver, 'benchmark_snapshot')
     added_once = len(after['transcript']) == len(before['transcript'])+1 and observation['users'] == 1
     turn = after['transcript'][-1] if added_once else {}
     text = turn.get('answer', {}).get('content', {}).get('text', '')
     delivered = driver.execute_script('''const id=arguments[0];const row=Array.from(document.querySelectorAll('[data-turn-role=assistant][data-request-id]')).find(e=>e.dataset.requestId===id);
 return {text:row?.querySelector('.answer-stage__answer,.message__content')?.textContent||'',urls:Array.from(row?.querySelectorAll('.answer-stage__sources a')||[]).map(a=>a.href)};''', turn.get('request_id'))
-    integrity = answer_integrity(case, text, delivered['text'], delivered['urls'], services is not None, turn.get('sources'))
+    integrity = answer_integrity(case, text, delivered['text'], delivered['urls'], services is not None, turn.get('sources'), profile)
     service = services.snapshot() if services else None
-    checks = typed_checks(case, integrity, native, service, added_once, observation)
+    checks = typed_checks(case, integrity, native, service, added_once, observation, profile)
     checks['completed_text_outcome'] = final is not None
+    if profile:
+        checks['local_speech_completed_and_retired'] = arithmetic_speech_passed(native.get('reply_speech'))
     if case == 'quick': checks['quick_answer_correct'] = quick_answer_correct(text)
     # The user deferred source-list projection repair, not canonical integrity.
     core, qualification = typed_eligibility(checks)
     def elapsed(end):
         start = observation['submit_ms']
-        value = observation[end]
+        value = observation.get(end)
         return value-start if start is not None and value is not None and value >= start else None
     return {'case': case, 'coverage': 'typed-workflow', 'workflow_completed': core,
             'qualification_eligible': qualification, 'all_checks_passed': all(checks.values()),
             'checks': checks, 'defects': [name for name, passed in checks.items() if not passed],
             'ui_submit_to_first_text_dom_ms': elapsed('first_text_ms'),
+            'ui_submit_to_first_complete_word_dom_ms': elapsed('first_word_ms'),
+            'ui_submit_to_speech_observation_ms': elapsed('speech_observation_ms') if profile else None,
+            'speech_observation_boundary': 'WebView payload receipt; includes IPC/poll observer overhead; not exact audio' if profile else None,
+            'speech_identity': native.get('speech_identity') if profile else None,
+            'reply_speech': native.get('reply_speech') if profile else None,
             'ui_submit_to_terminal_dom_ms': elapsed('terminal_ms'),
             'host_click_to_completed_observation_ms': (host_completed-host_started)*1000,
             'native_breakdown': stage_breakdown(native['events']),
@@ -1202,6 +1248,11 @@ def observe_native_completion_held(driver, before, baseline, services, deadline)
 
 def execute(args, platform=None):
     global PHASE, APP_PID
+    if args.entry == 'typed-speech':
+        if platform is None:
+            raise ValueError('Typed speech requires Windows effects')
+        import windows_effects
+        windows_effects.validate_options(args)
     if args.entry == 'voice-arithmetic':
         validate_arithmetic_options(args.live, args.cases, getattr(args, 'tts_model', None))
     validate_benchmark_binary(args.binary)
@@ -1224,7 +1275,8 @@ def execute(args, platform=None):
             return {'browserName': 'wry'}
 
     run = args.output.resolve()
-    profile = arithmetic_profile() if args.entry == 'voice-arithmetic' else None
+    typed_speech = args.entry == 'typed-speech'
+    profile = arithmetic_profile() if args.entry in ('voice-arithmetic', 'typed-speech') else None
     effects_api = SimpleNamespace(**globals()) if platform else None
     if platform:
         fixtures, speech_identity, identity = platform.prepare(profile, effects_api)
@@ -1238,7 +1290,7 @@ def execute(args, platform=None):
         if profile:
             speech_identity.update(web_enabled=False, tts_enabled=True)
         identity = arithmetic_identity(profile, args.tts_model.resolve(), speech_identity) if profile else None
-    services = FakeServices(profile=profile) if not args.live else None
+    services = FakeServices(profile=profile, gated_stream=typed_speech) if not args.live else None
     if services:
         services.__enter__()
     driver = None
@@ -1282,13 +1334,17 @@ def execute(args, platform=None):
             invoke(driver, 'benchmark_snapshot')
             platform.observe_app(APP_PID)
         PHASE = 'automatic_capture_start'
-        ready = wait_for(lambda: invoke(driver, 'benchmark_snapshot').get('capture_active'),
-                         60, 'automatic_capture_start')
+        if not typed_speech:
+            wait_for(lambda: invoke(driver, 'benchmark_snapshot').get('capture_active'),
+                     60, 'automatic_capture_start')
         launch_ms = (time.perf_counter()-launch)*1000
         readiness = None
-        if profile:
+        if profile and not typed_speech:
             PHASE = 'voice_model_readiness'
             readiness = voice_model_readiness(driver)
+        if typed_speech:
+            wait_for(lambda: driver.execute_script('return document.getElementById("composerInstantSelect")?.value') == 'custom-luna-none',
+                     30, 'typed_composer_ready')
         selected = driver.execute_script('return document.getElementById("composerInstantSelect")?.value')
         if selected != 'custom-luna-none':
             raise RuntimeError('Requested model was not selected')
@@ -1298,6 +1354,17 @@ def execute(args, platform=None):
             if readiness is not None and not readiness['ready']:
                 rows.append({'case': case, 'passed': False, 'failure': readiness['failure'],
                              'model_readiness': readiness})
+                break
+            if typed_speech:
+                PHASE = 'typed_speech_flow'
+                result = exercise_typed(driver, case, services, args.flow_timeout, profile=profile)
+                result['checks']['speech_identity_matches_descriptor'] = speech_identity_matches(result.get('speech_identity'), speech_identity)
+                result['passed'] = result['workflow_completed'] and result['checks']['speech_identity_matches_descriptor']
+                result['workflow_completed'] = result['passed']
+                result['qualification_eligible'] = False
+                result['all_checks_passed'] = all(result['checks'].values())
+                result['defects'] = [name for name, passed in result['checks'].items() if not passed]
+                rows.append(result)
                 break
             PHASE = 'voice_flow'
             if services:
@@ -1434,7 +1501,7 @@ def main():
     parser.add_argument('--wake-phrase', help='Required for voice, unused by typed-workflow')
     parser.add_argument('--voice', default='en-gb', choices=['en-gb', 'en-us', 'en-us+f3', 'en-gb+f2'])
     parser.add_argument('--cases', nargs='+', choices=list(CASES)+['arithmetic'])
-    parser.add_argument('--entry', choices=['voice', 'voice-arithmetic', 'typed', 'typed-control'], default='voice', help='Arithmetic voice is offline real synthesis/software-null output only')
+    parser.add_argument('--entry', choices=['voice', 'voice-arithmetic', 'typed', 'typed-control', 'typed-speech'], default='voice', help='Arithmetic voice is offline real synthesis/software-null output only')
     parser.add_argument('--tts-model', type=Path, help='Arithmetic only: explicit local Piper ONNX model with adjacent .json')
     parser.add_argument('--desktop-platform', choices=['linux', 'windows'], default='linux')
     parser.add_argument('--windows-manifest', type=Path, help='Windows-only staged PCM/assets/tools hash manifest')
@@ -1463,11 +1530,14 @@ def main():
     args = parser.parse_args()
     if any(path.is_symlink() for path in (ARTIFACT_ROOT, *ARTIFACT_ROOT.parents)):
         parser.error('Benchmark artifact storage must not use symlinks')
+    typed_speech = args.entry == 'typed-speech'
+    if typed_speech and args.desktop_platform != 'windows':
+        parser.error('Typed speech requires native Windows offline diagnostics')
     arithmetic = args.entry == 'voice-arithmetic'
     if args.readiness_diagnostic and (not arithmetic or args.live or args.desktop_platform != 'linux' or args.flow_timeout > 30):
         parser.error('Readiness diagnostic requires offline Linux arithmetic and flow timeout at most 30 seconds')
     if args.cases is None:
-        args.cases = ['arithmetic'] if arithmetic else list(CASES)
+        args.cases = ['arithmetic'] if arithmetic or typed_speech else list(CASES)
     if arithmetic:
         try:
             validate_arithmetic_options(args.live, args.cases, args.tts_model)
@@ -1475,7 +1545,7 @@ def main():
             parser.error(str(error))
         if args.wake_diagnostics or args.event_loop_diagnostic or args.driver_free_diagnostic or args.hold_native_observer or args.extended or args.poll_interval != 0.1:
             parser.error('Arithmetic qualification cannot use diagnostic probes')
-    elif 'arithmetic' in args.cases or args.tts_model is not None:
+    elif not typed_speech and ('arithmetic' in args.cases or args.tts_model is not None):
         parser.error('Arithmetic fixtures and TTS model require voice-arithmetic entry')
     args.tools = args.tools.resolve()
     if args.shared_suite and (not args.live or args.entry != 'typed' or args.extended or
@@ -1485,7 +1555,7 @@ def main():
             args.driver_free_diagnostic or args.wake_diagnostics or args.event_loop_diagnostic or
             args.extended or args.poll_interval != 0.1):
         parser.error('Native observer hold requires exactly one offline quick voice case without other probes')
-    if args.entry != 'typed' and not args.wake_phrase:
+    if args.entry not in ('typed', 'typed-speech') and not args.wake_phrase:
         parser.error('Voice and legacy controls require an explicit synthetic wake phrase')
     if args.extended and (args.entry != 'typed' or args.live):
         parser.error('Extended safety/context tests are offline typed-workflow only')

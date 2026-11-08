@@ -435,3 +435,86 @@ cargo test --offline --locked -p voxgolem-platform --lib \
 
 Normal shipping builds omit the benchmark Rust features and frontend flag. They
 must not expose synthetic input commands or depend on these tools.
+
+### Windows typed speech with an existing Neural service
+
+`--entry typed-speech --desktop-platform windows` is a separate offline diagnostic.
+It runs exactly one `fixtures.arithmetic_profile()` prompt through the normal UI
+composer and the existing typed observer, with one fake-model admission and zero
+live model calls. It does not load wake/VAD/ASR/PCM/Piper assets. Legacy `typed`,
+`voice-arithmetic`, schema-1 staging and live qualification/budget rules are unchanged.
+
+Use native Windows private Python with existing Selenium and the existing Windows
+Job/private-DACL/fresh-profile/retained application creation-identity protections.
+The schema-2 staging manifest must have `entry="typed-speech-windows"`, the shared
+`contract_sha256`, benchmark `application_id`, `native_source_sha256`,
+`driver_versions`, and `files` SHA-256 map. Its `roles` keys are exactly `binary`,
+`tauri_driver`, `native_driver`, `config`; paths are bundle-relative. The existing
+256 KiB/4096-file bounds, PE verification, pinned Tauri driver 2.1.0, matching
+Edge/WebView version checks, reparse refusal and declared executable-directory
+siblings (including DLLs) apply. No PCM metadata or speech asset roles are needed.
+Keep the manifest outside the executable/driver directories.
+
+The Windows adapter also passes `webviewOptions.userDataFolder` through Tauri to
+EdgeDriver, using the same private `run/webview` folder as the environment and
+native storage guard. Without this capability, EdgeDriver chooses a temporary
+folder and the exact-folder guard rejects startup. See Microsoft's
+[WebView options](https://learn.microsoft.com/en-us/microsoft-edge/webdriver/capabilities-edge-options#webviewoptions-object).
+The benchmark binary writes a bounded categorical `startup-validation.json`
+receipt when environment validation runs. `ready` confirms that boundary only;
+a missing receipt does not identify a failure cause. Shipping builds omit it.
+
+The hash-bound synthetic source config contains only this table (replace the
+synthetic voice with an explicitly selected public voice ID in the descriptor):
+
+```toml
+[tts]
+provider = "neural"
+endpoint = "http://127.0.0.1:19765"
+voice = "synthetic-a"
+start_command = []
+```
+
+Only literal loopback HTTP with an explicit port is accepted; no credentials,
+queries, paths, hostnames or launch command. At runtime the harness makes one
+bounded, no-proxy/no-redirect GET to `/v1/synthesis/capabilities` on the already
+running service and verifies readiness, protocol, voice, format and catalog bounds.
+It does not launch, reconfigure or stop the service. App-owned synthesis sessions
+remain the native client's responsibility. External shared-service lifecycle is
+reported `unverified`, separately from local speech retirement and owned Job cleanup.
+
+```powershell
+& $PRIVATE_PYTHON tools/app-bench/runner.py `
+  --binary $BENCHMARK_EXE --tools $PRIVATE_DRIVERS --config $SYNTHETIC_CONFIG `
+  --windows-manifest $WINDOWS_MANIFEST --desktop-platform windows `
+  --entry typed-speech --output $FRESH_RUN
+```
+
+Do not supply `--wake-phrase`, `--tts-model`, `--live`, extended controls or probes.
+The runner sets native `VOXGOLEM_BENCH_ENTRY=typed-speech-windows`, offline mode,
+TTS enabled and Web disabled in private storage. The native benchmark must accept
+that entry without capture assets and expose `snapshot.speech_identity` with
+`engine="neural"`, `backend`, canonical `voice`, `sample_rate_hz`,
+`incremental_audio`, `protocol_version=1`. This must equal the descriptor identity.
+The flow uses existing admission/commit stages and `reply_speech` counters/retired
+proof, plus `first_model_text`, `first_model_word`, `reply_synthesis_requested`,
+`reply_synthesis_valid`, `reply_output_submitted`, `reply_output_activated` and
+`reply_output_completed`. Text completion does not replace local speech retirement.
+
+The schema-4 report preserves `ui_submit_to_first_text_dom_ms` and adds
+`ui_submit_to_first_complete_word_dom_ms`: first nonblank word followed by
+whitespace, or the first nonblank word at terminal outcome (including `210`).
+`ui_submit_to_speech_observation_ms` uses the same WebView `performance.now()`
+observer at native snapshot payload receipt after observing output activation. It
+includes IPC/poll observer overhead and is not exact audio start. Native
+`native_breakdown` intervals use only native `elapsed_us`: prompt command to first
+model text/word, valid PCM, submitted output and activated output; synthesis request
+to valid PCM. Missing, duplicate or reordered interval boundaries produce `null`.
+DOM and native raw timestamps are never subtracted. All metrics remain in reports.
+
+Acoustics remain unverified. Even a completed diagnostic has `passed=false`,
+`diagnostic_only=true`, `qualified_for_live=false`, `offline_profile_qualified=false`,
+`live_calls=0`, and runner exit 1. `workflow_completed` separately requires the
+synthetic typed/speech checks, matching identity, private storage, retained app
+identity, graceful app exit and owned Job retirement. This report cannot authorize
+live measurement or establish Windows acoustic acceptance.

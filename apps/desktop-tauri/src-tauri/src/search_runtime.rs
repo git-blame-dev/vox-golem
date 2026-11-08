@@ -208,7 +208,10 @@ pub(super) async fn run_custom(
         RunError::Provider(voxgolem_platform::custom_openai::CustomOpenAiError::Timeout)
     })??;
     #[cfg(all(feature = "app-benchmark", not(test)))]
-    super::app_benchmark::mark("provider_run_completed");
+    {
+        super::app_benchmark::finish_model_word();
+        super::app_benchmark::mark("provider_run_completed");
+    }
     result.response.timings.headers_at += adapter_elapsed;
     result.response.timings.first_text_at = result
         .response

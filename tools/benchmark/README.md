@@ -691,3 +691,31 @@ execute the generated guard JavaScript against synthetic native/DOM state, inclu
 exact-execution cancellation, cancelled requests absent from committed history,
 foreign successors and unchanged-empty-session rejection. This is still not a
 real WebView or device test; no JavaScript dependency is installed for these checks.
+
+### Windows typed speech diagnostic
+
+The explicit `--workload typed-speech` desktop lane forwards to the existing
+`tools/app-bench/runner.py --entry typed-speech` Windows lifecycle. It uses the
+shared arithmetic contract, normal typed composer, an already running Neural TTS
+service, one fake-model admission and zero live calls. It requires native Windows
+private Python/Selenium, a schema-2 `typed-speech-windows` manifest, explicit binary,
+private drivers and synthetic Neural-only config; see
+[the staging and native contract](../app-bench/README.md#windows-typed-speech-with-an-existing-neural-service).
+
+```powershell
+& $PRIVATE_PYTHON tools/benchmark/benchmark.py --platform desktop `
+  --workload typed-speech --desktop-platform windows --max-live-calls 0 `
+  --binary $BENCHMARK_EXE --tools $PRIVATE_DRIVERS --config $SYNTHETIC_CONFIG `
+  --windows-manifest $WINDOWS_MANIFEST --output $FRESH_RUN
+```
+
+The Makefile also exposes this explicit workload through
+`make benchmark PLATFORM=desktop BENCHMARK_FLAGS="--workload typed-speech ..."`
+when `python3` is the native private Windows interpreter. `--list` needs no runtime
+access. No wake phrase, Piper model, physical-device controls or live evidence are
+accepted. Completed schema-4 diagnostics map to shared exit 2 (`unverified`), never
+a qualification pass. The child `report.json` holds DOM first-text/complete-word,
+WebView speech payload-receipt observations (including IPC/poll overhead), separate
+native-clock speech stage intervals, speech identity and local retirement evidence.
+Shared-service lifecycle and acoustics remain unverified; Job retirement covers
+only owned processes. Legacy workloads and live-budget gates are unchanged.

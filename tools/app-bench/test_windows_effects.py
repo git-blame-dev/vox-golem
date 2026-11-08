@@ -17,6 +17,15 @@ import windows_effects as windows
 
 
 class WindowsEffectsTests(unittest.TestCase):
+    def test_webview_capability_binds_the_same_private_folder_as_native_storage_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            effects = windows.WindowsEffects.__new__(windows.WindowsEffects)
+            effects.roles = {'binary': Path(directory)/'synthetic.exe'}
+            effects.args = SimpleNamespace(output=Path(directory)/'private-run')
+            self.assertEqual(effects.application_options(), {
+                'application': str(effects.roles['binary'].resolve()),
+                'webviewOptions': {'userDataFolder': str((effects.args.output/'webview').resolve())}})
+
     def test_session_creation_cause_is_conservative_and_never_exports_message(self):
         class SessionNotCreatedException(Exception):
             def __init__(self, message):
