@@ -33,9 +33,6 @@ jobs:
   android-artifact:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    env:
-      # One SDK preference/signing location for phone and Wear throughout this job.
-      ANDROID_USER_HOME: ${{ runner.temp }}/voxgolem-android-user
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
@@ -45,9 +42,12 @@ jobs:
         with:
           toolchain: 1.95.0
           targets: aarch64-linux-android,armv7-linux-androideabi
+      - name: Configure isolated Android user directory
+        run: |
+          printf 'ANDROID_USER_HOME=%s/voxgolem-android-user\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/voxgolem-android-user"
       - name: Configure the pinned Android build tools
         run: |
-          mkdir -p "$ANDROID_USER_HOME"
           test -x "$JAVA_HOME_21_X64/bin/java"
           printf 'JAVA_HOME=%s\n' "$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
           printf '%s/bin\n' "$JAVA_HOME_21_X64" >> "$GITHUB_PATH"

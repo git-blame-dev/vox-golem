@@ -12,9 +12,14 @@ bun -e '
   const job = Bun.YAML.parse(await Bun.file(`${Bun.argv[1]}/.github/workflows/ci.yml`).text()).jobs["android-artifact"];
   const step = job.steps.find(s => s.name === "Sign and verify the optimized phone CI trial");
   await Bun.write(`${Bun.argv[2]}/sign.sh`, step.run);
-  const location = job.env?.ANDROID_USER_HOME ?? "";
-  await Bun.write(`${Bun.argv[2]}/location`, location.replace("${{ runner.temp }}", Bun.argv[2]));
+  const setup = job.steps.find(s => s.name === "Configure isolated Android user directory");
+  await Bun.write(`${Bun.argv[2]}/setup.sh`, setup.run);
 ' "$root" "$temp_dir"
+
+RUNNER_TEMP="$temp_dir" GITHUB_ENV="$temp_dir/job.env" bash "$temp_dir/setup.sh"
+sed -n 's/^ANDROID_USER_HOME=//p' "$temp_dir/job.env" > "$temp_dir/location"
+test -s "$temp_dir/location"
+test -d "$(cat "$temp_dir/location")"
 
 mkdir -p "$temp_dir/sdk/build-tools/36.0.0"
 ln -s "$temp_dir/sdk/build-tools/36.0.0" "$temp_dir/bin"
