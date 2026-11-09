@@ -116,7 +116,9 @@ max_unpacked_bytes_for() {
     VCRUNTIME140_1.dll) printf '%s\n' 100000 ;;
     onnxruntime_providers_cuda.dll) printf '%s\n' 110000000 ;;
     onnxruntime_providers_shared.dll) printf '%s\n' 100000 ;;
-    vox-golem.exe) printf '%s\n' 50000000 ;;
+    # Optimized x64 CI archive declared 53,245,440 bytes (2026-11-09).
+    # Budget 64 MiB; keep installer/package bounds aligned, aggregate unchanged.
+    vox-golem.exe) printf '%s\n' 67108864 ;;
     uninstall.exe|"\$PLUGINSDIR/"*) printf '%s\n' 500000 ;;
     *) return 1 ;;
   esac

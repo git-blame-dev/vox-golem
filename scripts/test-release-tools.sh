@@ -237,6 +237,70 @@ installer="$temp_dir/fake-installer.exe"
 create_test_installer "$installer"
 VOXGOLEM_FILE="$temp_dir/fake-file" VOXGOLEM_OBJDUMP="$temp_dir/fake-llvm-objdump" \
   "$root/scripts/verify-windows-installer.sh" "$installer" 250000000
+# Exercise real size checks and archive extraction with synthetic sparse payloads.
+# Inspectors remain stubs: these fixtures establish bounds, not PE authenticity.
+for executable_bytes in 53245440 67108863 67108864 67108865; do
+  truncate -s "$executable_bytes" "$temp_dir/windows-package/vox-golem.exe"
+  truncate -s "$executable_bytes" "$installer_input/vox-golem.exe"
+  boundary_installer="$temp_dir/boundary-installer.exe"
+  create_test_installer "$boundary_installer"
+  for validator in package installer; do
+    if [ "$validator" = package ]; then
+      arguments=("$temp_dir/windows-package")
+    else
+      arguments=("$boundary_installer" 250000000)
+    fi
+    boundary_log="$temp_dir/boundary-$validator.log"
+    if VOXGOLEM_FILE="$temp_dir/fake-file" VOXGOLEM_OBJDUMP="$temp_dir/fake-llvm-objdump" \
+      "$root/scripts/verify-windows-$validator.sh" "${arguments[@]}" > "$boundary_log" 2>&1; then
+      if [ "$executable_bytes" -gt 67108864 ]; then
+        printf 'Windows %s unexpectedly accepted executable above 64 MiB.\n' "$validator" >&2
+        exit 1
+      fi
+    else
+      if [ "$executable_bytes" -le 67108864 ]; then
+        cat "$boundary_log" >&2
+        printf 'Windows %s rejected executable within 64 MiB.\n' "$validator" >&2
+        exit 1
+      fi
+      grep -Fq 'vox-golem.exe (67108865 > 67108864 bytes)' "$boundary_log"
+    fi
+  done
+  printf 'Windows executable size boundary: %s bytes checked in both validators.\n' "$executable_bytes"
+done
+printf '%s\n' 'vox-golem.exe' > "$temp_dir/windows-package/vox-golem.exe"
+printf '%s\n' 'vox-golem.exe' > "$installer_input/vox-golem.exe"
+
+# Individually permitted payloads must still fail the unchanged aggregate bounds.
+for payload_dir in "$temp_dir/windows-package" "$installer_input"; do
+  truncate -s 25000000 "$payload_dir/DirectML.dll"
+  truncate -s 110000000 "$payload_dir/onnxruntime_providers_cuda.dll"
+  truncate -s 42000000 "$payload_dir/vox-golem.exe"
+done
+aggregate_installer="$temp_dir/aggregate-installer.exe"
+create_test_installer "$aggregate_installer"
+for validator in package installer; do
+  if [ "$validator" = package ]; then
+    arguments=("$temp_dir/windows-package")
+    expected_error='Windows package exceeds its extracted size limit:'
+  else
+    arguments=("$aggregate_installer" 250000000)
+    expected_error='Installer archive exceeds its declared unpacked size limit:'
+  fi
+  aggregate_log="$temp_dir/aggregate-$validator.log"
+  if VOXGOLEM_FILE="$temp_dir/fake-file" VOXGOLEM_OBJDUMP="$temp_dir/fake-llvm-objdump" \
+    "$root/scripts/verify-windows-$validator.sh" "${arguments[@]}" > "$aggregate_log" 2>&1; then
+    printf 'Windows %s unexpectedly accepted an oversized aggregate payload.\n' "$validator" >&2
+    exit 1
+  fi
+  grep -Fq "$expected_error" "$aggregate_log"
+done
+for payload_dir in "$temp_dir/windows-package" "$installer_input"; do
+  for file in DirectML.dll onnxruntime_providers_cuda.dll vox-golem.exe; do
+    printf '%s\n' "$file" > "$payload_dir/$file"
+  done
+done
+
 if VOXGOLEM_FILE="$temp_dir/fake-file" FAKE_NON_PE_NAME='MSVCP140.dll' \
   VOXGOLEM_OBJDUMP="$temp_dir/fake-llvm-objdump" \
   "$root/scripts/verify-windows-installer.sh" "$installer" 250000000; then

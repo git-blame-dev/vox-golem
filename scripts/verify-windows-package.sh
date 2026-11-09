@@ -57,7 +57,9 @@ for file in "${expected[@]}"; do
     VCRUNTIME140_1.dll) max_file_bytes=100000 ;;
     onnxruntime_providers_cuda.dll) max_file_bytes=110000000 ;;
     onnxruntime_providers_shared.dll) max_file_bytes=100000 ;;
-    vox-golem.exe) max_file_bytes=50000000 ;;
+    # Optimized x64 CI archive declared 53,245,440 bytes (2026-11-09).
+    # Budget 64 MiB; keep installer/package bounds aligned, aggregate unchanged.
+    vox-golem.exe) max_file_bytes=67108864 ;;
   esac
   if [ "$file_bytes" -gt "$max_file_bytes" ]; then
     printf 'Windows package entry exceeds its size limit: %s (%s > %s bytes).\n' \
