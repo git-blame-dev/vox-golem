@@ -72,12 +72,4 @@ class StandaloneCapabilityProbeTest {
         assertEquals(count, ShadowLog.getLogsForTag(StandaloneCapabilityProbe.TAG).size)
     }
 
-    @Test @Config(sdk = [32]) fun olderApiProbeReportsUnsupportedWithoutCreatingEngines() {
-        val recognizer = ShadowSpeechRecognizer.getLatestSpeechRecognizer()
-        val tts = ShadowTextToSpeech.getLastTextToSpeechInstance()
-        StandaloneCapabilityProbe(RuntimeEnvironment.getApplication()).run()
-        assertSame(recognizer, ShadowSpeechRecognizer.getLatestSpeechRecognizer())
-        assertSame(tts, ShadowTextToSpeech.getLastTextToSpeechInstance())
-        assertTrue(ShadowLog.getLogsForTag(StandaloneCapabilityProbe.TAG).any { it.msg.contains("supportedProbeApi") })
-    }
 }

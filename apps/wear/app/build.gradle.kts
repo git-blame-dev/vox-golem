@@ -101,6 +101,10 @@ dependencies {
 }
 
 tasks.withType<Test>().configureEach {
+    // Bound Robolectric SDK/theme/bitmap retention to one class per worker and
+    // keep native SDK initialization isolated. Leave heap and parallelism unchanged.
+    forkEvery = 1
+
     dependsOn(":assistant-android:buildAssistantNativeJvm")
     val libraryDirectory = rootProject.layout.buildDirectory.dir("assistant-android/rust-native/debug").get().asFile
     systemProperty("java.library.path", libraryDirectory.absolutePath)
