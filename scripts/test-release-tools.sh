@@ -30,6 +30,10 @@ for target in ("app", "linux", "update-bundle", "pc", "pc-benchmark", "pc-instal
     desktop = [shlex.split(line) for line in commands if "cargo tauri " in line]
     assert len(desktop) == 1, (target, desktop)
     args = desktop[0]
+    if target == "pc-installer":
+        install_index = commands.index("bun install --frozen-lockfile")
+        build_index = next(i for i, line in enumerate(commands) if "cargo tauri " in line)
+        assert install_index < build_index, "fresh Windows packaging must install frontend dependencies before building"
     for name, expected in (
         ("TAURI_APP_PATH", root / "apps/desktop-tauri/src-tauri"),
         ("TAURI_FRONTEND_PATH", root),

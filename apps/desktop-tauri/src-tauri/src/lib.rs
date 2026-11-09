@@ -14688,6 +14688,11 @@ fn store_llama_runtime_if_current(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let startup_diagnostics =
+        std::env::var_os("VOXGOLEM_STARTUP_DIAGNOSTICS").is_some_and(|value| value == "1");
+    if startup_diagnostics {
+        eprintln!("VOXGOLEM_STARTUP_ENTER");
+    }
     let context = tauri::generate_context!();
     #[cfg(feature = "app-benchmark")]
     if let Err(error) = app_benchmark::validate_application_id(&context.config().identifier) {
@@ -14714,8 +14719,14 @@ pub fn run() {
 
     let builder = builder
         .manage(app_updates::PendingUpdate::default())
-        .setup(|app| {
+        .setup(move |app| {
+            if startup_diagnostics {
+                eprintln!("VOXGOLEM_SETUP_ENTER");
+            }
             let app_state = build_app_state(app.handle());
+            if startup_diagnostics {
+                eprintln!("VOXGOLEM_STATE_BUILT");
+            }
             let auto_update_download = load_auto_update_download().unwrap_or(false);
             let auto_update_install = load_auto_update_install().unwrap_or(false);
             app_updates::configure_auto_download(
@@ -15032,6 +15043,10 @@ pub fn run() {
             std::process::exit(1);
         }
     };
+
+    if startup_diagnostics {
+        eprintln!("VOXGOLEM_SHELL_BUILT");
+    }
 
     #[cfg(unix)]
     install_unix_signal_exit_handlers(app.handle());

@@ -1,4 +1,5 @@
 extensions.configure<com.android.build.gradle.AppExtension> {
+    ndkVersion = "28.2.13676358"
     sourceSets.getByName("main").res.srcDir(file("../../../../shell-res"))
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8

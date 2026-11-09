@@ -25,7 +25,11 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq p7zip-full libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev libxdo-dev cmake ninja-build clang lld llvm pkg-config espeak-ng ffmpeg
+          sudo apt-get install -y jq p7zip-full libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev libxdo-dev cmake ninja-build clang lld llvm pkg-config espeak-ng ffmpeg xvfb
+      - name: Prepare deterministic synthetic speech tools
+        run: |
+          scripts/prepare-synthetic-speech-tools.sh "$RUNNER_TEMP/synthetic-speech"
+          printf '%s/bin\n' "$RUNNER_TEMP/synthetic-speech" >> "$GITHUB_PATH"
       - run: make test
 
   release:

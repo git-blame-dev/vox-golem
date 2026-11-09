@@ -12,10 +12,20 @@ ready_timeout="$3"
 post_ready="$4"
 warning='GStreamer element appsink not found'
 
+process_alive() {
+  local state
+  state="$(ps -o stat= -p "$pid" 2>/dev/null || true)"
+  kill -0 "$pid" 2>/dev/null && [[ -n "$state" && "$state" != Z* ]]
+}
+
 for ((second = 0; second < ready_timeout; second += 1)); do
   sleep 1
   if grep -Fq "$warning" "$log"; then
     printf '%s\n' 'Linux AppImage smoke failed: GStreamer appsink is unavailable.' >&2
+    exit 1
+  fi
+  if ! process_alive; then
+    printf '%s\n' 'Linux AppImage smoke failed.' >&2
     exit 1
   fi
   if grep -Fq 'VOXGOLEM_STARTUP_READY' "$log"; then
@@ -25,7 +35,7 @@ for ((second = 0; second < ready_timeout; second += 1)); do
         printf '%s\n' 'Linux AppImage smoke failed: GStreamer appsink is unavailable.' >&2
         exit 1
       fi
-      if ! kill -0 "$pid" 2>/dev/null; then
+      if ! process_alive; then
         printf '%s\n' 'Linux AppImage smoke failed after startup readiness.' >&2
         exit 1
       fi
@@ -36,10 +46,6 @@ for ((second = 0; second < ready_timeout; second += 1)); do
     fi
     printf '%s\n' 'Linux AppImage smoke passed: startup-ready marker remained healthy.'
     exit 0
-  fi
-  if ! kill -0 "$pid" 2>/dev/null; then
-    printf '%s\n' 'Linux AppImage smoke failed.' >&2
-    exit 1
   fi
 done
 

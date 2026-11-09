@@ -4,7 +4,7 @@ Generate artificial speech, replay it through the production wake-word implement
 
 ## Run
 
-From the repository root on Linux, with the project's existing Rust build prerequisites plus Python 3.10+, eSpeak NG, FFmpeg and GNU coreutils (`sha256sum`) available:
+From the repository root on Linux, with the project's existing Rust build prerequisites plus Python 3.10+, eSpeak NG 1.52.0 or newer, FFmpeg and GNU coreutils (`sha256sum`) available:
 
 ```bash
 make test-wakeword-bench
@@ -12,6 +12,40 @@ make wakeword-bench WAKE_WORD_MODEL=/absolute/path/to/hey_livekit.onnx
 ```
 
 The command does not install dependencies, download models, record the microphone, play sounds, or change the running app. Supply a local classifier yourself. The official example classifier used during investigation has SHA-256 `8bd634fb7acf1e52d06307fb8f460abf2c7a40e561fb4532fc56e087e0246f62`; it differs from the SDK's smaller test-fixture classifier.
+
+### Deterministic speech tools in CI
+
+Distribution eSpeak NG 1.51 lacks the required `-D` deterministic mode. Both the
+CI test job and manual release test job should provision the same isolated tool
+before running tests (FFmpeg remains a distribution prerequisite):
+
+```yaml
+- name: Prepare deterministic synthetic speech tools
+  run: |
+    scripts/prepare-synthetic-speech-tools.sh "$RUNNER_TEMP/synthetic-speech"
+    echo "$RUNNER_TEMP/synthetic-speech/bin" >> "$GITHUB_PATH"
+```
+
+The script requires existing Bash, CMake, C/C++ compilers, Make, curl, tar and
+GNU coreutils; it installs no system packages. It builds the official
+[1.52.0 commit](https://github.com/espeak-ng/espeak-ng/commit/4870adfa25b1a32b4361592f1be8a40337c58d6c)
+archive with SHA-256
+`cd83f84c4e495f281ac14e919aecf2834306ec1ea1b498de8ef6000f3a0f90de`.
+Official release assets do not include a Linux CLI binary, so this uses the
+upstream CMake build with two jobs, static eSpeak libraries and installed voice
+data. Async, MBROLA, Sonic and sound-device output support are disabled for this
+file-only fixture tool. Upstream 1.52.0 dependency setup attempts a Sonic fetch
+even when disabled; a narrow guard in the temporary source honors that switch.
+CMake FetchContent is also disconnected, so configure/build perform no further
+downloads. The script verifies the version and identical `-D` WAV output from
+two fresh processes. A compatible tool already in the requested prefix is
+verified and reused; an incompatible/nonempty prefix is refused. Use a fresh
+absolute prefix to rebuild. It does not change the caller's PATH itself.
+
+The shared app-bench synthetic audio fixtures use this same tool requirement.
+Tool versions and generated audio fingerprints still belong in benchmark
+provenance; installing this CI tool does not establish equivalence with older
+corpora or other synthesis builds.
 
 The default artifact directory is ignored by Git: `target/wakeword-bench/validated-v1/`. Choose a new directory when changing the model, scorer, generator, or suite:
 

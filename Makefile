@@ -176,6 +176,7 @@ test:
 	$(MAKE) --no-print-directory test-local-runtime-tools
 	$(MAKE) --no-print-directory test-benchmark
 	$(MAKE) --no-print-directory test-app-benchmark
+	$(MAKE) --no-print-directory test-linux-smoke
 	cargo fmt --all -- --check
 	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 	cargo test --locked --workspace
@@ -264,46 +265,12 @@ app: check-linux-tools
 	bun install --frozen-lockfile
 	$(DESKTOP_TAURI) dev -- --locked
 
+.PHONY: test-linux-smoke
+test-linux-smoke:
+	python3 -B scripts/test-linux-smoke.py
+
 app-smoke: linux
-	@set -eu; \
-		app_pid=; \
-		smoke_log='/tmp/vox-golem-app-smoke.'$$$$'.log'; \
-		smoke_config='/tmp/vox-golem-app-smoke-config.'$$$$; \
-		cleanup() { \
-			status="$$1"; \
-			if [ -n "$$app_pid" ] && kill -0 "$$app_pid" 2>/dev/null; then \
-				kill -TERM -- "-$$app_pid" 2>/dev/null || true; \
-				for _ in 1 2 3 4 5; do \
-					kill -0 "$$app_pid" 2>/dev/null || break; \
-					sleep 1; \
-				 done; \
-				kill -KILL -- "-$$app_pid" 2>/dev/null || true; \
-				wait "$$app_pid" 2>/dev/null || true; \
-			fi; \
-			if [ "$$status" -ne 0 ] && [ -f "$$smoke_log" ]; then \
-				printf '%s\n' 'Linux app smoke diagnostics:' >&2; \
-				cat "$$smoke_log" >&2 || true; \
-			fi; \
-			rm -f "$$smoke_config" "$$smoke_log" || true; \
-		}; \
-		trap 'exit 130' INT; trap 'exit 143' TERM; \
-		trap 'status=$$?; cleanup "$$status"; exit "$$status"' EXIT; \
-		setsid env VOXGOLEM_CONFIG_PATH="$$smoke_config" '$(LINUX_RELEASE_DIR)/vox-golem' >"$$smoke_log" 2>&1 & app_pid=$$!; \
-		for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do \
-			sleep 1; \
-			state="$$(ps -o stat= -p "$$app_pid" 2>/dev/null || true)"; \
-			if ! kill -0 "$$app_pid" 2>/dev/null || case "$$state" in Z*) true;; *) false;; esac; then \
-				wait "$$app_pid" || status=$$?; \
-				printf 'Linux app smoke failed: process exited before the 30-second deadline (status %s). Output: %s\n' "$${status:-unknown}" "$$smoke_log" >&2; \
-				exit 1; \
-			fi; \
-			if grep -q 'VOXGOLEM_STARTUP_READY' "$$smoke_log"; then \
-				printf '%s\n' 'Linux app smoke passed: startup-ready marker observed.'; \
-				exit 0; \
-			fi; \
-		done; \
-		printf 'Linux app smoke timed out after 30 seconds: startup-ready marker was not observed. Output: %s\n' "$$smoke_log" >&2; \
-		exit 1
+	@bash scripts/linux-smoke.sh native '$(LINUX_RELEASE_DIR)/vox-golem'
 
 app-dev:
 	bun run dev
@@ -394,35 +361,10 @@ verify-update-bundle:
 update-bundle-smoke: verify-update-bundle
 	@set -eu; \
 		appimage="$$(find '$(LINUX_APPIMAGE_DIR)' -maxdepth 1 -type f -name '*.AppImage')"; \
-		smoke_pid=; smoke_log="/tmp/vox-golem-appimage-smoke.$$$$.log"; smoke_config="$$(mktemp /tmp/vox-golem-appimage-config.XXXXXX)"; \
-		cleanup() { status="$$1"; if [ -n "$$smoke_pid" ] && kill -0 "$$smoke_pid" 2>/dev/null; then kill -TERM -- "-$$smoke_pid" 2>/dev/null || true; sleep 1; kill -KILL -- "-$$smoke_pid" 2>/dev/null || true; wait "$$smoke_pid" 2>/dev/null || true; fi; if [ "$$status" -ne 0 ] && [ -f "$$smoke_log" ]; then cat "$$smoke_log" >&2 || true; fi; rm -f "$$smoke_config" "$$smoke_log" || true; }; \
-		trap 'status=$$?; cleanup "$$status"; exit "$$status"' EXIT; \
-		setsid env VOXGOLEM_CONFIG_PATH="$$smoke_config" "$$appimage" >"$$smoke_log" 2>&1 & smoke_pid=$$!; \
-		bash scripts/wait-for-appimage-startup.sh "$$smoke_pid" "$$smoke_log" 30 5
+		bash scripts/linux-smoke.sh appimage "$$appimage"
 
 packaged-smoke: verify-dist
-	@set -eu; \
-		smoke_pid=; smoke_log="/tmp/vox-golem-packaged-smoke.$$$$.log"; smoke_config="$$(mktemp /tmp/vox-golem-packaged-config.XXXXXX)"; \
-		cleanup() { \
-			status="$$1"; \
-			if [ -n "$$smoke_pid" ] && kill -0 "$$smoke_pid" 2>/dev/null; then \
-				kill -TERM -- "-$$smoke_pid" 2>/dev/null || true; sleep 1; kill -KILL -- "-$$smoke_pid" 2>/dev/null || true; wait "$$smoke_pid" 2>/dev/null || true; \
-			fi; \
-			if [ "$$status" -ne 0 ] && [ -f "$$smoke_log" ]; then \
-				printf '%s\n' 'Packaged Linux smoke diagnostics:' >&2; \
-				cat "$$smoke_log" >&2 || true; \
-			fi; \
-			rm -f "$$smoke_config" "$$smoke_log" || true; \
-		}; \
-		trap 'exit 130' INT; trap 'exit 143' TERM; \
-		trap 'status=$$?; cleanup "$$status"; exit "$$status"' EXIT; \
-		(cd /tmp && setsid env VOXGOLEM_CONFIG_PATH="$$smoke_config" '$(LINUX_STAGED_RELEASE_DIR)/vox-golem') >"$$smoke_log" 2>&1 & smoke_pid=$$!; \
-		for _ in $$(seq 1 30); do \
-			sleep 1; \
-			if grep -q 'VOXGOLEM_STARTUP_READY' "$$smoke_log"; then printf '%s\n' 'Packaged Linux smoke passed: startup-ready marker observed.'; exit 0; fi; \
-			if ! kill -0 "$$smoke_pid" 2>/dev/null; then printf 'Packaged Linux smoke failed; output: %s\n' "$$smoke_log" >&2; exit 1; fi; \
-		done; \
-		printf 'Packaged Linux smoke timed out; output: %s\n' "$$smoke_log" >&2; exit 1
+	@bash scripts/linux-smoke.sh native '$(LINUX_STAGED_RELEASE_DIR)/vox-golem'
 
 .PHONY: check-pc-build-tools
 check-pc-tools: check-pc-build-tools
@@ -496,6 +438,7 @@ pc-dist: pc
 pc-installer: check-pc-tools $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_LIB) $(VC_RUNTIME_DIR)/.complete $(WINDOWS_NSIS_TEMPLATE)
 	@test -n '$(APP_VERSION)' || { printf '%s\n' 'Failed to generate application version.' >&2; exit 1; }
 	@case '$(APP_VERSION)' in *[!0-9A-Za-z.-]*|'') printf 'Invalid APP_VERSION: %s\n' '$(APP_VERSION)' >&2; exit 1;; esac
+	bun install --frozen-lockfile
 	@rm -rf '$(WINDOWS_NSIS_DIR)'
 	@rm -rf '$(CURDIR)/target/tauri-windows-resources'
 	VOXGOLEM_VC_RUNTIME_DIR='$(VC_RUNTIME_DIR)' bash scripts/prepare-tauri-windows-resources.sh --prepare

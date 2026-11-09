@@ -68,7 +68,9 @@ passed on the current source.
 ## Prerequisites
 
 - Existing Linux app build prerequisites. Only the voice profile additionally
-  requires local wake/VAD/Parakeet assets and `espeak-ng`/`ffmpeg` fixtures.
+  requires local wake/VAD/Parakeet assets and eSpeak NG 1.52.0+ / FFmpeg fixtures.
+  See [deterministic speech tool setup](../wakeword-bench/README.md#deterministic-speech-tools-in-ci)
+  for the shared isolated CI prerequisite; eSpeak NG 1.51 cannot generate these fixtures.
 - `bwrap` with a private network namespace and working loopback.
 - `dbus-run-session` and `gdbus` for an owned GUI session, plus the existing
   accessibility runtime. The controller creates a private runtime directory and

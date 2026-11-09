@@ -20,8 +20,12 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt, clippy
       - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev libxdo-dev cmake ninja-build clang lld llvm pkg-config jq p7zip-full espeak-ng ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev libxdo-dev cmake ninja-build clang lld llvm pkg-config jq p7zip-full espeak-ng ffmpeg xvfb
       - run: cargo install tauri-cli --version 2.11.1 --locked
+      - name: Prepare deterministic synthetic speech tools
+        run: |
+          scripts/prepare-synthetic-speech-tools.sh "$RUNNER_TEMP/synthetic-speech"
+          printf '%s/bin\n' "$RUNNER_TEMP/synthetic-speech" >> "$GITHUB_PATH"
       - run: make test
 
   android-artifact:
@@ -44,9 +48,27 @@ jobs:
           sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           test -x "$sdkmanager"
           "$sdkmanager" 'platforms;android-36' 'platforms;android-37.0' 'build-tools;36.0.0' 'ndk;28.2.13676358'
-          printf 'NDK_HOME=%s/ndk/28.2.13676358\n' "$ANDROID_HOME" >> "$GITHUB_ENV"
+          # Tauri CLI 2.11.1 replaces NDK_HOME with the last sorted SDK ndk entry.
+          # Expose only the project NDK without removing runner-installed packages.
+          pinned_sdk="$RUNNER_TEMP/voxgolem-android-sdk"
+          mkdir -p "$pinned_sdk/ndk"
+          for entry in "$ANDROID_HOME"/*; do
+            if [ "$(basename "$entry")" != ndk ]; then
+              ln -s "$entry" "$pinned_sdk/"
+            fi
+          done
+          ln -s "$ANDROID_HOME/ndk/28.2.13676358" "$pinned_sdk/ndk/28.2.13676358"
+          test -x "$pinned_sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          printf 'ANDROID_HOME=%s\nANDROID_SDK_ROOT=%s\nNDK_HOME=%s/ndk/28.2.13676358\n' \
+            "$pinned_sdk" "$pinned_sdk" "$pinned_sdk" >> "$GITHUB_ENV"
           cargo install tauri-cli --version 2.11.1 --locked
           bun install --frozen-lockfile
+      - name: Fetch locked Rust dependencies for offline JNI builds
+        run: |
+          host_target="$(rustc -vV | sed -n 's/^host: //p')"
+          test -n "$host_target"
+          cargo fetch --locked --target "$host_target" \
+            --target aarch64-linux-android --target armv7-linux-androideabi
       - name: Build the ARM64 debug app
         run: make android-build
       - name: Check SDK-only voice without JNI tasks
@@ -161,9 +183,9 @@ jobs:
       - name: Stage the versioned Linux binary
         run: make stage-linux-existing
       - name: Smoke test staged package
-        run: xvfb-run -a make packaged-smoke
+        run: make packaged-smoke
       - name: Smoke test updater AppImage
-        run: xvfb-run -a make update-bundle-smoke
+        run: make update-bundle-smoke
       - name: Archive Linux artifacts with executable modes
         env:
           APP_VERSION: ${{ steps.app_version.outputs.version }}
