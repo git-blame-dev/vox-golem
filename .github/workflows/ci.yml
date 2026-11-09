@@ -33,6 +33,9 @@ jobs:
   android-artifact:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    env:
+      # One SDK preference/signing location for phone and Wear throughout this job.
+      ANDROID_USER_HOME: ${{ runner.temp }}/voxgolem-android-user
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
@@ -44,6 +47,7 @@ jobs:
           targets: aarch64-linux-android,armv7-linux-androideabi
       - name: Configure the pinned Android build tools
         run: |
+          mkdir -p "$ANDROID_USER_HOME"
           test -x "$JAVA_HOME_21_X64/bin/java"
           printf 'JAVA_HOME=%s\n' "$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
           printf '%s/bin\n' "$JAVA_HOME_21_X64" >> "$GITHUB_PATH"
@@ -71,6 +75,8 @@ jobs:
           test -n "$host_target"
           cargo fetch --locked --target "$host_target" \
             --target aarch64-linux-android --target armv7-linux-androideabi
+      - name: Check Android CI signing preconditions
+        run: bash scripts/test-android-signing-workflow.sh
       - name: Build the ARM64 debug app
         run: make android-build
       - name: Check SDK-only voice without JNI tasks
@@ -88,14 +94,23 @@ jobs:
           build=apps/android-tauri/src-tauri/gen/android/app/build
           tools="$ANDROID_HOME/build-tools/36.0.0"
           apk=android-optimized-ci/vox-golem-android-optimized-ci-arm64.apk
-          test -s "$build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
-          test -s "$build/outputs/mapping/universalRelease/mapping.txt"
-          test -f "$HOME/.android/debug.keystore"
+          test -s "$build/outputs/apk/universal/release/app-universal-release-unsigned.apk" || {
+            printf '%s\n' '::error::Android CI signing precondition missing: apk' >&2
+            exit 1
+          }
+          test -s "$build/outputs/mapping/universalRelease/mapping.txt" || {
+            printf '%s\n' '::error::Android CI signing precondition missing: mapping' >&2
+            exit 1
+          }
+          test -f "$ANDROID_USER_HOME/debug.keystore" || {
+            printf '%s\n' '::error::Android CI signing precondition missing: keystore' >&2
+            exit 1
+          }
           mkdir android-optimized-ci
           "$tools/zipalign" -P 16 -f 4 \
             "$build/outputs/apk/universal/release/app-universal-release-unsigned.apk" \
             android-optimized-ci/aligned.apk
-          "$tools/apksigner" sign --ks "$HOME/.android/debug.keystore" \
+          "$tools/apksigner" sign --ks "$ANDROID_USER_HOME/debug.keystore" \
             --ks-key-alias androiddebugkey --ks-pass pass:android --key-pass pass:android \
             --out "$apk" android-optimized-ci/aligned.apk
           rm android-optimized-ci/aligned.apk
