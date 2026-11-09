@@ -38,7 +38,7 @@ export function parseWakeDiagnosticsSnapshot(value: unknown): WakeDiagnosticsSna
   return {
     schema_version: 1,
     enabled: value['enabled'],
-    model: (value['model'] as string).slice(0, 200),
+    model: value['model'] === 'hey_livekit' ? 'hey_livekit' : 'custom_or_unknown',
     feature_profile: 'normalized_f32',
     threshold: value['threshold'],
     sample_rate_hz: value['sample_rate_hz'],

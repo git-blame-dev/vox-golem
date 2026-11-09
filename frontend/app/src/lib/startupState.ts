@@ -125,16 +125,14 @@ export async function loadStartupState(): Promise<StartupState> {
   try {
     const payload = await invokeTauriCommand('get_startup_state')
     return parseStartupState(payload)
-  } catch (error) {
+  } catch {
     console.error('[startup] failed to load startup state', {
-      error,
       hasInjectedTauriInternals: hasInjectedTauriInternals(),
     })
 
-    const message = error instanceof Error ? error.message : 'Failed to load startup state'
     return {
       kind: 'error',
-      message,
+      message: 'Startup state is unavailable. Please restart VoxGolem.',
     }
   }
 }

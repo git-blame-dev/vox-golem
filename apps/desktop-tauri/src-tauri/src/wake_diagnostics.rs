@@ -5,7 +5,6 @@ use std::time::Instant;
 const SCHEMA_VERSION: u8 = 1;
 const HISTORY_MS: u64 = 30_000;
 const MAX_EVENTS: usize = 512;
-const MODEL_NAME_MAX_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,7 +104,7 @@ impl WakeDiagnostics {
         hop_samples: usize,
     ) -> Self {
         Self {
-            model: bounded_model_name(model),
+            model: public_model_category(model),
             threshold,
             sample_rate_hz,
             window_samples,
@@ -259,20 +258,11 @@ impl WakeDiagnosticEvent {
     }
 }
 
-fn bounded_model_name(model: &str) -> String {
-    let basename = model.rsplit(['/', '\\']).next().unwrap_or_default();
-    let stem = basename.rsplit_once('.').map_or(basename, |(stem, _)| stem);
-    stem.chars()
-        .scan(0, |bytes, character| {
-            let next = *bytes + character.len_utf8();
-            if next > MODEL_NAME_MAX_BYTES {
-                None
-            } else {
-                *bytes = next;
-                Some(character)
-            }
-        })
-        .collect()
+fn public_model_category(model: &str) -> String {
+    match model.rsplit(['/', '\\']).next().unwrap_or_default() {
+        "hey_livekit" | "hey_livekit.onnx" => String::from("hey_livekit"),
+        _ => String::from("custom_or_unknown"),
+    }
 }
 
 pub(crate) fn signal_metrics(samples: &[f32]) -> (Option<f32>, f32, f32) {
@@ -310,6 +300,35 @@ mod tests {
             32_000,
             1_280,
         )
+    }
+
+    #[test]
+    fn privacy_model_export_only_retains_allowlisted_public_ids() {
+        for (path, expected) in [
+            (
+                "/synthetic/SYNTHETIC_PRIVATE_MODEL.onnx",
+                "custom_or_unknown",
+            ),
+            (
+                r"C:\synthetic\SYNTHETIC_PRIVATE_MODEL.onnx",
+                "custom_or_unknown",
+            ),
+            ("/synthetic/私人 🧪.onnx", "custom_or_unknown"),
+            ("", "custom_or_unknown"),
+            ("hey_livekit.onnx.backup", "custom_or_unknown"),
+            ("/synthetic/hey_livekit.onnx", "hey_livekit"),
+            (r"C:\synthetic\hey_livekit.onnx", "hey_livekit"),
+            ("hey_livekit", "hey_livekit"),
+        ] {
+            let mut diagnostics = WakeDiagnostics::new(path, 0.68, 16_000, 32_000, 1_280);
+            diagnostics.set_enabled(true, 0);
+            let snapshot = diagnostics.mark(WakeDiagnosticMarker::WakeAttempt, 40);
+            let json = serde_json::to_value(snapshot).unwrap();
+            assert_eq!(json["model"], expected);
+            assert!(!json.to_string().contains("SYNTHETIC_PRIVATE_MODEL"));
+            assert_eq!(json["threshold"], serde_json::json!(0.68_f32));
+            assert_eq!(json["events"][0]["marker"], "wake_attempt");
+        }
     }
 
     #[test]

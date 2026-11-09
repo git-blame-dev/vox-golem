@@ -188,7 +188,7 @@ export function WakeDiagnostics({ disabled = false }: WakeDiagnosticsProps): JSX
   return (
     <Disclosure title="Wake diagnostics" className="wake-diagnostics" onToggle={(event) => { if (event.currentTarget.open) setError(null) }}>
       <div className="wake-diagnostics__body">
-        <p>This diagnostics panel keeps numeric data only and does not upload audio. Wake clips may separately save local audio on detection; manage them in Settings. Keep this panel open during the test and export the marked snapshot before closing; snapshots are session-local.</p>
+        <p>This diagnostics panel keeps numeric measurements and categorical metadata (including a public model ID or custom/unknown category) and does not upload audio. Wake clips may separately save local audio on detection; manage them in Settings. Keep this panel open during the test and export the marked snapshot before closing; snapshots are session-local.</p>
         <div className="wake-diagnostics__actions">
           {collecting
             ? <Button type="button" className="ui-button--utility" disabled={pending} onClick={() => void stop()}>Stop collection</Button>

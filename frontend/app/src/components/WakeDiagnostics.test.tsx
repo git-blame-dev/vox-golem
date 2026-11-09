@@ -21,6 +21,8 @@ describe('WakeDiagnostics', () => {
     const container = await render()
     expect(container.textContent).toContain('Wake clips may separately save local audio')
     expect(container.textContent).not.toContain('no audio is saved')
+    expect(container.textContent).toContain('numeric measurements and categorical metadata')
+    expect(container.textContent).not.toContain('numeric data only')
   })
   it('does not invoke diagnostics until the panel is opened and collection is started', async () => {
     vi.useFakeTimers()
@@ -64,6 +66,26 @@ describe('WakeDiagnostics', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
     expect(invoke.mock.calls.filter(([command]) => command === 'get_wake_diagnostics')).toHaveLength(polls)
     vi.useRealTimers()
+  })
+
+  it.each(['SYNTHETIC_PRIVATE_MODEL', '/synthetic/SYNTHETIC_PRIVATE_MODEL.onnx', 'C:\\synthetic\\SYNTHETIC_PRIVATE_MODEL.onnx', '私人 🧪', '', 'hey_livekit', 'custom_or_unknown'])('categorizes model %s in rendered and downloadable diagnostics', async (model) => {
+    const created: Blob[] = []
+    vi.spyOn(URL, 'createObjectURL').mockImplementation((value) => {
+      if (value instanceof Blob) created.push(value)
+      return 'blob:diagnostics'
+    })
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    installTauri(async () => diagnosticSnapshot({ enabled: true, model, events: [scoreEvent()] }))
+    const container = await render()
+    await click(container, 'Wake diagnostics')
+    await click(container, 'Start collection')
+    const expected = model === 'hey_livekit' ? model : 'custom_or_unknown'
+    await click(container, 'Export current snapshot')
+    const exported = JSON.parse(await created[0]!.text()) as Record<string, unknown>
+    expect(exported['model']).toBe(expected)
+    expect(container.querySelector('dd')?.textContent).toBe(expected)
+    expect(JSON.stringify(exported)).not.toContain('SYNTHETIC_PRIVATE_MODEL')
+    expect(exported['events']).toEqual([scoreEvent()])
   })
 
   it('exports an immutable marked snapshot rather than later live poll updates', async () => {

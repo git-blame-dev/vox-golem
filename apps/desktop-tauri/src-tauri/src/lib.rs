@@ -11524,8 +11524,8 @@ fn serialize_persisted_state(state: &PersistedState) -> Result<String, String> {
 }
 
 fn parse_persisted_state(contents: &str) -> Result<PersistedState, String> {
-    let wire: PersistedStateWire =
-        toml::from_str(contents).map_err(|error| format!("invalid state.toml: {error}"))?;
+    let wire: PersistedStateWire = toml::from_str(contents)
+        .map_err(|_| String::from("invalid state.toml: invalid TOML or state schema"))?;
     let assistant_settings = match (
         wire.assistant_instant,
         wire.assistant_deep,
@@ -12625,8 +12625,8 @@ fn start_voice_runtime_initialization_with<FWake, FParakeet, FVad, Spawn>(
                             },
                         );
                     }
-                    Err(error) => {
-                        eprintln!("failed to initialize wake word detector: {error}");
+                    Err(_) => {
+                        eprintln!("wake word runtime failed to initialize");
                         update_startup_voice_capability(
                             &startup_state,
                             &wake_slot,
@@ -12688,8 +12688,8 @@ fn start_voice_runtime_initialization_with<FWake, FParakeet, FVad, Spawn>(
                             },
                         );
                     }
-                    Err(error) => {
-                        eprintln!("{error}");
+                    Err(_) => {
+                        eprintln!("Parakeet runtime failed to initialize");
                         update_startup_voice_capability(
                             &startup_state,
                             &wake_slot,
@@ -12751,8 +12751,8 @@ fn start_voice_runtime_initialization_with<FWake, FParakeet, FVad, Spawn>(
                             },
                         );
                     }
-                    Err(error) => {
-                        eprintln!("{error}");
+                    Err(_) => {
+                        eprintln!("VAD runtime failed to initialize");
                         update_startup_voice_capability(
                             &startup_state,
                             &wake_slot,
@@ -12779,12 +12779,12 @@ fn start_voice_runtime_initialization(state: &AppState) {
         |path| {
             transcription::ParakeetRuntime::load(path)
                 .map(ParakeetRuntimeSlotValue::Real)
-                .map_err(|error| format!("failed to initialize parakeet transcriber: {error:?}"))
+                .map_err(|_| String::from("Parakeet runtime failed to initialize"))
         },
         |path| {
             voice_activity::VoiceActivityRuntime::load(path)
                 .map(VoiceActivityRuntimeSlotValue::Real)
-                .map_err(|error| format!("failed to initialize voice activity detector: {error:?}"))
+                .map_err(|_| String::from("VAD runtime failed to initialize"))
         },
         |job| {
             let _ = spawn_runtime_worker(job);
@@ -13571,13 +13571,18 @@ fn build_nonfatal_config_error_app_state(
 }
 
 fn load_llama_cpp_system_prompt() -> Result<String, String> {
-    let soul_path = application_config_path()?.with_file_name(WINDOWS_SOUL_FILE_NAME);
-    let contents = fs::read_to_string(&soul_path)
-        .map_err(|error| format!("{}: {error}", soul_path.display()))?;
+    let soul_path = application_config_path()
+        .map_err(|_| String::from("could not resolve the application configuration directory"))?
+        .with_file_name(WINDOWS_SOUL_FILE_NAME);
+    let contents = fs::read_to_string(&soul_path).map_err(|_| {
+        String::from("could not read SOUL.md; create a readable UTF-8 SOUL.md beside config.toml")
+    })?;
     let trimmed = contents.trim();
 
     if trimmed.is_empty() {
-        return Err(format!("{} is empty", soul_path.display()));
+        return Err(String::from(
+            "SOUL.md is empty; add a system prompt beside config.toml",
+        ));
     }
 
     Ok(format!(
@@ -15917,6 +15922,57 @@ mod tests {
             .tts_audio_playback
             .reserve(voxgolem_audio::playback::PlaybackPurpose::Cue)
             .is_ok());
+    }
+
+    #[test]
+    fn startup_config_failure_does_not_publish_private_parser_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let _storage_root = super::test_storage::ScopedRoot::new(directory.path().to_path_buf());
+        let path = directory.path().join("synthetic-private-config-path.toml");
+        std::fs::write(&path, "web_enabled = \"synthetic-private-source\"").unwrap();
+        let error = voxgolem_core::config::load_runtime_config(Some(&path)).unwrap_err();
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            error.to_string(),
+        );
+        let startup = state.startup_state.lock().unwrap();
+        let super::StartupStatePayload::Ready {
+            voice_input_available,
+            voice_input_error,
+            capabilities,
+            ..
+        } = &*startup
+        else {
+            panic!("config failure should leave the shell usable");
+        };
+        assert!(!voice_input_available);
+        assert!(voice_input_error
+            .as_ref()
+            .unwrap()
+            .contains("failed to parse config file"));
+        let published = serde_json::to_string(&*startup).unwrap();
+        assert!(!published.contains("synthetic-private"));
+        assert!(!published.contains(&directory.path().display().to_string()));
+        assert!(!capabilities.is_empty());
+    }
+
+    #[test]
+    fn persisted_state_parser_errors_do_not_expose_private_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synthetic-private-state-path.toml");
+        let store = super::state_store::StateStore::new(path.clone());
+        for contents in [
+            "synthetic_private_key = \"synthetic-private-source\"\n[",
+            "web_enabled = \"synthetic-private-source\"",
+            "synthetic_private_source_key = true",
+            "selected_response_profile = \"synthetic-private-source\"",
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            let error = super::parse_persisted_state(contents).unwrap_err();
+            assert_eq!(error, "invalid state.toml: invalid TOML or state schema");
+            assert_eq!(store.load().unwrap_err(), error);
+        }
     }
 
     #[test]
@@ -20079,6 +20135,127 @@ mod tests {
             capability["permissions"],
             serde_json::json!(["core:event:allow-listen", "core:event:allow-unlisten"])
         );
+    }
+
+    #[test]
+    fn privacy_soul_failures_publish_categorical_startup_payloads() {
+        let root = tempfile::Builder::new()
+            .prefix("SYNTHETIC_PRIVATE_SOUL_")
+            .tempdir()
+            .unwrap();
+        let _scope = super::test_storage::ScopedRoot::new(root.path().to_path_buf());
+        let soul = super::test_storage::configuration_path().with_file_name("SOUL.md");
+        std::fs::create_dir_all(soul.parent().unwrap()).unwrap();
+        for (case, expected) in [
+            (
+                "missing",
+                "could not read SOUL.md; create a readable UTF-8 SOUL.md beside config.toml",
+            ),
+            (
+                "empty",
+                "SOUL.md is empty; add a system prompt beside config.toml",
+            ),
+            (
+                "invalid_utf8",
+                "could not read SOUL.md; create a readable UTF-8 SOUL.md beside config.toml",
+            ),
+            (
+                "directory",
+                "could not read SOUL.md; create a readable UTF-8 SOUL.md beside config.toml",
+            ),
+        ] {
+            match case {
+                "empty" => std::fs::write(&soul, " \n\t").unwrap(),
+                "invalid_utf8" => std::fs::write(&soul, [0xff]).unwrap(),
+                "directory" => {
+                    std::fs::remove_file(&soul).unwrap();
+                    std::fs::create_dir(&soul).unwrap();
+                }
+                _ => {}
+            }
+            let error = load_llama_cpp_system_prompt().unwrap_err();
+            let state = build_startup_error_app_state(
+                default_voice_pipeline_config(),
+                format!("failed to load SOUL.md: {error}"),
+            );
+            let payload = serde_json::to_value(&*state.startup_state.lock().unwrap()).unwrap();
+            assert!(
+                !payload.to_string().contains("SYNTHETIC_PRIVATE_SOUL_"),
+                "{case}: {payload}"
+            );
+            assert_eq!(payload["kind"], "error");
+            assert_eq!(
+                payload["message"],
+                format!("failed to load SOUL.md: {expected}")
+            );
+        }
+    }
+
+    #[test]
+    fn privacy_voice_loader_stderr_and_payloads_exclude_private_details() {
+        const CHILD: &str = "VOXGOLEM_SYNTHETIC_PRIVACY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::privacy_voice_loader_stderr_and_payloads_exclude_private_details",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(!stderr.contains("SYNTHETIC_PRIVATE_LOADER"), "{stderr}");
+            assert_eq!(
+                stderr,
+                concat!(
+                    "wake word runtime failed to initialize\n",
+                    "Parakeet runtime failed to initialize\n",
+                    "VAD runtime failed to initialize\n",
+                )
+            );
+            return;
+        }
+        let root = tempfile::Builder::new()
+            .prefix("SYNTHETIC_PRIVATE_LOADER_")
+            .tempdir()
+            .unwrap();
+        let _scope = super::test_storage::ScopedRoot::new(root.path().to_path_buf());
+        let state = configured_voice_test_state(root.path());
+        let mut jobs = Vec::new();
+        super::start_voice_runtime_initialization_with(
+            &state,
+            |_, _| {
+                Err(String::from(
+                    "/synthetic/SYNTHETIC_PRIVATE_LOADER/wake.onnx: synthetic failure",
+                ))
+            },
+            |_| {
+                Err(String::from(
+                    "C:\\synthetic\\SYNTHETIC_PRIVATE_LOADER: synthetic failure",
+                ))
+            },
+            |path| {
+                std::fs::remove_file(path).unwrap();
+                super::voice_activity::VoiceActivityRuntime::load(path)
+                    .map(super::VoiceActivityRuntimeSlotValue::Real)
+                    .map_err(|error| format!("{error:?}"))
+            },
+            |job| jobs.push(job),
+        );
+        assert_eq!(jobs.len(), 3);
+        for job in jobs {
+            job();
+        }
+        let payload = serde_json::to_string(&*state.startup_state.lock().unwrap()).unwrap();
+        assert!(!payload.contains("SYNTHETIC_PRIVATE_LOADER"));
+        assert!(super::ensure_voice_input_ready(&state).is_err());
+        assert!(state.wake_word_runtime().is_none());
     }
 
     #[test]

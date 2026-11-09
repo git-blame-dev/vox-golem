@@ -472,6 +472,15 @@ describe('isStartupStateSettled', () => {
 })
 
 describe('loadStartupState', () => {
+  it.each([
+    'failed to load SOUL.md: could not read SOUL.md; create a readable UTF-8 SOUL.md beside config.toml',
+    'failed to load SOUL.md: SOUL.md is empty; add a system prompt beside config.toml',
+  ])('preserves categorical SOUL guidance from successful native IPC: %s', async (message) => {
+    window.__TAURI_INTERNALS__ = { invoke: vi.fn().mockResolvedValue({ kind: 'error', message }) }
+    await expect(loadStartupState()).resolves.toEqual({ kind: 'error', message })
+    expect(window.__TAURI_INTERNALS__.invoke).toHaveBeenCalledWith('get_startup_state', undefined)
+  })
+
   it('loads truthful browser preview capabilities through the shared adapter', async () => {
     await expect(loadStartupState()).resolves.toEqual(expect.objectContaining({
       kind: 'ready',
@@ -537,20 +546,28 @@ describe('loadStartupState', () => {
 
     await expect(loadStartupState()).resolves.toEqual({
       kind: 'error',
-      message: 'preview startup failed',
+      message: 'Startup state is unavailable. Please restart VoxGolem.',
     })
   })
 
-  it('surfaces invoke failures as startup errors', async () => {
+  it('reports invoke failures without exposing private error details', async () => {
+    const sentinel = 'SYNTHETIC_PRIVATE_STARTUP_DETAIL'
+    const privatePath = '/synthetic-private/config.toml'
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {})
     window.__TAURI_INTERNALS__ = {
       invoke: async () => {
-        throw new Error('startup command failed')
+        throw new Error(`${sentinel} at ${privatePath}`)
       },
     }
 
     await expect(loadStartupState()).resolves.toEqual({
       kind: 'error',
-      message: 'startup command failed',
+      message: 'Startup state is unavailable. Please restart VoxGolem.',
     })
+    expect(logged).toHaveBeenCalledWith('[startup] failed to load startup state', {
+      hasInjectedTauriInternals: true,
+    })
+    expect(JSON.stringify(logged.mock.calls)).not.toContain(sentinel)
+    expect(JSON.stringify(logged.mock.calls)).not.toContain(privatePath)
   })
 })

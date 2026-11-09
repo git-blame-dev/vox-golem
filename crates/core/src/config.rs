@@ -231,22 +231,26 @@ struct RawTtsConfigInput {
     sample_rate_hz: Option<serde::de::IgnoredAny>,
 }
 
+const TTS_PIPER_MIGRATION_ERROR: &str = "tts.provider = \"piper\" is no longer supported; install the Neural TTS service separately, configure tts.endpoint/voice, and remove provider and Piper tuning keys";
+const TTS_PROVIDER_MIGRATION_ERROR: &str =
+    "tts.provider is obsolete; only legacy \"neural\" input is accepted";
+const TTS_TUNING_MIGRATION_ERROR: &str = "Piper tuning keys are obsolete; configure the Neural TTS service and remove model_path, worker_count, max_queue and sample_rate_hz from [tts]";
+
 impl TryFrom<RawTtsConfigInput> for RawTtsConfig {
     type Error = &'static str;
 
     fn try_from(input: RawTtsConfigInput) -> Result<Self, Self::Error> {
         match input.provider.as_deref() {
-            Some("piper") => return Err(
-                "tts.provider = \"piper\" is no longer supported; install the Neural TTS service separately, configure tts.endpoint/voice, and remove provider and Piper tuning keys",
-            ),
+            Some("piper") => return Err(TTS_PIPER_MIGRATION_ERROR),
             Some("neural") => {}
-            Some(_) => return Err("tts.provider is obsolete; only legacy \"neural\" input is accepted"),
+            Some(_) => return Err(TTS_PROVIDER_MIGRATION_ERROR),
             None if input.model_path.is_some()
                 || input.worker_count.is_some()
                 || input.max_queue.is_some()
-                || input.sample_rate_hz.is_some() => return Err(
-                "Piper tuning keys are obsolete; configure the Neural TTS service and remove model_path, worker_count, max_queue and sample_rate_hz from [tts]",
-            ),
+                || input.sample_rate_hz.is_some() =>
+            {
+                return Err(TTS_TUNING_MIGRATION_ERROR)
+            }
             None => {}
         }
         Ok(Self {
@@ -433,7 +437,7 @@ pub enum ResponseBackendConfig {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ConfigError {
     MissingAppData,
     ReadConfigFailed { path: PathBuf, details: String },
@@ -446,21 +450,20 @@ impl Display for ConfigError {
             Self::MissingAppData => {
                 write!(formatter, "home directory is unavailable")
             }
-            Self::ReadConfigFailed { path, details } => {
-                write!(
-                    formatter,
-                    "failed to read config file {}: {details}",
-                    path.display()
-                )
+            Self::ReadConfigFailed { details, .. } => {
+                write!(formatter, "failed to read config file: {details}")
             }
-            Self::ParseConfigFailed { path, details } => {
-                write!(
-                    formatter,
-                    "failed to parse config file {}: {details}",
-                    path.display()
-                )
+            Self::ParseConfigFailed { details, .. } => {
+                write!(formatter, "failed to parse config file: {details}")
             }
         }
+    }
+}
+
+// Paths are retained for programmatic inspection, never diagnostic rendering.
+impl std::fmt::Debug for ConfigError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(self, formatter)
     }
 }
 
@@ -598,13 +601,13 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return Ok(default_runtime_config(
                 &config_dir,
-                Some(format!("config file not found: {}", config_path.display())),
+                Some(String::from("config file not found")),
             ));
         }
         Err(error) => {
             return Err(ConfigError::ReadConfigFailed {
                 path: config_path,
-                details: error.to_string(),
+                details: format!("{:?}", error.kind()),
             });
         }
     };
@@ -612,7 +615,15 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
     let raw_config = toml::from_str::<RawConfig>(&config_contents).map_err(|error| {
         ConfigError::ParseConfigFailed {
             path: config_path.clone(),
-            details: error.to_string(),
+            // TOML diagnostics include source excerpts, values and arbitrary key names.
+            // Preserve only our exact, fixed migration guidance.
+            details: match error.message() {
+                TTS_PIPER_MIGRATION_ERROR => TTS_PIPER_MIGRATION_ERROR,
+                TTS_PROVIDER_MIGRATION_ERROR => TTS_PROVIDER_MIGRATION_ERROR,
+                TTS_TUNING_MIGRATION_ERROR => TTS_TUNING_MIGRATION_ERROR,
+                _ => "invalid TOML or configuration schema",
+            }
+            .to_owned(),
         }
     })?;
 
@@ -626,19 +637,16 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
             details: String::from("opencode.path is required for native runtime"),
         });
     }
-    if let Some(path) = raw_config
+    if raw_config
         .opencode
         .as_ref()
         .filter(|raw| raw.runtime == OpencodeRuntime::Wsl)
         .and_then(|raw| raw.path.as_ref())
-        .filter(|path| !is_absolute_linux_path(path))
+        .is_some_and(|path| !is_absolute_linux_path(path))
     {
         return Err(ConfigError::ParseConfigFailed {
             path: config_path.clone(),
-            details: format!(
-                "opencode.path must be an absolute Linux path for WSL runtime: {}",
-                path.display()
-            ),
+            details: String::from("opencode.path must be an absolute Linux path for WSL runtime"),
         });
     }
     let wake_word_configured = raw_config.wake_word_model_path.is_some();
@@ -707,21 +715,18 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         "wake_word",
         wake_word_configured,
         wake_word_model_path.is_file(),
-        &wake_word_model_path,
     );
     record_path_issue(
         &mut capability_issues,
         "parakeet",
         parakeet_configured,
         parakeet_model_dir.is_dir(),
-        &parakeet_model_dir,
     );
     record_path_issue(
         &mut capability_issues,
         "vad",
         vad_configured,
         silero_vad_model.is_file(),
-        &silero_vad_model,
     );
 
     let local_tts = match raw_config.tts {
@@ -845,13 +850,9 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
                 });
             }
             OpencodeRuntime::Wsl => {}
-            OpencodeRuntime::Native => record_path_issue(
-                &mut capability_issues,
-                "opencode",
-                true,
-                path.is_file(),
-                &path,
-            ),
+            OpencodeRuntime::Native => {
+                record_path_issue(&mut capability_issues, "opencode", true, path.is_file())
+            }
         }
         OpencodeConfig {
             path,
@@ -871,24 +872,13 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
             "local_fast",
             true,
             server_path.is_file() && fast_model_path.is_file(),
-            if !server_path.is_file() {
-                &server_path
-            } else {
-                &fast_model_path
-            },
         );
         if let Some(path) = quality_model_path.as_ref() {
-            let unavailable_path = if !server_path.is_file() {
-                &server_path
-            } else {
-                path
-            };
             record_path_issue(
                 &mut capability_issues,
                 "local_quality",
                 true,
                 server_path.is_file() && path.is_file(),
-                unavailable_path,
             );
         }
         LlamaCppConfig {
@@ -928,11 +918,6 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
             "qwen_prediction",
             true,
             server_path.is_file() && model_path.is_file(),
-            if !server_path.is_file() {
-                &server_path
-            } else {
-                &model_path
-            },
         );
         CompletionConfig {
             server_path,
@@ -1101,7 +1086,6 @@ fn record_path_issue(
     capability: &'static str,
     configured: bool,
     available: bool,
-    path: &Path,
 ) {
     if available {
         return;
@@ -1109,7 +1093,7 @@ fn record_path_issue(
     issues.push(CapabilityConfigIssue {
         capability,
         reason: if configured {
-            format!("configured asset is unavailable: {}", path.display())
+            String::from("configured asset is unavailable")
         } else {
             String::from("not configured")
         },
@@ -1743,9 +1727,12 @@ mod tests {
         assert_eq!(config.initial_silence_timeout_ms, 2_500);
         assert_eq!(config.silence_timeout_ms, 750);
         assert!(config.capability_issues.iter().any(|issue| {
-            issue.capability == "config"
-                && issue.reason.contains(&missing_path.display().to_string())
+            issue.capability == "config" && issue.reason == "config file not found"
         }));
+        assert!(config
+            .capability_issues
+            .iter()
+            .all(|issue| !issue.reason.contains(&temp.path().display().to_string())));
     }
 
     #[test]
@@ -1860,6 +1847,42 @@ mod tests {
     }
 
     #[test]
+    fn config_failures_do_not_expose_private_paths_or_source() {
+        let temp = TempDir::new();
+        let path = temp.path().join("synthetic-private-config-path.toml");
+        for contents in [
+            "synthetic_private_key = \"synthetic-private-source\"\n[",
+            "web_enabled = \"synthetic-private-source\"",
+            "synthetic_private_source_key = true",
+            "[opencode]\nruntime = \"synthetic-private-source\"",
+            "[tts]\nprovider = \"synthetic-private-source\"",
+            "[tts]\nprovider = \"neural\"\nsynthetic_private_source_key = true",
+            "[opencode]\nruntime = \"wsl\"\npath = \"synthetic-private-source/opencode\"",
+        ] {
+            fs::write(&path, contents).unwrap();
+            let error = load_runtime_config(Some(&path)).unwrap_err();
+            assert!(matches!(error, ConfigError::ParseConfigFailed { .. }));
+            for rendered in [error.to_string(), format!("{error:?}")] {
+                assert!(rendered.contains("failed to parse config file"));
+                assert!(!rendered.contains("synthetic-private"));
+                assert!(!rendered.contains("synthetic_private"));
+                assert!(!rendered.contains(&temp.path().display().to_string()));
+            }
+        }
+
+        fs::write(&path, [0xff]).unwrap();
+        let error = load_runtime_config(Some(&path)).unwrap_err();
+        assert!(matches!(error, ConfigError::ReadConfigFailed { .. }));
+        assert!(error.to_string().contains("failed to read config file"));
+        assert!(!error.to_string().contains("synthetic-private"));
+        assert!(!format!("{error:?}").contains("synthetic-private"));
+        assert_eq!(
+            ConfigError::MissingAppData.to_string(),
+            "home directory is unavailable"
+        );
+    }
+
+    #[test]
     fn reports_unavailable_configured_wake_word_model_file() {
         let temp = TempDir::new();
         let model_dir = temp.path().join("models");
@@ -1887,11 +1910,12 @@ mod tests {
 
         let config = result.expect("missing wake word asset must not block other capabilities");
         assert!(config.capability_issues.iter().any(|issue| {
-            issue.capability == "wake_word"
-                && issue
-                    .reason
-                    .contains(&missing_wake_word_model_path.display().to_string())
+            issue.capability == "wake_word" && issue.reason == "configured asset is unavailable"
         }));
+        assert!(config
+            .capability_issues
+            .iter()
+            .all(|issue| !issue.reason.contains(&temp.path().display().to_string())));
     }
 
     #[test]
@@ -2158,11 +2182,12 @@ mod tests {
 
         let config = result.expect("missing VAD asset must not block other capabilities");
         assert!(config.capability_issues.iter().any(|issue| {
-            issue.capability == "vad"
-                && issue
-                    .reason
-                    .contains(&missing_silero_vad_model.display().to_string())
+            issue.capability == "vad" && issue.reason == "configured asset is unavailable"
         }));
+        assert!(config
+            .capability_issues
+            .iter()
+            .all(|issue| !issue.reason.contains(&temp.path().display().to_string())));
     }
 
     #[test]
@@ -2563,9 +2588,12 @@ sample_rate_hz = 0
         let config = load_runtime_config(Some(&config_path)).expect("config should load");
 
         assert!(config.capability_issues.iter().any(|issue| {
-            issue.capability == "local_quality"
-                && issue.reason.contains(&missing_server.display().to_string())
+            issue.capability == "local_quality" && issue.reason == "configured asset is unavailable"
         }));
+        assert!(config
+            .capability_issues
+            .iter()
+            .all(|issue| !issue.reason.contains(&temp.path().display().to_string())));
     }
 
     #[test]
