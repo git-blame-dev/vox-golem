@@ -722,3 +722,11 @@ requires the strict schema-5 live result, all timing/integrity/speech/cleanup
 receipts and native spend counts. Acoustics and external shared-service lifecycle
 remain unverified. Linux tests and cross-compilation do not certify Windows
 runtime readiness or latency.
+
+### Revised lookup subjects
+
+The shared lookup and page-read scenarios use the Federal Reserve federal funds
+target range and require `federalreserve.gov` sources. These US question subjects
+replace earlier regional inputs. Record the scenario fingerprint with each run;
+older reports with different questions are not an equivalent workload. No live
+answer or current rate is frozen into the scenario contract.

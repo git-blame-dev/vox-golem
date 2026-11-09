@@ -79,3 +79,11 @@ score does not demonstrate useful retrieval or lower supported-answer latency.
 No training, feature extraction, inference, predictions, live lookup or model
 download was performed in preparing these files. Structural validation is not
 semantic adjudication, tokenization proof, or runtime acceptance.
+
+## Revised question subjects
+
+Public locations, agencies and events now use US equivalents. IDs, labels,
+families and split membership are unchanged; question and context bytes are not.
+Existing feature exports, fitted artifacts and scores require the exact dataset
+fingerprint they used. Re-extract and independently adjudicate the revised corpus
+before a new experiment; do not compare it directly with older results.

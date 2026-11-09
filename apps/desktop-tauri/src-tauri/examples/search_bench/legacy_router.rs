@@ -1379,8 +1379,7 @@ mod tests {
         assert!(research.needs_smart());
         assert!(research.needs_search());
 
-        let search =
-            classify_lexical_fallback("what is the current weather forecast in Chicago?");
+        let search = classify_lexical_fallback("what is the current weather forecast in Chicago?");
         assert_eq!(search.primary, Route2D::SearchFast);
         assert!(search.needs_search());
         assert!(!search.needs_smart());

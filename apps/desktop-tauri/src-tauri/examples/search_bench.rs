@@ -955,7 +955,10 @@ async fn run_anonymous_suite() -> Result<Vec<ScenarioRow>, Box<dyn Error>> {
 
     // Explicit component operations; this does not benchmark automatic model selection.
     for (id, objective) in [
-        ("live_02_warm_search", "Current New York City weather temperature"),
+        (
+            "live_02_warm_search",
+            "Current New York City weather temperature",
+        ),
         (
             "live_03_rules_search",
             "Urza's Saga Construct token ability after land destruction",
