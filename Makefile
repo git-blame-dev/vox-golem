@@ -7,6 +7,10 @@ export CARGO_INCREMENTAL ?= 0
 WAKE_WORD_MODEL ?=
 WAKE_BENCH_DIR ?= target/wakeword-bench/validated-v1
 
+# Root discovery can select the Android shell first. --config only merges
+# configuration; select the Rust app and hook working directory explicitly.
+DESKTOP_TAURI := env TAURI_APP_PATH='$(CURDIR)/apps/desktop-tauri/src-tauri' TAURI_FRONTEND_PATH='$(CURDIR)' VITE_VOXGOLEM_RUNTIME=desktop cargo tauri
+
 WINDOWS_TARGET := x86_64-pc-windows-msvc
 LINUX_RELEASE_DIR := $(CURDIR)/target/release
 LINUX_STAGED_RELEASE_DIR := $(CURDIR)/dist/VoxGolem
@@ -29,8 +33,9 @@ override LINUXDEPLOY_APPIMAGE_PLUGIN := $(TAURI_BUNDLER_CACHE_DIR)/linuxdeploy-p
 override LINUXDEPLOY_APPIMAGE_PLUGIN_URL := https://api.github.com/repos/linuxdeploy/linuxdeploy-plugin-appimage/releases/assets/228937581
 override LINUXDEPLOY_APPIMAGE_PLUGIN_SHA256 := 992d502a248e14ab185448ddf6f6e7d25558cb84d4623c354c3af350c25fccb3
 override APPIMAGE_RUNTIME := $(TAURI_BUNDLER_CACHE_DIR)/runtime-x86_64
-override APPIMAGE_RUNTIME_URL := https://api.github.com/repos/AppImage/type2-runtime/releases/assets/456065460
-override APPIMAGE_RUNTIME_SHA256 := 1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf
+# Official dated release 20251108; continuous release assets are replaced upstream.
+override APPIMAGE_RUNTIME_URL := https://api.github.com/repos/AppImage/type2-runtime/releases/assets/326011592
+override APPIMAGE_RUNTIME_SHA256 := 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
 override MAX_LINUX_APPIMAGE_BYTES := 300000000
 BUILD_SEQUENCE := $(if $(GITHUB_RUN_NUMBER),$(GITHUB_RUN_NUMBER),0)
 override APP_VERSION := $(shell scripts/release-version.sh "$$(git show -s --format=%ct HEAD)" '$(BUILD_SEQUENCE)')
@@ -257,7 +262,7 @@ check-linux-tools:
 
 app: check-linux-tools
 	bun install --frozen-lockfile
-	cargo tauri dev -- --locked
+	$(DESKTOP_TAURI) dev -- --locked
 
 app-smoke: linux
 	@set -eu; \
@@ -305,7 +310,7 @@ app-dev:
 
 linux: check-linux-tools
 	bun install --frozen-lockfile
-	cargo tauri build --no-bundle -- --locked
+	$(DESKTOP_TAURI) build --no-bundle -- --locked
 	@printf 'Linux app: %s\n' '$(LINUX_RELEASE_DIR)/vox-golem'
 
 dist: linux
@@ -350,7 +355,7 @@ update-bundle: check-linux-tools prepare-appimage-tools
 	@case '$(TAURI_CACHE_ROOT)' in /*) ;; *) printf 'Tauri cache root must be absolute: %s\n' '$(TAURI_CACHE_ROOT)' >&2; exit 1;; esac
 	@rm -rf '$(LINUX_APPIMAGE_DIR)'
 	bun install --frozen-lockfile
-	LDAI_RUNTIME_FILE='$(APPIMAGE_RUNTIME)' cargo tauri build --bundles appimage --config '{"version":"$(APP_VERSION)","bundle":{"createUpdaterArtifacts":false}}' -- --locked
+	LDAI_RUNTIME_FILE='$(APPIMAGE_RUNTIME)' $(DESKTOP_TAURI) build --bundles appimage --config '{"version":"$(APP_VERSION)","bundle":{"createUpdaterArtifacts":false}}' -- --locked
 	@$(MAKE) --no-print-directory postprocess-update-bundle
 
 postprocess-update-bundle:
@@ -453,7 +458,7 @@ pc: check-pc-tools $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_
 	VOXGOLEM_REAL_CLANG_CL='$(REAL_CLANG_CL)' \
 	CMAKE_GENERATOR=Ninja \
 	RUSTFLAGS="$${RUSTFLAGS:+$${RUSTFLAGS} }-L native=$(IMPORT_LIB_DIR)" \
-	cargo tauri build --runner cargo-xwin --target $(WINDOWS_TARGET) --no-bundle --config '{"bundle":{"resources":[]}}' -- --locked
+	$(DESKTOP_TAURI) build --runner cargo-xwin --target $(WINDOWS_TARGET) --no-bundle --config '{"bundle":{"resources":[]}}' -- --locked
 	@printf 'Windows app: %s\n' '$(WINDOWS_RELEASE_DIR)/vox-golem.exe'
 
 # Separate diagnostic artifact, never a shipping package or updater input. Reuse
@@ -468,7 +473,7 @@ pc-benchmark: check-pc-build-tools $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $
 	CARGO_NET_OFFLINE=true \
 	CARGO_TARGET_DIR='$(CURDIR)/target/app-benchmark-windows' \
 	RUSTFLAGS="$${RUSTFLAGS:+$${RUSTFLAGS} }-L native=$(IMPORT_LIB_DIR)" \
-	cargo tauri build --runner cargo-xwin --target $(WINDOWS_TARGET) --no-bundle \
+	$(DESKTOP_TAURI) build --runner cargo-xwin --target $(WINDOWS_TARGET) --no-bundle \
 		--features app-benchmark --config '{"identifier":"dev.gitblame.voxgolem.benchmark","build":{"beforeBuildCommand":{"script":"bun $(CURDIR)/frontend/app/node_modules/vite/bin/vite.js build $(CURDIR)/frontend/app","cwd":"$(CURDIR)/frontend/app"}},"bundle":{"resources":[]}}' -- --locked
 	@printf 'Windows diagnostic app (stage/hash separately; do not publish): %s\n' '$(CURDIR)/target/app-benchmark-windows/$(WINDOWS_TARGET)/release/vox-golem.exe'
 
@@ -498,7 +503,7 @@ pc-installer: check-pc-tools $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHC
 	VOXGOLEM_REAL_CLANG_CL='$(REAL_CLANG_CL)' \
 	CMAKE_GENERATOR=Ninja \
 	RUSTFLAGS="$${RUSTFLAGS:+$${RUSTFLAGS} }-L native=$(IMPORT_LIB_DIR)" \
-	cargo tauri build --runner cargo-xwin --target $(WINDOWS_TARGET) --bundles nsis --config '{"version":"$(APP_VERSION)","bundle":{"createUpdaterArtifacts":false}}' -- --locked
+	$(DESKTOP_TAURI) build --runner cargo-xwin --target $(WINDOWS_TARGET) --bundles nsis --config '{"version":"$(APP_VERSION)","bundle":{"createUpdaterArtifacts":false}}' -- --locked
 	@$(MAKE) --no-print-directory verify-pc-installer
 
 verify-pc-installer:

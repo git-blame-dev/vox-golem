@@ -118,9 +118,9 @@ Automated tests and builds cover software behavior and compatibility. Microphone
 
 ## 📦 Releases / Artifacts
 
-[GitHub Releases](https://github.com/git-blame-dev/vox-golem/releases) hosts published downloads. Source can be ahead of the latest release.
+No releases are currently published. Future approved downloads will appear on [GitHub Releases](https://github.com/git-blame-dev/vox-golem/releases).
 
-The desktop release workflow builds Linux ZIP/AppImage and Windows NSIS packages with updater signatures and checksums. Updater signatures are separate from Windows Authenticode signing; Windows packages may trigger SmartScreen. Models, system GPU libraries, credentials and user data stay external.
+The manually dispatched desktop release workflow builds Linux ZIP/AppImage and Windows NSIS packages with updater signatures and checksums. Updater signatures are separate from Windows Authenticode signing; Windows packages may trigger SmartScreen. Models, system GPU libraries, credentials and user data stay external.
 
 ```bash
 make dist          # stage Linux files in dist/VoxGolem/

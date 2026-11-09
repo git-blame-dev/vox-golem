@@ -103,6 +103,8 @@ workflow_step() {
 bun -e '
   import assert from "node:assert/strict";
   const workflow = Bun.YAML.parse(await Bun.file(Bun.argv[1]).text());
+  assert.deepEqual(Object.keys(workflow.on), ["workflow_dispatch"], "releases must be explicitly requested");
+  assert.equal(workflow.jobs.release.if, "github.event_name == \u0027workflow_dispatch\u0027 && github.ref == \u0027refs/heads/main\u0027");
   const steps = workflow.jobs.release.steps;
   const index = (name) => steps.findIndex((step) => step.name === name);
   const install = index("Install release dependencies");
@@ -124,6 +126,11 @@ bun -e '
   const action = "tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f";
   assert.equal(linux.uses, action);
   assert.equal(windows.uses, action);
+  assert.equal(linux.with.projectPath, "apps/desktop-tauri");
+  assert.equal(windows.with.projectPath, "apps/desktop-tauri");
+  assert.equal(workflow.jobs.release.env.TAURI_APP_PATH, "${{ github.workspace }}/apps/desktop-tauri/src-tauri");
+  assert.equal(workflow.jobs.release.env.TAURI_FRONTEND_PATH, "${{ github.workspace }}");
+  assert.equal(workflow.jobs.release.env.VITE_VOXGOLEM_RUNTIME, "desktop");
   assert.equal(linux.with.releaseDraft, true);
   assert.equal(linux.with.releaseCommitish, "${{ github.sha }}");
   assert.equal(windows.with.releaseId, "${{ steps.linux.outputs.releaseId }}");

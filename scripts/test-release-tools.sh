@@ -10,6 +10,35 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 temp_dir="$(mktemp -d)"
 trap 'rm -rf "$temp_dir"' EXIT
 
+# Check the emitted commands, including inherited packaging targets, without
+# installing dependencies, invoking build tools or changing their caches.
+python3 - "$root" <<'PY_DESKTOP'
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+root = Path(sys.argv[1])
+for target in ("app", "linux", "update-bundle", "pc", "pc-benchmark", "pc-installer"):
+    result = subprocess.run(
+        ["make", "--no-print-directory", "--dry-run", target],
+        cwd=root, check=True, text=True, stdout=subprocess.PIPE,
+        env={**os.environ, "VITE_VOXGOLEM_RUNTIME": "android"},
+    )
+    commands = result.stdout.replace("\\\n", " ").splitlines()
+    desktop = [shlex.split(line) for line in commands if "cargo tauri " in line]
+    assert len(desktop) == 1, (target, desktop)
+    args = desktop[0]
+    for name, expected in (
+        ("TAURI_APP_PATH", root / "apps/desktop-tauri/src-tauri"),
+        ("TAURI_FRONTEND_PATH", root),
+        ("VITE_VOXGOLEM_RUNTIME", "desktop"),
+    ):
+        assert f"{name}={expected}" in args, (target, name, args)
+print("Desktop packaging commands select the desktop app and frontend runtime.")
+PY_DESKTOP
+
 mkdir -p "$temp_dir/compiler"
 # The generated stub retains these variables for its own runtime.
 # shellcheck disable=SC2016
