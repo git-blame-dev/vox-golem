@@ -1,3 +1,6 @@
+// @vitest-environment jsdom
+// happy-dom 16 holds mutation reporters only weakly; GC can silently stop delivery.
+// Use jsdom so the live-region observer stays active throughout restoration and submit.
 import { act } from 'react'
 import { readFileSync } from 'node:fs'
 import { createRoot } from 'react-dom/client'
@@ -20,6 +23,15 @@ import { getCachedAndroidPreferences, setCachedAndroidPreferences } from './lib/
 let root: Root | null = null
 let container: HTMLElement | null = null
 const initialTimingEnv = import.meta.env['VITE_VOXGOLEM_TIMING'] ?? ''
+
+function appStyleRules(): CSSStyleRule[] {
+  const style = document.createElement('style')
+  style.textContent = readFileSync('src/App.css', 'utf8')
+  document.head.append(style)
+  try {
+    return Array.from(style.sheet!.cssRules).filter((rule): rule is CSSStyleRule => rule instanceof CSSStyleRule)
+  } finally { style.remove() }
+}
 
 beforeEach(() => { installHistoryHarness(null) })
 
@@ -428,9 +440,7 @@ describe('Android App lifecycle', () => {
     } }
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<App />) })
-    const sheet = new CSSStyleSheet()
-    sheet.replaceSync(readFileSync('src/App.css', 'utf8'))
-    const rules = Array.from(sheet.cssRules).filter((rule): rule is CSSStyleRule => rule instanceof CSSStyleRule)
+    const rules = appStyleRules()
     const styleFor = (suffix: string, element: Element): CSSStyleDeclaration => {
       const rule = rules.find((rule) => rule.selectorText === `.shell[data-platform='android'] ${suffix}`)!
       expect(element.matches(rule.selectorText)).toBe(true)
@@ -448,7 +458,7 @@ describe('Android App lifecycle', () => {
     expect(container.querySelector('.composer__utility-actions [aria-label="New Chat"]')).not.toBeNull()
     expect(input.getAttribute('rows')).toBe('1')
     expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
-    expect(styleFor('.shell__header-actions', container.querySelector('.shell__header-actions')!).flexWrap).toBe('wrap')
+    expect(styleFor('.shell__header-actions', container.querySelector('.shell__header-actions')!).getPropertyValue('flex-wrap')).toBe('wrap')
     const ask = container.querySelector('[aria-label="Ask"]')!
     expect(ask.closest('.composer__utility-row')).not.toBeNull()
 
@@ -657,11 +667,9 @@ describe('Android App lifecycle', () => {
     await act(async () => { root?.render(<App />) })
     const chooser = container.querySelector<HTMLSelectElement>('[aria-label="Conversation"]')!
     expect(chooser.selectedOptions[0]?.textContent).toBe(title)
-    const sheet = new CSSStyleSheet()
-    sheet.replaceSync(readFileSync('src/App.css', 'utf8'))
-    const rules = Array.from(sheet.cssRules).filter((rule): rule is CSSStyleRule => rule instanceof CSSStyleRule)
+    const rules = appStyleRules()
     const composer = rules.find((rule) => rule.selectorText === '.composer')
-    expect(composer?.style.minWidth).toBe('0')
+    expect(composer?.style.getPropertyValue('min-width')).toBe('0')
     expect(chooser.closest('header')).not.toBeNull()
     expect(chooser.closest('.shell__conversation-picker')?.querySelector('svg')).not.toBeNull()
     expect(chooser.closest('#conversation-navigation')).not.toBeNull()
@@ -1200,7 +1208,7 @@ describe('Android App lifecycle', () => {
     try {
       await act(async () => { hydrate(wire) })
       expect(container.querySelector<HTMLTextAreaElement>('#promptComposer')?.value).toBe(wire.assistant.draft)
-      expect(announcements).toEqual(['Draft restored in Prompt'])
+      await vi.waitFor(() => expect(announcements).toEqual(['Draft restored in Prompt']))
       expect(document.activeElement).toBe(settings)
       expect(container.querySelectorAll('[aria-label="Response announcements"]')).toHaveLength(1)
       const expectNoOldRecoveryCopy = (): void => {
@@ -1233,8 +1241,10 @@ describe('Android App lifecycle', () => {
       // A real prompt admission clears the live region. A later identical snapshot
       // must not restore its announcement merely because the current text is empty.
       await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Send"]')!.click() })
+      expect(container.querySelector('[aria-label="Response announcements"]')).toBe(announcer)
       expect(announcer.textContent).toBe('')
-      expect(announcements).toEqual(['Draft restored in Prompt', ''])
+      // MutationObserver delivery is asynchronous even after React has committed.
+      await vi.waitFor(() => expect(announcements).toEqual(['Draft restored in Prompt', '']))
       await act(async () => { finish({ kind: 'cancelled' }) })
       const readsBeforeRefresh = reads
       settings.focus()
