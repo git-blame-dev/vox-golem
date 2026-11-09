@@ -42,10 +42,13 @@ schema or existing user preference keys are migrated by this module extraction.
 From the project checkout with JDK21 and the configured Android SDK:
 
 ```sh
+make android-build # Once per fresh checkout: generates Tauri's ignored Gradle dependency files.
 make android-voice-test
 ```
 
-This runs SDK-layer unit tests and lint without compiling/loading Assistant JNI.
+After that bootstrap, `android-voice-test` runs SDK-layer unit tests and lint without
+compiling/loading Assistant JNI. `android-init` alone creates the scaffold but not
+those dependency files. An existing phone release build also satisfies the bootstrap.
 Phone/Wear aggregate checks also include this module. Tests use synthetic inputs and
 simulated SDK boundaries; they do not establish device/provider, acoustic or optimized
 physical performance acceptance. Host dependency isolation is not itself a measured
