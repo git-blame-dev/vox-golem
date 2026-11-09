@@ -116,13 +116,41 @@ class CaptureNativeExitTest {
         try {
             val activity = controller.get()
             awaitCaptureIdle(activity)
-            activity.requestStart()
-            controller.pause().stop()
+            val repository = ReflectionHelpers.getField<Lazy<Any>>(activity, "repository\$delegate").value
+            val shared = ReflectionHelpers.getField<CaptureRepository>(repository, "shared")
+            val monitor = ReflectionHelpers.getField<Any>(shared, "monitor")
+            // Hold the real lookup pending while Home retires its generation. Without
+            // this barrier, Robolectric lifecycle calls can drain a completed lookup.
+            synchronized(monitor) {
+                activity.requestStart()
+                assertTrue(activity.commandsPending)
+                assertTrue(commands().isEmpty())
+                controller.pause().stop()
+            }
             awaitCaptureIdle(activity)
             activity.setContentView(View(context))
             controller.restart().start().resume().visible()
             awaitCaptureIdle(activity)
             assertTrue("An IO continuation from before exit cannot attach or create another start", commands().isEmpty())
+        } finally { controller.pause().stop().destroy() }
+    }
+
+    @Test fun homeAfterStartLookupCompletesStopsWithoutRequeueOnResume() {
+        shadowOf(context).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        val controller = Robolectric.buildActivity(CaptureActivity::class.java, Intent(Intent.ACTION_VIEW)).create().start().resume()
+        try {
+            val activity = controller.get()
+            awaitCaptureIdle(activity)
+            activity.requestStart()
+            awaitCaptureIdle(activity)
+            assertEquals(listOf(CaptureService.ACTION_START), commands().map { it.action })
+            controller.pause().stop()
+            awaitCaptureIdle(activity)
+            assertEquals(listOf(CaptureService.ACTION_STOP), commands().map { it.action })
+            activity.setContentView(View(context))
+            controller.restart().start().resume().visible()
+            awaitCaptureIdle(activity)
+            assertTrue("Returning after a completed start and Home stop cannot restart capture", commands().isEmpty())
         } finally { controller.pause().stop().destroy() }
     }
 
