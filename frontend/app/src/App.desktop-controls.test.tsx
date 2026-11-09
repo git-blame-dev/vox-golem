@@ -1,3 +1,5 @@
+import { execFileSync } from 'node:child_process'
+import { resolve } from 'node:path'
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import type { Root } from 'react-dom/client'
@@ -82,6 +84,271 @@ async function typeQuestion() {
 }
 const sendButton = () => container!.querySelector<HTMLButtonElement>('button[type="submit"]')!
 const poll = async (milliseconds = 1_000) => { await act(async () => { await vi.advanceTimersByTimeAsync(milliseconds) }) }
+
+function benchmarkScripts() {
+  return JSON.parse(execFileSync('python3', ['-c',
+    'import json,runpy,sys; s=runpy.run_path(sys.argv[1]); print(json.dumps({k:s[k] for k in ("BEGIN_OWNERSHIP_JS","SETTINGS_NAVIGATION_JS","RELEASE_OWNERSHIP_JS")}))',
+    resolve('../../tools/benchmark/benchmark.py'),
+  ], { encoding: 'utf8', timeout: 5000 })) as {
+    BEGIN_OWNERSHIP_JS: string; SETTINGS_NAVIGATION_JS: string; RELEASE_OWNERSHIP_JS: string
+  }
+}
+
+// Execute benchmark JavaScript against real App/ActionMenu/settings DOM.
+// Geometry, history traversal and native calls are synthetic; no app is launched.
+it('supports shared benchmark settings navigation and refuses foreign UI mutations', async () => {
+  const state = await mount()
+  // happy-dom does not traverse history; deliver the browser's popstate boundary.
+  const historyStates: unknown[] = []
+  const pushState = window.history.pushState.bind(window.history)
+  vi.spyOn(window.history, 'pushState').mockImplementation((data, unused, url) => {
+    historyStates.push(window.history.state)
+    pushState(data, unused, url)
+  })
+  vi.spyOn(window.history, 'back').mockImplementation(() => {
+    const state = historyStates.pop() ?? null
+    window.history.replaceState(state, '')
+    window.dispatchEvent(new PopStateEvent('popstate', { state }))
+  })
+  const originalInvoke = state.invoke.getMockImplementation()!
+  state.invoke.mockImplementation(async (command, args) => {
+    if (command === 'list_audio_input_devices') return []
+    if (command === 'set_assistant_settings') return (args as { settings: unknown }).settings
+    if (command === 'set_tts_enabled') return { enabled: (args as { enabled: boolean }).enabled }
+    return originalInvoke(command, args)
+  })
+  vi.spyOn(HTMLElement.prototype, 'getClientRects').mockReturnValue([{}] as unknown as DOMRectList)
+  const scripts = benchmarkScripts()
+  const script = scripts.SETTINGS_NAVIGATION_JS
+  const releaseScript = scripts.RELEASE_OWNERSHIP_JS
+  const release = () => window.eval(releaseScript.replace('ARGS', JSON.stringify('synthetic-owner-token'))) as boolean
+  const owner = { token: 'synthetic-owner-token', session: '1', request: null, execution: null, baseline: '[]' }
+  Object.assign(window, { __voxBenchmarkOwner: owner })
+  let enabled = true
+  const run = async (action: string, page = 'web', label = 'Allow web access') => {
+    let result: unknown
+    await act(async () => {
+      result = await window.eval(script.replace('ARGS', JSON.stringify({ action, token: 'synthetic-token', page, label, enabled })))
+      await vi.advanceTimersByTimeAsync(100)
+    })
+    return result
+  }
+  const mutate = async (action: string, page = 'web', label = 'Allow web access') => {
+    Object.assign(window, { __voxBenchmarkOwner: { ...owner, session: 'synthetic-foreign' } })
+    expect(await run(action, page, label), `${action}: foreign owner`).toBe(false)
+    Object.assign(window, { __voxBenchmarkOwner: owner })
+    return run(action, page, label)
+  }
+  try {
+    const menu = container!.querySelector<HTMLDetailsElement>('details.ui-action-menu')!
+    expect(menu.open).toBe(false)
+    const composer = container!.querySelector<HTMLTextAreaElement>('#promptComposer')!
+    composer.value = 'Synthetic draft'
+    expect(await run('begin')).toBe(false)
+    expect(menu.open).toBe(false)
+    expect(composer.value).toBe('Synthetic draft')
+    composer.value = ''
+    menu.open = true
+    expect(await run('begin')).toBe(false)
+    expect(menu.open).toBe(true)
+    menu.open = false
+    for (const [page, label] of [['web', 'Allow web access'], ['voice', 'Speak replies']]) {
+      for (const action of ['begin', 'open', 'mounted', 'page', 'ready']) {
+        expect(await (['begin', 'open', 'page', 'back', 'close', 'finish'].includes(action) ? mutate : run)(action, page, label), `${page}: ${action}`).toBe(true)
+      }
+      const input = container!.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`)!
+      enabled = !input.checked
+      Object.assign(window, { __voxBenchmarkOwner: { ...owner, session: 'synthetic-foreign' } })
+      expect(await run('toggle', page, label)).toBe(false)
+      expect(input.checked).toBe(!enabled)
+      Object.assign(window, { __voxBenchmarkOwner: owner })
+      expect(await run('toggle', page, label)).toBe(true)
+      expect(input.checked).toBe(enabled)
+      for (const action of ['back', 'overview', 'close', 'closed', 'finish']) {
+        expect(await (['begin', 'open', 'page', 'back', 'close', 'finish'].includes(action) ? mutate : run)(action, page, label), `${page}: ${action}`).toBe(true)
+      }
+      expect(menu.open).toBe(false)
+      expect(container!.querySelector('[role="dialog"]')).toBeNull()
+    }
+    // A mount-observation failure must still close the dialog this operation opened.
+    for (const action of ['begin', 'open', 'back', 'overview', 'close', 'closed', 'finish']) {
+      expect(await run(action), `mount failure cleanup: ${action}`).toBe(true)
+    }
+    // A page that never mounts must also unwind from the remaining overview.
+    expect(await run('begin')).toBe(true)
+    expect(await run('open')).toBe(true)
+    expect(await run('mounted')).toBe(true)
+    const link = container!.querySelector<HTMLButtonElement>('[aria-label="Web research"]')!
+    const blockedClick = vi.spyOn(link, 'click').mockImplementation(() => {})
+    expect(await run('page')).toBe(true)
+    expect(await run('ready')).toBe(false)
+    blockedClick.mockRestore()
+    for (const action of ['back', 'overview', 'close', 'closed', 'finish']) {
+      expect(await run(action), `page failure cleanup: ${action}`).toBe(true)
+    }
+    const trigger = menu.querySelector<HTMLElement>('[aria-label="More actions"]')!
+    const failedBegin = vi.spyOn(trigger, 'click').mockImplementation(() => { throw new Error('Synthetic begin failure') })
+    await expect(run('begin')).rejects.toThrow('Synthetic begin failure')
+    failedBegin.mockRestore()
+    expect(await run('finalize')).toBe(false)
+    expect(Reflect.get(window, '__voxBenchmarkNavigation')).toBeUndefined()
+    expect(menu.open).toBe(false)
+    expect(await run('begin')).toBe(true)
+    const refusedFinish = vi.spyOn(trigger, 'click').mockImplementation(() => {})
+    expect(await run('finish')).toBe(false)
+    refusedFinish.mockRestore()
+    expect(Reflect.get(window, '__voxBenchmarkNavigation')).toBeDefined()
+    expect(await run('finalize')).toBe(false)
+    expect(Reflect.get(window, '__voxBenchmarkNavigation')).toBeUndefined()
+    expect(menu.open).toBe(true)
+    menu.open = false // Synthetic user closes their remaining menu.
+    // A draft or canonical ownership change forbids UI cleanup, but must not
+    // strand this operation's internal token or block a later clean admission.
+    for (const interruption of ['draft', 'canonical', 'owner']) {
+      expect(await run('begin')).toBe(true)
+      expect(await run('open')).toBe(true)
+      if (interruption === 'draft') composer.value = 'Synthetic interrupted draft'
+      if (interruption === 'canonical') state.setSnapshotResponse(async () => ({ ...state.snapshot(), session_id: 'synthetic-successor' }))
+      if (interruption === 'owner') Object.assign(window, { __voxBenchmarkOwner: { ...owner } })
+      const dialog = container!.querySelector('[role="dialog"]')
+      expect(await run('back')).toBe(false)
+      expect(await run('finalize')).toBe(false)
+      expect(Reflect.get(window, '__voxBenchmarkNavigation')).toBeUndefined()
+      expect(container!.querySelector('[role="dialog"]')).toBe(dialog)
+      expect(menu.open).toBe(true)
+      if (interruption === 'draft') expect(composer.value).toBe('Synthetic interrupted draft')
+      // Only the synthetic user returns their own UI/draft to baseline.
+      composer.value = ''
+      state.setSnapshotResponse(null)
+      Object.assign(window, { __voxBenchmarkOwner: owner })
+      await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click() })
+      menu.open = false
+      for (const action of ['begin', 'back', 'overview', 'close', 'closed', 'finish', 'finalize']) {
+        expect(await run(action), `subsequent admission: ${action}`).toBe(true)
+      }
+    }
+    // Returning preferences/UI to baseline cannot erase an earlier failed cleanup.
+    expect(Reflect.get(window, '__voxBenchmarkNavigation')).toBeUndefined()
+    expect(release()).toBe(false)
+    expect(Reflect.get(window, '__voxBenchmarkOwner')).toBeUndefined()
+    Reflect.deleteProperty(owner, 'navigationFailed')
+    Object.assign(window, { __voxBenchmarkOwner: owner })
+    expect(await run('begin')).toBe(true)
+    const foreignNavigation = Reflect.get(window, '__voxBenchmarkNavigation') as { token: string }
+    foreignNavigation.token = 'synthetic-foreign-token'
+    expect(await run('finalize')).toBe(false)
+    expect(Reflect.get(window, '__voxBenchmarkNavigation')).toBe(foreignNavigation)
+    foreignNavigation.token = 'synthetic-token'
+    expect(await run('finish')).toBe(true)
+    expect(await run('finalize')).toBe(true)
+    // Release only retires this suite's bookkeeping, even when UI is unsafe.
+    expect(await run('begin')).toBe(true)
+    expect(await run('open')).toBe(true)
+    composer.value = 'Synthetic release draft'
+    const ownedDialog = container!.querySelector('[role="dialog"]')
+    expect(release()).toBe(false)
+    expect(Reflect.get(window, '__voxBenchmarkNavigation')).toBeUndefined()
+    expect(Reflect.get(window, '__voxBenchmarkOwner')).toBeUndefined()
+    expect(container!.querySelector('[role="dialog"]')).toBe(ownedDialog)
+    expect(menu.open).toBe(true)
+    expect(composer.value).toBe('Synthetic release draft')
+    composer.value = ''
+    await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click() })
+    menu.open = false
+    const nextOwner = { ...owner, navigationFailed: false }
+    Object.assign(window, { __voxBenchmarkOwner: nextOwner })
+    expect(await run('begin')).toBe(true)
+    const ownedNavigation = Reflect.get(window, '__voxBenchmarkNavigation')
+    const successor = { ...owner, token: 'synthetic-successor-token' }
+    Object.assign(window, { __voxBenchmarkOwner: successor, __voxBenchmarkExecutions: ['synthetic-successor'] })
+    expect(release()).toBe(false)
+    expect(Reflect.get(window, '__voxBenchmarkNavigation')).toBeUndefined()
+    expect(Reflect.get(window, '__voxBenchmarkOwner')).toBe(successor)
+    expect(Reflect.get(window, '__voxBenchmarkExecutions')).toEqual(['synthetic-successor'])
+    expect(menu.open).toBe(true)
+    menu.open = false
+    Object.assign(window, { __voxBenchmarkOwner: nextOwner })
+    // A foreign navigation token/owner must survive our release as well.
+    const foreignOwnedNavigation = { ...(ownedNavigation as object), owner: successor }
+    Object.assign(window, { __voxBenchmarkNavigation: foreignOwnedNavigation })
+    expect(release()).toBe(false)
+    expect(Reflect.get(window, '__voxBenchmarkNavigation')).toBe(foreignOwnedNavigation)
+    Reflect.deleteProperty(window, '__voxBenchmarkNavigation')
+    Object.assign(window, { __voxBenchmarkOwner: nextOwner })
+    expect(release()).toBe(true)
+    Object.assign(window, { __voxBenchmarkOwner: owner })
+    const foreignDialog = document.createElement('section')
+    foreignDialog.setAttribute('role', 'dialog')
+    container!.append(foreignDialog)
+    expect(await run('begin')).toBe(false)
+    expect(foreignDialog.isConnected).toBe(true)
+    expect(menu.open).toBe(false)
+    foreignDialog.remove()
+    expect(state.invoke.mock.calls.filter(([command]) => command === 'set_assistant_settings')).toHaveLength(1)
+    expect(state.invoke.mock.calls.filter(([command]) => command === 'set_tts_enabled')).toHaveLength(1)
+    expect(state.unexpected).toEqual([])
+  } finally {
+    Reflect.deleteProperty(window, '__voxBenchmarkOwner')
+    Reflect.deleteProperty(window, '__voxBenchmarkNavigation')
+    Reflect.deleteProperty(window, '__voxBenchmarkExecutions')
+  }
+})
+
+it('revokes timed-out acquisition before delayed native snapshots can install ownership', async () => {
+  const state = await mount()
+  const scripts = benchmarkScripts()
+  const acquire = (token: string) => window.eval(scripts.BEGIN_OWNERSHIP_JS.replace('OWNER_TOKEN', JSON.stringify(token))) as Promise<boolean>
+  const release = (token: string) => window.eval(scripts.RELEASE_OWNERSHIP_JS.replace('ARGS', JSON.stringify(token))) as boolean
+  const delayed = deferred<unknown>()
+  const originalInvoke = state.invoke.getMockImplementation()!
+  state.invoke.mockImplementation(async (command, args) => command === 'get_app_snapshot' ? delayed.promise : originalInvoke(command, args))
+  try {
+    // A CDP timeout abandons its result, not the JavaScript/native promise.
+    const pending = acquire('synthetic-expired-owner')
+    const released = release('synthetic-expired-owner')
+    delayed.resolve(state.snapshot())
+    expect(await pending).toBe(false)
+    expect(released).toBe(true)
+    expect(Reflect.get(window, '__voxBenchmarkOwner')).toBeUndefined()
+    expect(Reflect.get(window, '__voxBenchmarkAcquisition')).toBeUndefined()
+    state.invoke.mockImplementation(originalInvoke)
+    expect(await acquire('synthetic-next-owner')).toBe(true)
+    expect(release('synthetic-expired-owner')).toBe(false)
+    expect(Reflect.get(window, '__voxBenchmarkOwner')).toMatchObject({ token: 'synthetic-next-owner' })
+    expect(release('synthetic-next-owner')).toBe(true)
+    expect(Reflect.get(window, '__voxBenchmarkOwner')).toBeUndefined()
+
+    const expiredSnapshot = deferred<unknown>()
+    const successorSnapshot = deferred<unknown>()
+    let snapshots = 0
+    state.invoke.mockImplementation(async (command, args) => command === 'get_app_snapshot'
+      ? (++snapshots === 1 ? expiredSnapshot.promise : successorSnapshot.promise)
+      : originalInvoke(command, args))
+    const expired = acquire('synthetic-expired-overlap')
+    const acquired = Reflect.get(window, '__voxBenchmarkAcquisition')
+    expect(await acquire('synthetic-competing-owner')).toBe(false)
+    expect(release('synthetic-foreign-release')).toBe(false)
+    expect(Reflect.get(window, '__voxBenchmarkAcquisition')).toBe(acquired)
+    expect(release('synthetic-expired-overlap')).toBe(true)
+    const successor = acquire('synthetic-successor-overlap')
+    const successorIntent = Reflect.get(window, '__voxBenchmarkAcquisition')
+    expiredSnapshot.resolve(state.snapshot())
+    expect(await expired).toBe(false)
+    expect(Reflect.get(window, '__voxBenchmarkAcquisition')).toBe(successorIntent)
+    expect(release('synthetic-expired-overlap')).toBe(false)
+    successorSnapshot.resolve(state.snapshot())
+    expect(await successor).toBe(true)
+    expect(release('synthetic-successor-overlap')).toBe(true)
+
+    state.invoke.mockRejectedValueOnce(new Error('Synthetic native snapshot failure'))
+    await expect(acquire('synthetic-rejected-owner')).rejects.toThrow('Synthetic native snapshot failure')
+    expect(Reflect.get(window, '__voxBenchmarkAcquisition')).toBeUndefined()
+    expect(release('synthetic-rejected-owner')).toBe(true)
+  } finally {
+    Reflect.deleteProperty(window, '__voxBenchmarkOwner')
+    Reflect.deleteProperty(window, '__voxBenchmarkAcquisition')
+  }
+})
 
 describe('desktop change-triggered canonical model controls', () => {
   it('applies held control updates without allowing their pre-settlement null disposition to erase an unsaved answer', async () => {

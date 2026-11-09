@@ -654,27 +654,124 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(checks['sources_present'], 'fail')
         self.assertIs(metrics.get('model_reported_rate_limit'), True)
 
-    async def test_settings_mount_is_observed_before_toggle(self):
-        events = []
-        snapshots = iter([{'web_enabled':False}, {'web_enabled':True}])
-        async def snapshot(ui):
-            return next(snapshots)
-        async def click(ui, label):
-            events.append(label)
-        class UI:
-            async def evaluate(self, expression):
-                if 'e.checked' in expression:
-                    events.append('toggle')
+    async def test_settings_navigation_observes_each_transition_and_cleans_failures(self):
+        for setter, key, page, label in (
+                (bench.set_web, 'web_enabled', 'web', 'Allow web access'),
+                (bench.set_tts, 'tts_enabled', 'voice', 'Speak replies')):
+            for failure in (None, 'begin', 'open', 'mounted', 'page', 'ready', 'toggle', 'confirmed'):
+                with self.subTest(key=key, failure=failure):
+                    events = []
+                    reads = 0
+                    observations = {}
+                    async def snapshot(ui):
+                        nonlocal reads
+                        reads += 1
+                        if reads > 1 and failure == 'confirmed':
+                            raise bench.Blocked('synthetic_confirmation_failure')
+                        return {key: reads > 2}
+                    async def navigation(ui, action, **kwargs):
+                        events.append(action)
+                        self.assertEqual((kwargs['page'], kwargs['label'], kwargs['enabled']), (page, label, True))
+                        if action == failure:
+                            raise bench.Blocked('synthetic_navigation_failure')
+                        observations[action] = observations.get(action, 0) + 1
+                        return action not in ('mounted', 'ready') or observations[action] > 1
+                    class UI:
+                        async def evaluate(self, expression):
+                            return False  # Closed ActionMenu: old direct click cannot succeed.
+                    with patch.object(bench, 'snapshot_preferences', snapshot), \
+                            patch.object(bench, 'settings_navigation', navigation, create=True):
+                        if failure:
+                            with self.assertRaises(bench.Blocked):
+                                await setter(UI(), True)
+                        else:
+                            await setter(UI(), True)
+                    expected = ['begin', 'open', 'mounted', 'page', 'ready', 'toggle']
+                    if failure in expected:
+                        expected = expected[:expected.index(failure) + 1]
+                    expected = [event for action in expected for event in
+                                ([action, action] if action in ('mounted', 'ready') and action != failure else [action])]
+                    self.assertEqual(events, expected + ['back', 'overview', 'close', 'closed', 'finish', 'finalize'])
+
+    async def test_settings_interruption_always_finalizes_own_token(self):
+        for failure in ('begin', 'back', 'overview', 'close', 'closed', 'finish'):
+            with self.subTest(failure=failure):
+                events = []
+                tokens = set()
+                async def navigation(ui, action, **kwargs):
+                    events.append(action)
+                    tokens.add(kwargs['token'])
+                    if action == failure:
+                        raise bench.Blocked('synthetic_interruption')
                     return True
-                events.append('mounted')
-                return events.count('mounted') > 1
-        with patch.object(bench, 'snapshot_preferences', snapshot), patch.object(bench, 'click', click):
-            await bench.set_web(UI(), True)
-        self.assertEqual(events, ['Settings', 'mounted', 'mounted', 'toggle', 'Close settings'])
+                reads = 0
+                async def snapshot(ui):
+                    nonlocal reads
+                    reads += 1
+                    return {'web_enabled': reads > 1}
+                async def interrupted(predicate, timeout=10):
+                    if not await predicate():
+                        raise bench.Blocked('synthetic_interruption')
+                with patch.object(bench, 'snapshot_preferences', snapshot), \
+                        patch.object(bench, 'settings_navigation', navigation), \
+                        patch.object(bench, 'wait_condition', interrupted):
+                    with self.assertRaises(bench.Blocked):
+                        await bench.set_web(None, True)
+                self.assertEqual(events[-1], 'finalize')
+                self.assertEqual(len(tokens), 1)
+
+    async def test_unchanged_setting_does_not_acquire_navigation(self):
+        async def snapshot(ui): return {'web_enabled':False}
+        with patch.object(bench, 'snapshot_preferences', snapshot), \
+                patch.object(bench, 'settings_navigation', side_effect=AssertionError('navigation')):
+            await bench.set_web(None, False)
+
+    async def test_suite_releases_internal_ownership_even_after_foreign_fence(self):
+        calls = []
+        async def release(driver):
+            calls.append(driver.owner_token)
+            return True
+        with patch.object(bench.DOMSuiteDriver, 'release_ownership', release):
+            _, report = await self.run_controller(fail=True, foreign=True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(report['cleanup']['preferences'], 'blocked_ownership_fence')
+        self.assertEqual(report['cleanup']['navigation'], 'pass')
+
+    async def test_failed_suite_acquisition_always_attempts_scoped_release(self):
+        events = []
+        async def begin(driver):
+            events.append('begin')
+            raise bench.Blocked('synthetic_failed_begin')
+        async def release(driver):
+            events.append('release')
+            return False
+        report = {'cases':[], 'cleanup':{}}
+        with patch.object(bench.DOMSuiteDriver, 'begin_ownership', begin), \
+                patch.object(bench.DOMSuiteDriver, 'release_ownership', release):
+            with self.assertRaisesRegex(bench.Blocked, 'synthetic_failed_begin'):
+                await self.run_controller(cases=['arithmetic'], report=report)
+        self.assertEqual(events, ['begin', 'release'])
+        self.assertEqual(report['cleanup']['navigation'], 'fail')
+
+    async def test_unchanged_preferences_still_report_navigation_release(self):
+        # No setting navigation is needed: suite-level finalization must still run.
+        for released in (True, False):
+            with self.subTest(released=released):
+                async def release(driver): return released
+                with patch.object(bench.DOMSuiteDriver, 'release_ownership', release):
+                    if released:
+                        _, report = await self.run_controller(cases=['arithmetic'])
+                        self.assertEqual(report['cleanup']['navigation'], 'pass')
+                    else:
+                        report = {'cases':[], 'cleanup':{}}
+                        with self.assertRaisesRegex(bench.Blocked, 'cleanup_restore_incomplete'):
+                            await self.run_controller(cases=['arithmetic'], report=report)
+                        self.assertEqual(report['cleanup']['preferences'], 'pass')
+                        self.assertEqual(report['cleanup']['navigation'], 'fail')
 
     async def run_controller(self, fail=False, foreign=False, invalid_answer=False,
                              active_failure=False, before_admission=False, cases=None, blocked_reply=False,
-                             history_seed_turns=1, stages=None):
+                             history_seed_turns=1, stages=None, report=None):
         original = dict(instant='synthetic-original', web_enabled=False, tts_enabled=True,
                         prefetch=False, completion=False)
         prefs = dict(original)
@@ -685,6 +782,8 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
                     return []
                 if '__voxBenchmarkRateStatus' in expression:
                     return True
+                if 'delete window.__voxBenchmarkOwner' in expression:
+                    return True  # Synthetic internal release; DOM test executes its JS.
                 return True if 'promptComposer' in expression else False
         async def snapshot(ui):
             return dict(prefs)
@@ -697,7 +796,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         async def model(ui, value):
             prefs['instant'] = value
             calls.append(('model', value))
-        async def begin(ui):
+        async def begin(ui, token=None):
             pass
         changed = False
         active = False
@@ -753,7 +852,8 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
             return metrics
         args = SimpleNamespace(model='synthetic-model', repetitions=1, turn_timeout=1, cases=cases,
                                history_seed_turns=history_seed_turns)
-        report = {'cases':[], 'cleanup':{}}
+        if report is None:
+            report = {'cases':[], 'cleanup':{}}
         with patch.object(bench, 'snapshot_preferences', snapshot), patch.object(bench, 'set_web', web), \
                 patch.object(bench, 'set_tts', tts), patch.object(bench, 'new_chat', new), \
                 patch.object(bench, 'select_model', model), patch.object(bench, 'begin_ownership', begin), \
@@ -1064,7 +1164,7 @@ class GeneratedGuardTests(unittest.IsolatedAsyncioTestCase):
     """Actual generated JS, but a synthetic in-memory native/DOM boundary, not Tauri."""
     def ui(self, active=False, foreign=False):
         execution = {'session_id':'synthetic-session', 'generation':'1'}
-        state = {'owner':{'session':'synthetic-session', 'request':'synthetic-request',
+        state = {'owner':{'token':'synthetic-owner-token', 'session':'synthetic-session', 'request':'synthetic-request',
                           'execution':json.dumps(execution, separators=(',', ':')), 'before':'[]', 'baseline':'[]'},
                  'snapshot':{'session_id':'synthetic-session', 'runtime_phase':'sleeping', 'transcript':[],
                              'active_request':None}, 'calls':[]}
@@ -1144,6 +1244,7 @@ global.window = {{__voxBenchmarkOwner:state.owner, __voxBenchmarkNextSession:sta
         with patch.object(bench, 'click', click):
             await bench.new_chat(ui)
         self.assertEqual(state['owner']['session'], 'synthetic-new-session')
+        self.assertEqual(state['owner']['token'], 'synthetic-owner-token')
         self.assertEqual(state['executions'], [])
 
 

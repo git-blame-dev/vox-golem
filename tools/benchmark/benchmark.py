@@ -657,42 +657,132 @@ async def wait_condition(predicate, timeout=10):
     raise Blocked('ui_transition_deadline')
 
 
-async def set_web(ui, enabled):
-    prefs = await snapshot_preferences(ui)
-    if prefs.get('web_enabled') is enabled:
+# Shared desktop/phone DOM navigation; state holds exact nodes, never user content.
+SETTINGS_NAVIGATION_JS = """(async () => {
+  const {action, token, page, label, enabled} = ARGS;
+  // Internal retirement only: never click or change a draft outside the fences.
+  if (action === 'finalize') {
+    const n = window.__voxBenchmarkNavigation;
+    if (!n) return true;
+    if (n.token !== token) return false;
+    n.owner.navigationFailed = true;
+    delete window.__voxBenchmarkNavigation;
+    return false; // finish did not establish UI cleanup before retirement.
+  }
+  FENCE
+  if (window.__voxBenchmarkOwner !== owner) return false;
+  if (document.getElementById('promptComposer')?.value !== '') return false;
+  const visible = e => !!e && !!e.getClientRects().length &&
+    !e.closest('[hidden], [inert]') && !Array.from(document.querySelectorAll('details:not([open])'))
+      .some(d => d.contains(e) && !Array.from(d.children).find(c => c.tagName === 'SUMMARY')?.contains(e));
+  const control = (root, name, selector = 'button[aria-label], summary[role="button"][aria-label]') => {
+    const matches = Array.from(root.querySelectorAll(selector)).filter(e =>
+      e.getAttribute('aria-label') === name && visible(e) && !e.disabled);
+    return matches.length === 1 ? matches[0] : null;
+  };
+  const dialogs = () => Array.from(document.querySelectorAll('[role="dialog"]'));
+  if (action === 'begin') {
+    if (window.__voxBenchmarkNavigation || dialogs().length) return false;
+    const trigger = control(document, 'More actions');
+    const menu = trigger?.closest('details');
+    if (!menu || menu.open) return false;
+    window.__voxBenchmarkNavigation = {token, owner, menu, trigger, dialog:null, page:'overview'};
+    trigger.click(); return true;
+  }
+  const n = window.__voxBenchmarkNavigation;
+  if (!n || n.token !== token || n.owner !== owner || !n.menu.isConnected) return false;
+  if (action === 'open') {
+    if (dialogs().length) return false;
+    const invoker = control(n.menu, 'Settings');
+    if (!invoker || invoker.getAttribute('aria-expanded') !== 'false') return false;
+    n.invoker = invoker;
+    n.dialogId = invoker.getAttribute('aria-controls');
+    invoker.click(); return true;
+  }
+  const current = dialogs();
+  // Capture even during cleanup after a failed mount observation.
+  if (!n.dialog && current.length === 1 && current[0].id === n.dialogId &&
+      n.invoker?.isConnected && n.invoker.getAttribute('aria-expanded') === 'true') n.dialog = current[0];
+  if (current.some(d => d !== n.dialog) || (n.dialog && current.length &&
+      ![n.page, 'overview'].includes(n.dialog.getAttribute('data-settings-view')))) return false;
+  if (action === 'closed') return current.length === 0;
+  if (action === 'finish') {
+    if (current.length) return false;
+    if (n.menu.open) n.trigger.click();
+    if (n.menu.open) return false;
+    delete window.__voxBenchmarkNavigation;
+    return true;
+  }
+  if (action === 'back' || action === 'close') {
+    if (!current.length) return true;
+    if (action === 'back' && n.dialog.getAttribute('data-settings-view') === 'overview') {
+      n.page = 'overview'; return true;
+    }
+    const e = control(n.dialog, action === 'back' ? 'Back to settings' : 'Close settings');
+    if (!e) return false;
+    if (action === 'back') n.page = 'overview';
+    e.click(); return true;
+  }
+  if (action === 'overview') return !current.length || n.dialog?.getAttribute('data-settings-view') === 'overview';
+  if (!n.dialog || !current.length || !visible(n.dialog)) return false;
+  if (action === 'mounted') return n.page === 'overview';
+  if (action === 'page') {
+    const e = control(n.dialog, page === 'web' ? 'Web research' : 'Voice and audio');
+    if (!e || n.page !== 'overview') return false;
+    n.page = page; e.click(); return true;
+  }
+  const e = control(n.dialog, label, 'input[role="switch"][aria-label]');
+  if (action === 'ready') return !!e && n.page === page;
+  if (action === 'toggle' && e && n.page === page) {
+    if (e.checked !== enabled) e.click();
+    return true;
+  }
+  return false;
+})()""".replace('FENCE', IDLE_FENCE)
+
+
+async def settings_navigation(ui, action, **args):
+    return await ui.evaluate(SETTINGS_NAVIGATION_JS.replace('ARGS', json.dumps(dict(action=action, **args)))) is True
+
+
+async def set_setting(ui, key, page, label, enabled):
+    if (await snapshot_preferences(ui)).get(key) is enabled:
         return
-    await click(ui, 'Settings')
+    token = os.urandom(16).hex()
+    async def step(action):
+        if not await settings_navigation(ui, action, token=token, page=page, label=label, enabled=enabled):
+            raise Blocked('settings_navigation_unavailable')
+    async def observe(action):
+        async def ready():
+            return await settings_navigation(ui, action, token=token, page=page, label=label, enabled=enabled)
+        await wait_condition(ready)
     try:
-        async def mounted():
-            return await ui.evaluate("""(() => {
-              const e = document.querySelector('input[aria-label="Allow web access"]');
-              return !!e && !e.disabled && !!e.getClientRects().length;
-            })()""") is True
-        await wait_condition(mounted)
-        async def toggle():
-            return await ui.evaluate(f"""(async () => {{
-              {IDLE_FENCE}
-              const e = document.querySelector('input[aria-label="Allow web access"]');
-              if (!e || e.disabled || !e.getClientRects().length) return false;
-              if (e.checked !== {json.dumps(enabled)}) e.click(); return true;
-            }})()""") is True
-        # Click once only; repeat observation, never generation or control admission.
-        if not await toggle():
-            raise Blocked('web_control_unavailable')
+        await step('begin')
+        await step('open')
+        await observe('mounted')
+        await step('page')
+        await observe('ready')
+        await step('toggle')  # Click once; confirmation only observes canonical preferences.
         async def confirmed():
-            return (await snapshot_preferences(ui)).get('web_enabled') is enabled
+            return (await snapshot_preferences(ui)).get(key) is enabled
         await wait_condition(confirmed)
     finally:
-        await click(ui, 'Close settings')
+        try:
+            await step('back')
+            await observe('overview')
+            await step('close')
+            await observe('closed')
+            await step('finish')
+        finally:
+            await step('finalize')
+
+
+async def set_web(ui, enabled):
+    await set_setting(ui, 'web_enabled', 'web', 'Allow web access', enabled)
 
 
 async def set_tts(ui, enabled):
-    if (await snapshot_preferences(ui)).get('tts_enabled') is enabled:
-        return
-    await click(ui, 'Speak replies')
-    async def confirmed():
-        return (await snapshot_preferences(ui)).get('tts_enabled') is enabled
-    await wait_condition(confirmed)
+    await set_setting(ui, 'tts_enabled', 'voice', 'Speak replies', enabled)
 
 
 async def select_model(ui, model):
@@ -713,16 +803,30 @@ async def select_model(ui, model):
     await wait_condition(confirmed)
 
 
-async def begin_ownership(ui):
-    result = await ui.evaluate("""(async () => {
-      const s = await window.__TAURI_INTERNALS__.invoke('get_app_snapshot');
-      if (window.__voxBenchmarkOwner || s.active_request !== null || s.runtime_phase !== 'sleeping' ||
-          document.getElementById('promptComposer')?.value !== '' ||
-          document.querySelector('[role=dialog]')) return false;
-      window.__voxBenchmarkOwner = {session:s.session_id, request:null, execution:null,
-        baseline:JSON.stringify(s.transcript.map(t => [t.request_id,t.execution_id]))};
-      return true;
-    })()""")
+BEGIN_OWNERSHIP_JS = """(async () => {
+      const token = OWNER_TOKEN;
+      if (window.__voxBenchmarkOwner || window.__voxBenchmarkAcquisition) return false;
+      const pending = {token};
+      window.__voxBenchmarkAcquisition = pending;
+      try {
+        const s = await window.__TAURI_INTERNALS__.invoke('get_app_snapshot');
+        // CDP can stop waiting while this native promise keeps running.
+        if (window.__voxBenchmarkAcquisition !== pending || window.__voxBenchmarkOwner ||
+            s.active_request !== null || s.runtime_phase !== 'sleeping' ||
+            document.getElementById('promptComposer')?.value !== '' ||
+            document.querySelector('[role=dialog]')) return false;
+        window.__voxBenchmarkOwner = {token, session:s.session_id, request:null, execution:null,
+          baseline:JSON.stringify(s.transcript.map(t => [t.request_id,t.execution_id]))};
+        return true;
+      } finally {
+        if (window.__voxBenchmarkAcquisition === pending) delete window.__voxBenchmarkAcquisition;
+      }
+    })()"""
+
+
+async def begin_ownership(ui, token=None):
+    token = token or os.urandom(16).hex()
+    result = await ui.evaluate(BEGIN_OWNERSHIP_JS.replace('OWNER_TOKEN', json.dumps(token)))
     if result is not True:
         raise Blocked('existing_draft_or_activity_must_not_be_touched')
 
@@ -802,7 +906,9 @@ async def new_chat(ui):
       const s = await window.__TAURI_INTERNALS__.invoke('get_app_snapshot');
       if (s.session_id !== window.__voxBenchmarkNextSession || s.active_request !== null ||
           s.transcript.length !== 0 || document.getElementById('promptComposer')?.value !== '') return false;
-      window.__voxBenchmarkOwner = {session:s.session_id, request:null, execution:null, baseline:'[]'};
+      window.__voxBenchmarkOwner = {token:window.__voxBenchmarkOwner.token,
+        navigationFailed:window.__voxBenchmarkOwner.navigationFailed,
+        session:s.session_id, request:null, execution:null, baseline:'[]'};
       window.__voxBenchmarkExecutions = [];
       delete window.__voxBenchmarkNextSession;
       return true;
@@ -850,6 +956,27 @@ async def terminal_validation(ui, case, request, metrics):
     return checks
 
 
+# Owner-token-scoped internal release also works after canonical fences change.
+# It deliberately leaves all UI and foreign bookkeeping untouched.
+RELEASE_OWNERSHIP_JS = """(() => {
+  const token = ARGS;
+  const owner = window.__voxBenchmarkOwner;
+  const n = window.__voxBenchmarkNavigation;
+  const pending = window.__voxBenchmarkAcquisition;
+  const ownsPending = pending?.token === token;
+  if (ownsPending) delete window.__voxBenchmarkAcquisition;
+  let clean = !n && (!pending || ownsPending);
+  if (n && n.owner.token === token) delete window.__voxBenchmarkNavigation;
+  if (!owner) return clean;
+  if (owner.token !== token) return false;
+  clean = clean && !owner.navigationFailed;
+  delete window.__voxBenchmarkExecutions;
+  delete window.__voxBenchmarkOwner;
+  delete window.__voxBenchmarkNextSession;
+  return clean;
+})()"""
+
+
 class DOMSuiteDriver:
     """Default adapter; semantic drivers implement these async operations instead.
 
@@ -864,9 +991,10 @@ class DOMSuiteDriver:
     def __init__(self, ui, exercise):
         self.ui = ui
         self._exercise = exercise
+        self.owner_token = os.urandom(16).hex()
 
     async def snapshot_preferences(self): return await snapshot_preferences(self.ui)
-    async def begin_ownership(self): return await begin_ownership(self.ui)
+    async def begin_ownership(self): return await begin_ownership(self.ui, self.owner_token)
     async def ownership(self, action='check', request=None): return await ownership(self.ui, action, request)
     async def set_tts(self, value): return await set_tts(self.ui, value)
     async def set_web(self, value): return await set_web(self.ui, value)
@@ -890,7 +1018,7 @@ class DOMSuiteDriver:
         if cleared is not True:
             raise Blocked('cleanup_ownership_fence_changed')
     async def release_ownership(self):
-        await self.ui.evaluate('delete window.__voxBenchmarkExecutions; delete window.__voxBenchmarkOwner; delete window.__voxBenchmarkNextSession')
+        return await self.ui.evaluate(RELEASE_OWNERSHIP_JS.replace('ARGS', json.dumps(self.owner_token))) is True
 
 
 async def exercise_semantic_with_native_status(driver, model, prompt, *, row, web_enabled, **kwargs):
@@ -943,7 +1071,16 @@ async def _run_suite(ui, args, report, exercise=None, stages=None, *, driver=Non
         raise Blocked('preconfigured_prefetch_completion_required')
     if original.get('deep_enabled') is True or original.get('review_enabled') is True:
         raise Blocked('single_generation_profile_required')
-    await driver.begin_ownership()
+    try:
+        await driver.begin_ownership()
+    except BaseException:
+        if not semantic:
+            try:
+                clean = await driver.release_ownership()
+                report['cleanup']['navigation'] = 'pass' if clean else 'fail'
+            except BaseException:
+                report['cleanup']['navigation'] = 'fail'
+        raise
     report.setdefault('admissions', {'submitted':0, 'observed':0, 'budget':getattr(args, 'max_live_calls', report['planned_admissions'])})
     observed_requests = set()
     async def submitted():
@@ -1051,45 +1188,56 @@ async def _run_suite(ui, args, report, exercise=None, stages=None, *, driver=Non
                     raise Blocked('scenario_validation_failed')
         report['status'] = 'unverified' if report['coverage'] == 'partial' or any(r['status'] == 'unverified' for r in report['cases']) else 'pass'
     finally:
-        # Never echo preferences. Restore only settings this controller changes.
-        report['cleanup']['preferences'] = 'fail'
-        errors = False
         try:
-            state = await driver.ownership()
-            if state == 'foreign':
-                raise Blocked('cleanup_foreign_session_or_execution')
-            if state in ('owned_active', 'pending'):
-                if state == 'owned_active' and await driver.ownership('cancel') == 'foreign':
-                    raise Blocked('cleanup_foreign_session_or_execution')
-                async def idle():
-                    state = await driver.ownership()
-                    if state == 'foreign':
-                        raise Blocked('cleanup_foreign_session_or_execution')
-                    return state == 'idle'
-                await wait_condition(idle, 20)
-            await ensure_idle()
-            prompts = [c['prompt'] for c in cases] + [prompt for c in cases if 'seed' in c for prompt in seed_prompts(args, c)]
-            await driver.clear_owned_draft(prompts)
-        except BaseException:
-            # A foreign successor must never be stopped or have its preferences changed.
-            report['cleanup']['preferences'] = 'blocked_ownership_fence'
-            raise Blocked('cleanup_ownership_or_retirement_incomplete') from None
-        # Attempt each restoration even if a different control or cancellation failed.
-        for restore, value in ((driver.select_model, original['instant']), (driver.set_web, original['web_enabled']), (driver.set_tts, original['tts_enabled'])):
+            # Never echo preferences. Restore only settings this controller changes.
+            report['cleanup']['preferences'] = 'fail'
+            errors = False
             try:
+                state = await driver.ownership()
+                if state == 'foreign':
+                    raise Blocked('cleanup_foreign_session_or_execution')
+                if state in ('owned_active', 'pending'):
+                    if state == 'owned_active' and await driver.ownership('cancel') == 'foreign':
+                        raise Blocked('cleanup_foreign_session_or_execution')
+                    async def idle():
+                        state = await driver.ownership()
+                        if state == 'foreign':
+                            raise Blocked('cleanup_foreign_session_or_execution')
+                        return state == 'idle'
+                    await wait_condition(idle, 20)
                 await ensure_idle()
-                await restore(value)
+                prompts = [c['prompt'] for c in cases] + [prompt for c in cases if 'seed' in c for prompt in seed_prompts(args, c)]
+                await driver.clear_owned_draft(prompts)
+            except BaseException:
+                # A foreign successor must never be stopped or have its preferences changed.
+                report['cleanup']['preferences'] = 'blocked_ownership_fence'
+                raise Blocked('cleanup_ownership_or_retirement_incomplete') from None
+            # Attempt each restoration even if a different control or cancellation failed.
+            for restore, value in ((driver.select_model, original['instant']), (driver.set_web, original['web_enabled']), (driver.set_tts, original['tts_enabled'])):
+                try:
+                    await ensure_idle()
+                    await restore(value)
+                except BaseException:
+                    errors = True
+            try:
+                restored = await driver.snapshot_preferences()
+                errors |= any(restored.get(k) != original.get(k) for k in original)
             except BaseException:
                 errors = True
-        try:
-            restored = await driver.snapshot_preferences()
-            errors |= any(restored.get(k) != original.get(k) for k in original)
-            await driver.release_ownership()
-        except BaseException:
-            errors = True
-        if errors:
-            raise Blocked('cleanup_restore_incomplete')
-        report['cleanup']['preferences'] = 'pass'
+            if errors:
+                raise Blocked('cleanup_restore_incomplete')
+            report['cleanup']['preferences'] = 'pass'
+        finally:
+            try:
+                released = await driver.release_ownership()
+            except BaseException:
+                if not semantic:
+                    report['cleanup']['navigation'] = 'fail'
+                raise
+            if not semantic:
+                report['cleanup']['navigation'] = 'pass' if released else 'fail'
+                if not released:
+                    raise Blocked('cleanup_restore_incomplete')
 
 
 def checked_metrics(metrics):
