@@ -11873,6 +11873,22 @@ fn capability_available(capabilities: &[CapabilityPayload], id: &str) -> bool {
     })
 }
 
+async fn start_completion_runtime_for_publication(
+    config: &voxgolem_core::config::CompletionConfig,
+) -> Result<voxgolem_platform::completion::CompletionRuntime, String> {
+    voxgolem_platform::completion::CompletionRuntime::start_with_policy(
+        &config.server_path,
+        &config.model_path,
+        platform_inference_policy(config.inference_provider),
+    )
+    .await
+    .map_err(|_| {
+        String::from(
+            "completion runtime failed to initialize; check the completion server and model configuration, then restart the app",
+        )
+    })
+}
+
 fn fail_startup_capability(
     lifecycle_gate: &Mutex<()>,
     startup_state: &Arc<Mutex<StartupStatePayload>>,
@@ -14908,13 +14924,7 @@ pub fn run() {
                 )
                 .map_err(std::io::Error::other)?;
                 tauri::async_runtime::spawn(async move {
-                    match voxgolem_platform::completion::CompletionRuntime::start_with_policy(
-                        &config.server_path,
-                        &config.model_path,
-                        platform_inference_policy(config.inference_provider),
-                    )
-                    .await
-                    {
+                    match start_completion_runtime_for_publication(&config).await {
                         Ok(runtime) => {
                             let actual_provider =
                                 actual_inference_provider_name(runtime.actual_provider());
@@ -14948,7 +14958,7 @@ pub fn run() {
                             &app_handle.state::<AppState>().lifecycle_gate,
                             &app_handle.state::<AppState>().startup_state,
                             "qwen_prediction",
-                            format!("failed to start completion runtime: {error}"),
+                            error,
                         ),
                     }
                 });
@@ -20150,6 +20160,69 @@ mod tests {
             capability["permissions"],
             serde_json::json!(["core:event:allow-listen", "core:event:allow-unlisten"])
         );
+    }
+
+    #[tokio::test]
+    async fn privacy_completion_loader_failure_publishes_categorical_capability() {
+        let root = tempfile::Builder::new()
+            .prefix("SYNTHETIC_PRIVATE_COMPLETION_")
+            .tempdir()
+            .unwrap();
+        let config = voxgolem_core::config::CompletionConfig {
+            server_path: root.path().join("missing-server"),
+            model_path: root.path().join("missing-model.gguf"),
+            inference_provider: voxgolem_core::config::InferencePolicy::Auto,
+        };
+        let raw_error = match voxgolem_platform::completion::CompletionRuntime::start_with_policy(
+            &config.server_path,
+            &config.model_path,
+            super::platform_inference_policy(config.inference_provider),
+        )
+        .await
+        {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("synthetic missing server must fail before process launch"),
+        };
+        assert!(raw_error.contains("SYNTHETIC_PRIVATE_COMPLETION_"));
+        let reason = match super::start_completion_runtime_for_publication(&config).await {
+            Err(reason) => reason,
+            Ok(_) => panic!("synthetic missing server must fail before process launch"),
+        };
+        let startup = Arc::new(Mutex::new(StartupStatePayload::Ready {
+            cue_asset_paths: super::embedded_cue_asset_paths(),
+            runtime_phase: RuntimePhasePayload::Sleeping,
+            voice_input_available: false,
+            voice_input_error: None,
+            initial_silence_timeout_ms: DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
+            silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
+            selected_response_profile: ResponseProfilePayload::Fast,
+            supported_response_profiles: vec![ResponseProfilePayload::Fast],
+            prompt_cancellation_available: false,
+            tts_enabled: false,
+            tts_output_gain_db: 0.0,
+            capabilities: vec![CapabilityPayload {
+                id: "qwen_prediction",
+                state: CapabilityStatePayload::Warming,
+                reason: String::from("completion model is loading"),
+                actual_provider: Some("cpu"),
+            }],
+        }));
+        super::fail_startup_capability(&Mutex::new(()), &startup, "qwen_prediction", reason);
+        let payload = serde_json::to_value(&*startup.lock().unwrap()).unwrap();
+        let serialized = payload.to_string();
+        assert!(!serialized.contains("SYNTHETIC_PRIVATE_COMPLETION_"));
+        assert!(!serialized.contains(&raw_error));
+        assert!(!serialized.contains("missing-server"));
+        assert!(!serialized.contains("missing-model.gguf"));
+        assert_eq!(payload["kind"], "ready");
+        assert_eq!(payload["capabilities"][0]["state"], "failed");
+        assert!(payload["capabilities"][0]["actual_provider"].is_null());
+        assert_eq!(
+            payload["capabilities"][0]["reason"],
+            "completion runtime failed to initialize; check the completion server and model configuration, then restart the app"
+        );
+        let ipc = super::ipc_capabilities(&startup.lock().unwrap());
+        assert_eq!(serde_json::to_value(ipc).unwrap(), payload["capabilities"]);
     }
 
     #[test]
