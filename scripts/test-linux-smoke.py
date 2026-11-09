@@ -33,6 +33,8 @@ pathlib.Path(RESULT).write_text(json.dumps({
     "environment": sorted(os.environ),
     "diagnostics": os.environ.get("VOXGOLEM_STARTUP_DIAGNOSTICS"),
     "arguments": sys.argv[1:],
+    "uid": os.getuid(),
+    "gid": os.getgid(),
 }))
 print("VOXGOLEM_STARTUP_ENTER", flush=True)
 if MODE == "exit":
@@ -58,6 +60,8 @@ time.sleep(120)
             elapsed = time.monotonic() - started
             self.assertTrue(result_file.exists(), process.stderr)
             result = json.loads(result_file.read_text())
+            if os.environ.get("VOXGOLEM_SMOKE_NAMESPACE_MODE") == "privileged-network":
+                self.assertEqual((result["uid"], result["gid"]), (os.getuid(), os.getgid()))
             self.assertEqual(result["arguments"], ["--appimage-extract-and-run"] if kind == "appimage" else [])
             smoke_dir = Path(result["config"]).parent.parent
             self.assertFalse(smoke_dir.exists(), "private directory leaked")

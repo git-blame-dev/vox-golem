@@ -10,6 +10,8 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    env:
+      VOXGOLEM_SMOKE_NAMESPACE_MODE: privileged-network
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
@@ -158,6 +160,8 @@ jobs:
 
   native-artifact:
     runs-on: ubuntu-24.04
+    env:
+      VOXGOLEM_SMOKE_NAMESPACE_MODE: privileged-network
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6

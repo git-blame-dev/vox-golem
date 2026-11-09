@@ -12,6 +12,16 @@ case "$1" in
   appimage) post_ready=5; arguments=(--appimage-extract-and-run) ;;
   *) exit 2 ;;
 esac
+namespace_command=(unshare --user --map-root-user --net --)
+case "${VOXGOLEM_SMOKE_NAMESPACE_MODE:-user}" in
+  user) ;;
+  privileged-network)
+    # Hosted Ubuntu restricts unprivileged user namespaces. Elevate only the
+    # namespace setup, then drop identity before the isolated environment/app.
+    namespace_command=(sudo -n unshare --net --setgid "$(id -g)" --setuid "$(id -u)" --)
+    ;;
+  *) printf '%s\n' 'Unsupported Linux smoke namespace mode.' >&2; exit 2 ;;
+esac
 executable="$(realpath -- "$2")"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 umask 077
@@ -48,7 +58,7 @@ printf '%s\n' 'auto_update_download = false' 'auto_update_install = false' \
 # belong to that namespace. Private bus/audio endpoints avoid host services.
 (
   cd "$smoke_dir/work"
-  exec setsid env -i PATH=/usr/bin:/bin LANG=C.UTF-8 \
+  exec setsid "${namespace_command[@]}" env -i PATH=/usr/bin:/bin LANG=C.UTF-8 \
     HOME="$smoke_dir/home" XDG_CONFIG_HOME="$smoke_dir/config" \
     XDG_DATA_HOME="$smoke_dir/data" XDG_STATE_HOME="$smoke_dir/state" \
     XDG_CACHE_HOME="$smoke_dir/cache" XDG_RUNTIME_DIR="$smoke_dir/runtime" \
@@ -58,6 +68,6 @@ printf '%s\n' 'auto_update_download = false' 'auto_update_install = false' \
     PULSE_SERVER="unix:$smoke_dir/runtime/no-pulse" \
     VOXGOLEM_CONFIG_PATH="$smoke_dir/config/config.toml" \
     VOXGOLEM_STARTUP_DIAGNOSTICS=1 \
-    unshare --user --map-root-user --net -- xvfb-run -a "$executable" "${arguments[@]}"
+    xvfb-run -a "$executable" "${arguments[@]}"
 ) > "$smoke_dir/output.log" 2>&1 & smoke_pid=$!
 bash "$root/scripts/wait-for-appimage-startup.sh" "$smoke_pid" "$smoke_dir/output.log" 30 "$post_ready"
