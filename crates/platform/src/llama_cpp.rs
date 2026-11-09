@@ -1,7 +1,7 @@
 use crate::inference::{ActualInferenceProvider, InferencePolicy};
-use crate::managed_process::{
-    ensure_role_retired, LaunchError, LaunchGate, ManagedProcess, ProcessRole,
-};
+#[cfg(not(test))]
+use crate::managed_process::ensure_role_retired;
+use crate::managed_process::{LaunchError, LaunchGate, ManagedProcess, ProcessRole};
 use rand::random;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
@@ -313,6 +313,8 @@ impl LlamaCppRuntime {
             policy,
             LlamaCppServerMode::Embedding,
             Some(&startup_cancellation),
+            #[cfg(test)]
+            &crate::managed_process::TestProcessPool::new(),
         )
     }
 
@@ -326,6 +328,8 @@ impl LlamaCppRuntime {
             policy,
             LlamaCppServerMode::Chat,
             cancellation.as_ref(),
+            #[cfg(test)]
+            &crate::managed_process::TestProcessPool::new(),
         )
     }
 
@@ -334,11 +338,14 @@ impl LlamaCppRuntime {
         policy: InferencePolicy,
         mode: LlamaCppServerMode,
         cancellation: Option<&LlamaCppStartupCancellation>,
+        #[cfg(test)] test_process_pool: &crate::managed_process::TestProcessPool,
     ) -> Result<Self, LlamaCppRuntimeError> {
-        ensure_role_retired(ProcessRole::LlamaCpp).map_err(|_| {
-            LlamaCppRuntimeError::SpawnFailed {
-                details: "managed_process_retirement_pending".into(),
-            }
+        #[cfg(not(test))]
+        let retired = ensure_role_retired(ProcessRole::LlamaCpp);
+        #[cfg(test)]
+        let retired = test_process_pool.ensure_retired(ProcessRole::LlamaCpp);
+        retired.map_err(|_| LlamaCppRuntimeError::SpawnFailed {
+            details: "managed_process_retirement_pending".into(),
         })?;
         if cancellation.is_some_and(LlamaCppStartupCancellation::is_cancelled) {
             return Err(LlamaCppRuntimeError::StartupCancelled);
@@ -370,7 +377,14 @@ impl LlamaCppRuntime {
         let mut last_error = None;
         for (index, cuda) in attempts.into_iter().enumerate() {
             let Some(cuda) = cuda else { break };
-            match Self::start_owned(spec.clone(), cuda, mode, cancellation) {
+            match Self::start_owned(
+                spec.clone(),
+                cuda,
+                mode,
+                cancellation,
+                #[cfg(test)]
+                test_process_pool,
+            ) {
                 Ok(runtime) => return Ok(runtime),
                 Err(error) => {
                     let retryable = matches!(
@@ -393,6 +407,7 @@ impl LlamaCppRuntime {
         cuda: bool,
         mode: LlamaCppServerMode,
         cancellation: Option<&LlamaCppStartupCancellation>,
+        #[cfg(test)] test_process_pool: &crate::managed_process::TestProcessPool,
     ) -> Result<Self, LlamaCppRuntimeError> {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         if cancellation.is_some_and(|token| token.is_cancelled()) {
@@ -449,23 +464,27 @@ impl LlamaCppRuntime {
         if cancellation.is_some() {
             gate = gate.with_cancellation(&check_cancelled);
         }
-        let child = ManagedProcess::spawn_owned_with(&mut command, ProcessRole::LlamaCpp, &gate)
-            .map_err(|error| match error {
-                LaunchError::Cancelled => LlamaCppRuntimeError::StartupCancelled,
-                LaunchError::TimedOut => LlamaCppRuntimeError::StartupTimedOut {
-                    host: spec.host().to_string(),
-                    port: spec.port(),
-                },
-                LaunchError::ChildExited(exit_code) => {
-                    LlamaCppRuntimeError::ServerExited { exit_code }
-                }
-                LaunchError::Supervision(details) => {
-                    LlamaCppRuntimeError::ProcessJobFailed { details }
-                }
-                LaunchError::Spawn(error) => LlamaCppRuntimeError::SpawnFailed {
-                    details: error.to_string(),
-                },
-            })?;
+        #[cfg(not(test))]
+        let child = ManagedProcess::spawn_owned_with(&mut command, ProcessRole::LlamaCpp, &gate);
+        #[cfg(test)]
+        let child = test_process_pool
+            .reserve(ProcessRole::LlamaCpp)
+            .map_err(LaunchError::Spawn)
+            .and_then(|reservation| {
+                reservation.spawn_std_with(&mut command, &gate, Command::spawn)
+            });
+        let child = child.map_err(|error| match error {
+            LaunchError::Cancelled => LlamaCppRuntimeError::StartupCancelled,
+            LaunchError::TimedOut => LlamaCppRuntimeError::StartupTimedOut {
+                host: spec.host().to_string(),
+                port: spec.port(),
+            },
+            LaunchError::ChildExited(exit_code) => LlamaCppRuntimeError::ServerExited { exit_code },
+            LaunchError::Supervision(details) => LlamaCppRuntimeError::ProcessJobFailed { details },
+            LaunchError::Spawn(error) => LlamaCppRuntimeError::SpawnFailed {
+                details: error.to_string(),
+            },
+        })?;
 
         let mut runtime = Self {
             spec,
@@ -2529,11 +2548,19 @@ mod tests {
             "test",
         );
         let cancel = super::LlamaCppStartupCancellation::default();
-        let worker = LlamaCppRuntime::start_with_policy_cancellation(
-            spec,
-            InferencePolicy::Cpu,
-            cancel.clone(),
-        );
+        let pool = crate::managed_process::TestProcessPool::new();
+        let worker_pool = pool.clone();
+        let worker_spec = spec.clone();
+        let worker_cancel = cancel.clone();
+        let worker = thread::spawn(move || {
+            LlamaCppRuntime::start_with_mode_and_cancellation(
+                worker_spec,
+                InferencePolicy::Cpu,
+                super::LlamaCppServerMode::Chat,
+                Some(&worker_cancel),
+                &worker_pool,
+            )
+        });
         let deadline = Instant::now() + Duration::from_secs(5);
         let pid = loop {
             if let Ok(marker) = std::fs::read_to_string(&marker) {
@@ -2551,6 +2578,28 @@ mod tests {
             Path::new(&format!("/proc/{pid}")).exists(),
             "owned child must exist before cancellation"
         );
+        // An independently owned fixture must attach while this startup owns a child.
+        // Catch the assertion so cancellation/reaping still runs on regression.
+        let attachment = std::panic::catch_unwind(|| {
+            let blocked = LlamaCppRuntime::start_with_mode_and_cancellation(
+                spec,
+                InferencePolicy::Cpu,
+                super::LlamaCppServerMode::Chat,
+                None,
+                &pool,
+            );
+            assert!(matches!(
+                blocked,
+                Err(LlamaCppRuntimeError::SpawnFailed { details })
+                    if details == "managed_process_retirement_pending"
+            ));
+            start_reuses_running_server_and_does_not_stop_external_server_behavior();
+            start_embedding_attaches_to_compatible_external_embedding_server();
+            assert!(Path::new(&format!("/proc/{pid}")).exists());
+            assert!(pool
+                .ensure_retired(crate::managed_process::ProcessRole::LlamaCpp)
+                .is_err());
+        });
         cancel.cancel();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !worker.is_finished() {
@@ -2569,6 +2618,9 @@ mod tests {
             !Path::new(&format!("/proc/{pid}")).exists(),
             "actual startup child must be reaped"
         );
+        if let Err(panic) = attachment {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]

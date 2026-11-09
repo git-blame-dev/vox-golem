@@ -333,6 +333,18 @@ impl Supervisor {
             );
         }
     }
+    fn ensure_retired(&self, slot: usize) -> io::Result<()> {
+        if lock(&self.slots)[slot]
+            .as_ref()
+            .is_some_and(|mailbox| mailbox.outcome() != Outcome::Retired)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "managed process lane is occupied",
+            ));
+        }
+        Ok(())
+    }
     async fn wait_for_retirement(&self, timeout: Duration) -> io::Result<()> {
         let deadline = Instant::now() + timeout;
         let mailboxes = lock(&self.slots).clone();
@@ -355,17 +367,10 @@ fn supervisor() -> io::Result<&'static Arc<Supervisor>> {
 
 /// Do not mistake a server still owned by this process's cleanup lane for an
 /// independently managed external HTTP server during fallback/attachment.
+#[cfg(not(test))]
 pub(crate) fn ensure_role_retired(role: ProcessRole) -> io::Result<()> {
     if let Some(Ok(supervisor)) = SUPERVISOR.get() {
-        if lock(&supervisor.slots)[role as usize]
-            .as_ref()
-            .is_some_and(|mailbox| mailbox.outcome() != Outcome::Retired)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "managed process lane is occupied",
-            ));
-        }
+        supervisor.ensure_retired(role as usize)?;
     }
     Ok(())
 }
@@ -394,6 +399,9 @@ impl TestProcessPool {
     }
     pub(crate) fn reserve(&self, _role: ProcessRole) -> io::Result<ProcessReservation> {
         self.0.reserve(0)
+    }
+    pub(crate) fn ensure_retired(&self, _role: ProcessRole) -> io::Result<()> {
+        self.0.ensure_retired(0)
     }
 }
 
@@ -1522,6 +1530,7 @@ impl std::fmt::Debug for ManagedProcess {
     }
 }
 impl ManagedProcess {
+    #[cfg(not(test))]
     pub(crate) fn spawn_owned_with(
         command: &mut Command,
         role: ProcessRole,
@@ -2408,6 +2417,7 @@ mod tests {
     #[test]
     fn reservation_rejects_before_launch_and_drop_is_nonblocking() {
         let scope = Scope::new(1);
+        scope.0.ensure_retired(0).unwrap();
         let mut process = scope
             .reserve(0)
             .spawn_std(&mut command("exec sleep 30"))
@@ -2431,11 +2441,14 @@ mod tests {
             !launched,
             "capacity is checked before entering the real spawn path"
         );
+        assert!(scope.0.ensure_retired(0).is_err());
         let start = Instant::now();
         drop(process);
         assert!(start.elapsed() < Duration::from_millis(100));
         assert!(scope.0.reserve(0).is_err());
+        assert!(scope.0.ensure_retired(0).is_err());
         mailbox.wait(Duration::from_secs(3)).unwrap();
+        scope.0.ensure_retired(0).unwrap();
         drop(scope.reserve(0));
     }
 
@@ -2490,6 +2503,7 @@ mod tests {
         scope.0.paused.store(false, Ordering::Release);
         assert!(mailbox.wait(Duration::from_secs(1)).is_err());
         assert!(scope.0.reserve(0).is_err());
+        assert!(scope.0.ensure_retired(0).is_err());
         assert!(mailbox.bundle.get().is_some());
         mailbox.panic_poll.store(true, Ordering::Release);
         mailbox.fail_wait.store(false, Ordering::Release);
@@ -2499,6 +2513,7 @@ mod tests {
         }
         assert_eq!(mailbox.outcome(), Outcome::Unavailable);
         assert!(scope.0.reserve(0).is_err());
+        assert!(scope.0.ensure_retired(0).is_err());
         // Explicit fixture cleanup, not a production fallback/restarted worker.
         let deadline = Instant::now() + Duration::from_secs(3);
         while !lock(mailbox.bundle.get().unwrap()).poll().unwrap() {
