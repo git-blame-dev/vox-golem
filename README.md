@@ -1,298 +1,148 @@
-# Vox Golem
+# 🎙️ Vox Golem
 
 [![Linux CI](https://github.com/git-blame-dev/vox-golem/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/git-blame-dev/vox-golem/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/git-blame-dev/vox-golem?label=release&logo=github&logoColor=white)](https://github.com/git-blame-dev/vox-golem/releases/latest)
-[![Ubuntu 24.04 x86_64](https://img.shields.io/badge/Ubuntu%2024.04-x86__64-E95420?logo=ubuntu&logoColor=white)](#supported-linux-baseline)
 
-Vox Golem is a Linux-first assistant with Linux/Windows Tauri desktop, Android phone, and native Wear OS shells. Desktop supports typed or spoken developer prompts, including configured wake-word capture and local transcription. Phone and watch can each run foreground Custom-provider chat; neither requires the other to execute its provider request once credentials and network access are available.
+A voice and chat assistant for desktop, Android and Wear OS, with configurable response backends, local desktop transcription, and shared phone/watch conversations.
 
-Desktop and phone share the responsive React UI. Wear uses native Kotlin/Compose and an ARM32 Rust JNI library, not a WebView. Browser preview uses the same React tree with a labelled deterministic simulated runtime.
+![Earlier Vox Golem desktop interface showing a demonstration conversation](docs/assets/demo.gif)
 
-## Platform boundaries
+*Earlier desktop interface; the current app uses Material 3 navigation.*
 
-| Capability | Linux/Windows desktop | Android phone | Wear OS |
-| --- | --- | --- | --- |
-| Chat providers | Local, Custom, OpenCode | Custom; foreground only | Custom; foreground only |
-| Conversation storage | Desktop lifecycle; no phone/Wear replication wiring | App-private SQLite, local drafts, conversation/head selection | Same native store/domain; local drafts and conversation/head selection |
-| Phone/Wear conversation sync | Not wired | Automatic native-paired sharing | Automatic native-paired sharing |
-| Assistant speech | Configured desktop wake/VAD/transcription/TTS | Native admission enabled; on-device dictation requires installed language support; optional local TTS | On-device SDK dictation when installed language support is proven; optional local TTS |
-| Voice notes | No native watch capture runtime | Watch-audio recognition, history and SAF/Org export | Durable local recording with phone preview/archive transfer |
-| Desktop-only features | Completion, Deep/Review, prefetch, signed updates | Capability-gated off | Not included |
+## 🔎 Overview
 
-Linux builds and tests do not establish Windows, Android or Wear runtime readiness. Real microphone, speech provider, gestures, lifecycle, GMS transport and optimized JNI paths require device acceptance.
+Vox Golem combines hands-free desktop voice capture and typed chat with phone and watch assistants. Desktop and phone share one React interface; Wear uses a native Kotlin/Compose shell. Shared Rust code owns portable conversation and speech policy, with platform adapters for storage, audio and device lifecycle.
 
-## Desktop speech
+Desktop offers local `llama.cpp`, Custom and OpenCode backends. Phone and Wear use Custom-provider chat and can each execute requests once access and connectivity are available. Phone/watch conversation sharing uses native pairing; it does not replicate desktop history.
 
-Desktop speech uses Neural TTS exclusively, configured under `[tts]` in the runtime config.
-Neural TTS supplies synthesis and its installed voice catalog over loopback;
-Vox owns bounded native playback, Stop, cues and output drain. Settings exposes
-voice selection and an explicit service reconnect. Android and Wear continue to
-use their native TTS SDKs, with portable delivery and voice eligibility in Rust.
+## ✨ Features
 
-`endpoint` defaults to `http://127.0.0.1:8765`. Leave `start_command = []` for an
-externally managed service, or configure a trusted executable and literal argument
-array to start it on demand. No shell expansion is performed. The service and its
-models are installed separately; model/reference paths belong to its local config.
-Vox releases only its own session when exiting and never terminates another client's
-service. Service startup and inference can delay the first reply. Current Qwen
-produces complete utterances; framed PCM transport does not imply incremental model
-audio. Fixed spoken cues prepare outside microphone admission, with embedded cues
-available immediately. The service handshake supplies the actual audio sample rate;
-Vox retains bounded audio duration, buffer size and output gain.
+- Desktop wake-word capture, voice activity detection and local transcription, with typed prompts in the same conversation view.
+- Configurable local and remote response backends, optional desktop completion, and model-led web tools controlled by a Web permission.
+- Desktop spoken replies through an external Neural TTS service, with native playback and cancellation. Phone and watch use native speech SDKs.
+- Shared phone/watch conversation history, with local drafts and explicit conversation branches.
+- Phone **Vox Chat**, **Vox Ask** and **Vox Talk** launchers, plus a separate watch voice-note capture and phone export workflow.
+- Signed desktop updater packages, with automatic installation gated on the app being idle.
 
-New configurations omit `provider` and all Piper tuning keys (`model_path`,
-`worker_count`, `max_queue`, `sample_rate_hz`). Existing explicit `provider = "neural"`
-files still load, discarding those obsolete tuning keys. Explicit `provider = "piper"`
-is rejected with migration guidance; install/configure Neural and remove the old
-provider and tuning keys before enabling desktop speech.
+Feature availability depends on platform, configured assets, permissions and provider support. The [platform matrix](docs/technical-guide.md#platform-boundaries) describes those boundaries.
 
-## Desktop local diagnostics
+## 🛠️ Tech Stack
 
-`[telemetry].enabled` controls categorical model metadata; `[logging].enabled` controls categorical frontend/TTS events. Neither accepts prompt/answer/error text, paths, endpoints or request IDs. Model identifiers come from a closed public vocabulary. These desktop settings do not change Android/Wear diagnostics.
+- **Desktop and phone shells:** Tauri 2 with Rust; Android native plugins use Kotlin.
+- **Shared interface:** React 19, TypeScript, Vite, Bun, Vitest and ESLint.
+- **Wear interface:** Kotlin/Compose with Rust through JNI.
+- **Portable runtime:** Rust workspace for conversation policy, provider tools, speech delivery and platform contracts.
+- **Desktop voice:** native capture, wake-word detection, Silero VAD, local transcription and an external Neural TTS service.
+- **Mobile storage and transport:** app-private SQLite and native Wear Data Layer exchanges.
+- **CI / packaging:** Linux-hosted GitHub Actions, Linux AppImage packaging, Windows NSIS cross-builds, and Android/Wear builds.
 
-The single background writer stores **schema 2 JSONL** in the state directory's `diagnostics/`: Linux `${XDG_STATE_HOME:-$HOME/.local/state}/voxgolem/diagnostics/`, Windows `%LOCALAPPDATA%/VoxGolem/diagnostics/`. Read `events-000.jsonl` through the configured final slot. `timestamp_ms` is the native observation time captured at nonblocking admission; `persisted_ms` is the separate writer wall-clock observation, not a duration or durability receipt. Numeric `process_id` and process-local `event_sequence` help correlate a run; the persisted `rotation_sequence` orders file eviction even when timestamps tie or the process restarts. These are not globally unique durable IDs. Each row contains only a categorical `record`. The empty `writer.lock` sidecar is stable and must not be removed while an app is running. Only one process writes this directory; another process reports an unavailable writer without interrupting chat. Unix directories/files use owner-only permissions.
+## 🧠 Engineering Highlights
 
-Both streams share `[telemetry].max_bytes` per file and `backup_count + 1` file slots (so the example caps JSONL storage at 40 MiB across four files, plus one empty lock file). Files roll at observation UTC-day boundaries or the size limit. Maximum retention is 90 days, conservatively measured from the observation day's start, not file modification time; startup, pre-write and at-most-60-second periodic maintenance prune expired files while a writer is running. An already-expired or future-dated queued observation is discarded visibly rather than given a fresh timestamp. Files can therefore expire up to one day early, and byte/file budgets may evict them sooner. No process can perform maintenance while the app is stopped; expired files are pruned on the next successful writer startup. Legacy `telemetry.jsonl*` and `logs/runtime.log` are neither read, migrated nor managed by this owner.
+- Shared domain rules keep desktop, phone and Wear behavior aligned while adapters own platform effects and resource cleanup.
+- Bounded audio, tool and diagnostic work protects responsiveness; cancellation and ownership checks prevent stale operations from taking over newer work.
+- Phone/watch synchronization exchanges immutable conversation records with receiver commit and explicit acknowledgements. Concurrent continuations retain separate heads.
+- Optional desktop diagnostics use categorical records, bounded storage and a maximum 90-day retention policy; they exclude raw prompts, answers, audio and credentials.
+- Model assets, configuration, credentials, recordings and generated reports remain outside source control. Listening cues have a [reproducible synthetic source](scripts/listening-cues.md).
 
-Admission uses a bounded 128-record nonblocking queue. The existing `record_frontend_runtime_diagnostic` command accepts only `{event: {kind: <fixed category>}}`, rejecting extra envelope/event fields, and returns atomic counters: `enabled`, `admitted`, `dropped`, `written`, `failures`, `unavailable`, `stopping`, `stopped`. These observations remain available if disk I/O blocks; they are not a transactional snapshot. Queue overflow, unavailable storage, expiry and shutdown can drop records. `written` means a complete write call, **not fsync or durable storage**. Shutdown requests a bounded drain and waits at most 250 ms in the existing async cleanup. A blocked worker remains truthfully `stopped: false`, but optional diagnostics cannot veto completed essential native cleanup or updater eligibility. With both streams disabled there is no diagnostics thread or filesystem access. No diagnostic data is exported automatically.
+## 🏗️ Architecture
 
-## Android and Wear builds
-
-Run from this source checkout on Linux. Use JDK 21, Android SDK platform/build tools 36, NDK 28.2.13676358 and Tauri CLI 2.11.1. Set `JAVA_HOME`, `ANDROID_HOME`, and `NDK_HOME`; put the JDK's `bin` on `PATH`. Rust targets are `aarch64-linux-android` for the phone and `armv7-linux-androideabi` for the current Wear APK. JNI builds use cached Cargo dependencies (`--offline --locked`).
-
-```bash
-make android-build           # ARM64 phone debug APK, including both native plugins
-make android-release         # optimized ARM64 phone release APK; unsigned without local signing config
-make android-assistant-test  # shared Assistant + phone bridge unit tests and lint
-make android-capture-test    # shared capture + phone plugin unit tests and lint
-make wear-test               # shared libraries + Wear unit tests and lint
-make wear-build              # ARM32 Wear debug APK
-make wear-performance        # optimized, non-debuggable, debug-signed local trial
+```text
+Desktop / Android phone                 Wear OS
+React + Tauri                           Kotlin / Compose
+       |                                      |
+       +---------- native adapters -----------+
+                          |
+                 Shared Rust domain
+          conversation / speech / provider tools
+                          |
+       local runtimes / remote providers / platform SDKs
 ```
 
-Phone output: `apps/android-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/debug/`. Wear outputs: `apps/wear/app/build/outputs/apk/{debug,performance}/`. An optimized local trial is not a production-signed release. These commands build/check source; they do not install anything.
+The shared frontend owns interaction and pending projections. Rust owns canonical portable transitions; native shells own permissions, audio, storage and lifecycle. Phone/watch replication is separate from provider credentials and from voice-note capture.
 
-Phone release output is `apps/android-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk` with the current unsigned release configuration. `android-release` uses Tauri's default release mode (optimized Rust and R8, no debug profile override). Linux CI retains the debug checks and additionally publishes `vox-golem-android-optimized-ci-arm64-debug-key`: an aligned, non-debuggable ARM64 release APK signed with that job's existing Android debug key, plus R8 mapping, signature/inspection evidence and APK SHA-256. This is a **CI trial, not production signing**, and its certificate is not guaranteed compatible with installed phone/Watch apps. It does not change local signing configuration or authorize installation. See the [phone build guide](apps/android-tauri/README.md#optimized-release-and-ci-trial) for checks and remaining device acceptance.
+Key directories:
 
-`make android-init` is the only phone scaffold-regeneration command. Keep authored configuration, native libraries and UI sources outside generated output; launcher assets derive from the canonical [SVG](apps/desktop-tauri/src-tauri/icons/icon.svg). The [phone shell guide](apps/android-tauri/README.md) covers native setup, and the [Wear guide](apps/wear/README.md) covers launchers and device gates.
+- [`frontend/app/`](frontend/app/) — shared React interface and browser preview.
+- [`apps/desktop-tauri/`](apps/desktop-tauri/) — Linux/Windows shell and packaging.
+- [`apps/android-tauri/`](apps/android-tauri/README.md) — phone shell and build guide.
+- [`apps/wear/`](apps/wear/README.md) — native Wear shell and build guide.
+- [`crates/core/`](crates/core/) and [`crates/platform/`](crates/platform/) — portable domain and platform contracts.
+- [`crates/assistant-android/`](crates/assistant-android/README.md) and [`crates/capture-android/`](crates/capture-android/README.md) — shared native mobile adapters.
+- [`Makefile`](Makefile) — local verification, build and packaging commands.
 
-## Shared phone/Wear Assistant
+## 🚀 Getting Started
 
-Phone and watch retain the **same conversation identities and completed turns** after native enrollment and reconciliation, while drafts, selected heads, running requests and provisional text remain local. Concurrent continuations remain branches: choose a head before sending rather than silently merging sibling answers. New Chat retains existing conversations.
+### Supported Linux baseline
 
-Rust core owns immutable operations, snapshot validation, merge/deletion rules and bounded context selection. The shared headless JNI bridge applies those rules; [AssistantRuntime](crates/assistant-android/src/main/java/dev/gitblame/voxgolem/assistant/runtime/AssistantRuntime.kt) owns one engine per process. [AssistantStore](crates/assistant-android/src/main/java/dev/gitblame/voxgolem/assistant/AssistantStore.kt) owns app-private SQLite transactions, including revision checks, outboxes and exact per-peer receipts. Installation replica IDs and credentials are excluded from backup. Provisional output is not history: successful delivery gating and a local commit are required before a completed turn is published.
+The desktop release baseline is Ubuntu 24.04 LTS x86_64, including WSL2/WSLg. Windows 11 x64 is a separate runtime target; Linux checks do not establish Windows readiness.
 
-Conversation replication uses bounded, finite GMS DataItem/Asset exchanges of immutable records, never an imported database snapshot or a remote-generation command. Receiver commit precedes exact-body ACK; SDK submission alone is not proof of synchronization. Wear Data Layer may route through encrypted Google servers when direct connectivity is unavailable, so this is **not a cloud-free transport**. Custom prompts and answers also go to the configured remote provider. See the [shared native Assistant guide](crates/assistant-android/README.md) for ownership and canonical source links.
+For Linux development, use Bun 1.3.9, Rust 1.95.0 and Tauri CLI 2.11.1 with the native packages in the [setup guide](docs/technical-guide.md#wsl2wslg-setup). Android/Wear also need JDK 21, SDK platform 36 (plus platform 37.0 for Wear), build tools 36 and NDK 28.2.13676358; see the [mobile build prerequisites](docs/technical-guide.md#android-and-wear-builds).
+
+### Configure local assets
+
+On Linux, copy [`config.example.toml`](config.example.toml) to `${XDG_CONFIG_HOME:-$HOME/.config}/voxgolem/config.toml`. Windows uses `%APPDATA%\VoxGolem\config.toml`. Relative asset paths resolve beside that file.
+
+Configure only the capabilities you intend to use. Local model profiles also require external model/runtime files and a non-empty `SOUL.md` beside the config. Desktop speech uses an independently installed Neural service; Piper configurations require migration. Missing optional assets disable the affected capability.
 
 ### ChatGPT device-code sign-in
 
-On Linux/Windows desktop or Android, open **Settings → Model → Continue with ChatGPT**. Open the sign-in page and enter the displayed one-time code. Device-code login may need enabling in ChatGPT security settings or workspace permissions. Only authorize a code you started in VoxGolem. Closing Settings does not cancel a pending attempt; **Cancel** does. Attempts expire after at most 15 minutes. No local callback server or second login method is used.
+For Custom-provider access, use **Settings → Model → Continue with ChatGPT** on desktop or phone. Wear receives short-lived access through its paired phone. See the [sign-in and credential boundaries](docs/technical-guide.md#chatgpt-device-code-sign-in). OpenCode uses its own CLI login separately.
 
-Linux uses the `xdg-open` browser helper from `xdg-utils`. If browser launching is unavailable (for example, in a headless or WSL session), manually open the displayed device-code URL in an ordinary browser and enter the code there. Installing the helper does not establish that a browser opened, authentication succeeded, or a model request works; those require separate interactive acceptance.
+### Install and verify
 
-The native app owns token renewal and keeps credentials outside the WebView. Desktop stores `chatgpt/chatgpt-auth.json` under its configuration directory in a dedicated private subdirectory; Android uses its private, backup-excluded directory. This is the only credential source for Custom models: copied or imported credential files are not read. Signing out keeps an empty source-selection record. Older `custom_openai.auth_path` and `auth_source` settings are still accepted so existing configuration files load, but they are ignored. Do not put runtime keys in prompts, logs, examples or project artifacts.
-
-Wear has no sign-in screen. The Android phone shares short-lived access only with its verified native-paired, matching-package/signature watch through a separate transient credential channel, never conversation replication. Refresh and ID tokens stay on the phone. An offline watch can use already-shared access until it expires; renewal requires the phone. Sign-out clearing reaches the watch when it reconnects; it cannot instantly erase an offline watch's cached access. Conversation sharing remains independent of provider access.
-
-This uses the Codex-compatible device flow also implemented by OpenCode, labelled **legacy** in OpenCode and **beta** in Codex documentation. It uses ChatGPT plan allowance, not separate API credits, and does not bypass plan/model/workspace restrictions. Authentication success does not prove a model request will be admitted. No silent paid-API fallback is performed. See [Codex authentication](https://developers.openai.com/codex/auth) and [OpenCode provider accounts](https://opencode.ai/v2/docs/cli/providers).
-
-### Phone voice entries
-
-The phone launcher exposes **Vox Chat / Vox Ask / Vox Talk** with chat-bubble, microphone and conversation badges. There is no in-app home-screen pinning; earlier builds' pinned Ask shortcut is disabled on launch. Ask preserves the current conversation and existing draft, submits one authoritative finalized utterance once, optionally speaks the reply, then idles. Talk uses the same current-context pipeline and reopens recognition after the reply/playback completes. **Stop cancels without sending**; ordinary draft dictation still requires a separate Send. Fresh Ask/Talk launches request the mic without an extra caller-confirmation tap, subject to microphone permission and foreground/readiness/context checks. These exported entries can also be invoked by another app; incoming intent text is not a prompt. Missing provider/language support leaves typing available. Stable legacy command IDs remain compatibility interfaces, not the current new-chat workflow. See the [phone bridge guide](crates/assistant-plugin/README.md#new-voice-chat-shortcut-implemented-source).
-
-The phone plugin now enables shared speech-resource admission on load. This removes the previous source-wiring blocker, not the need for microphone permission, installed provider/language checks or physical acceptance. The separate watch-to-phone supplied-audio Assistant lane has production runtime constructors, but its provider/device gate remains default-false without physical calibration evidence; it is not advertised as an activated UI feature.
-
-Automated builds and checks establish software compatibility, not launcher, speech-provider or physical runtime acceptance. During a refactor, previously built or installed APKs are not evidence for the changing source. Deployment must verify the matching build, application ID, ABI, signing certificate and APK SHA-256, and preserve user data.
-
-## Voice notes: separate from Assistant
-
-On the phone, open **Voice notes**, enable watch dictation through visible permission setup, and select the destination with Android's folder picker. On the watch, use **Vox Note**, including as Samsung knock-knock's target. A deliberate launch starts one recording after setup; ordinary resume does not start another. Recording remains local when the phone is absent. Arm-down stopping needs calibration and worn-device verification; manual Stop remains available.
-
-Vox Note records on the Watch and attempts live phone transcription from supplied PCM (API33+); text previews return while recording, with saved-WAV replay as recovery after Stop. New Notes capture the shared installation speech language/fallback preference at Start; an Automatic language resolves to the Watch locale. With fallback disabled, admission requires the dedicated on-device route. With fallback allowed, an ordinary provider may use network processing; offline preference is not an offline guarantee. Legacy records without captured policy require dedicated on-device recognition. Supplied-input/segmented support and microphone-source isolation require actual provider acceptance, not API availability or a READY callback. No recognition model is bundled or downloaded. Recording readiness, transcription readiness, retained audio, archival and export are distinct statuses. Note capture never submits an Assistant prompt.
-
-Verified WAV copies go to `recordings/<capture-id>.wav` in the selected folder. The app creates `ai-inbox.org` if absent and prepends a final transcript as a `* TODO` with a capture-day, date-only `SCHEDULED` line, without a summary or property drawer. Only the matching `ai-inbox.org.txt` candidate may be normalized. Existing `inbox.org` files and old exports stay untouched; old-target pending journals require review. Corrections to an already exported transcript do not create another task. Ambiguous SAF writes retain recovery data rather than claiming success; permanent recordings are not automatically pruned.
-
-Shared records, SQLite and WAV code live in [capture-android](crates/capture-android/README.md); the [capture API guide](crates/capture-plugin/API.md) links canonical types, phone adapters and the frontend parser without duplicating schemas. Watch **SAVED**, phone archival and Org export are distinct acknowledgements.
-
-## Capabilities
-
-Each capability is optional and uses user-supplied local assets: local `llama.cpp`, the experimental Custom private Codex endpoint, OpenCode, wake-word/VAD/transcription, and local TTS. Eight Instant choices are **Local Fast**, **Local Quality**, **Custom Sol High**, **Custom Sol No Reasoning**, **Custom GPT-6 Luna No Reasoning**, **Custom GPT-5.6 Luna Low**, **OpenCode Sol High**, and **OpenCode Luna Low**. Both Custom Sol choices and Custom GPT-6 Luna No Reasoning use VoxGolem's direct Rust connection to the configured Custom endpoint; OpenCode choices use the separate OpenCode client. Four Deep/Review choices are **Custom Sol High**, **Custom Luna Low**, **OpenCode Sol High**, and **OpenCode Luna Low**.
-
-Deep and Review default to disabled. They are reasoning/review-only paths with no workspace or shell authority; OpenCode research is restricted to `websearch` and `webfetch`. Prefetch is disabled by default; enabling it can transmit predicted prompt text to the configured provider before submission.
-
-The stable Custom/OpenCode Sol aliases now request `gpt-6.1-sol`; alias mapping is not
-evidence that a live provider accepts that model. Chat remains on the requested backend,
-independent of local-first speech processing.
-
-### Web permission and response presentation
-
-One global Web permission defaults on and is persisted per installation through Settings.
-The selected answer model automatically chooses permitted tools; there are no manual
-search modes, prompt-keyword heuristics or routing model. Disabling Web keeps ordinary chat available, advertises
-no web tools and prevents native lookup/provider-fallback calls; it does not make remote
-chat or provider-controlled speech offline. Native lookup sends question-derived queries,
-focus text and URLs to Exa, with Parallel as the disclosed fallback. OpenCode research is
-delegated to its configured runtime, whose external provider identity may be unknown.
-External correlation is process-scoped rather than the canonical local conversation ID.
-
-Custom-provider desktop, Android and Wear adapters use one shared tool runtime with the
-user-selected answer model unchanged, with one bounded automatic tool path: at most eight
-searches, eight submitted URL reads, ten model rounds, 90 seconds of cumulative tool-operation
-time and 96 KiB of cumulative retained evidence per run. These are ceilings, not required work.
-There is no forced initial search or separate planner. Process-owned web sessions are borrowed per operation, not locked across
-model waits. A readable page observation is structural evidence only, not certification
-that an answer's facts or citations are correct. Native evidence instructions distinguish
-search excerpts, readable pages, failures and gaps. Local/Nano backends without tool support
-do not gain invented tools. Agy uses its own CLI capabilities; these native loop budgets
-are not claimed to govern that external runtime.
-
-One portable app-owned policy requests plain text and the shortest complete answer,
-without a duplicate lead summary. Tool calls, required structured stage JSON, refusals,
-literal code/symbols and essential sources retain their contracts. Existing conversation
-records and external `SOUL.md` content are not rewritten. Mobile speech consumes the
-answer-only projection, not the canonical source footer. Model compliance and physical
-speech behavior remain separate acceptance checks.
-
-## Supported Linux baseline
-
-The supported release baseline is Ubuntu 24.04 LTS on x86_64, including Ubuntu 24.04 under WSL2/WSLg. CI builds on that baseline; older Ubuntu releases and other distributions are not promised because native library compatibility is not verified. CUDA and its system libraries are intentionally external and are never bundled.
-
-## Windows target
-
-Windows 11 x64 uses a per-user NSIS installer under `%LOCALAPPDATA%\Programs\VoxGolem`. The installer is built on Ubuntu, creates a Start Menu shortcut, and packages only the application, DirectML, ONNX Runtime provider bridges, and required app-local Microsoft VC runtime DLLs. NVIDIA drivers, CUDA, cuDNN, TensorRT, models, `llama-server`, `SOUL.md`, configuration, credentials, and user data remain external. Windows artifacts are not Authenticode-signed and may trigger SmartScreen. Installation, single-instance behavior, configured NVIDIA and forced-CPU modes, audio, data preservation, uninstall/reinstall, and the previously shipped updater were validated on Windows 11 x64 NVIDIA hardware. The maintained-updater installer was also installed successfully over the existing application while preserving configuration; a signed in-app update through the new updater still requires human Windows acceptance. Non-NVIDIA Windows hardware remains unvalidated.
-
-Windows configuration defaults to `%APPDATA%\VoxGolem\config.toml`. Relative paths resolve beside that file, and missing assets disable only the affected optional capability.
-
-### Native Windows with WSL providers
-
-The native Windows app can use the default WSL distribution for OpenCode without adding OpenCode or WSL files to the installer. Install and log in to OpenCode inside that distribution first; the distribution must also provide `sh` and `setsid`, as Ubuntu does by default. The OpenCode provider starts one authenticated WSL server at app startup and keeps it warm until app exit. The Custom provider does not use WSL credentials; sign in to it with the in-app ChatGPT device-code flow.
-
-```toml
-[opencode]
-runtime = "wsl"
-```
-
-The default OpenCode location is `$HOME/.opencode/bin/opencode`, followed by WSL command lookup for the executable. On Windows, `wsl.exe` uses the default WSL distribution, and `$HOME` is that distribution's user home. An optional override must be an absolute Linux path. WSL selection is explicit per provider; omitted selectors retain native behavior. Missing WSL, a default distribution, or OpenCode disables only the OpenCode capability.
-
-## WSL2/WSLg setup
-
-Install Bun 1.3.9, Rust 1.95.0, Tauri CLI 2.11.1, and the Ubuntu WebKitGTK/GTK, audio, CMake, Ninja, and Clang/LLVM development packages. WSLg supplies the Linux GUI and microphone integration; verify those manually on your machine.
+From the repository root:
 
 ```bash
-sudo apt-get install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev libxdo-dev cmake ninja-build clang lld llvm pkg-config p7zip-full xdg-utils
-cargo install tauri-cli --version 2.11.1 --locked
+bun install --frozen-lockfile
+make test
+make app          # native Linux app
+make app-dev      # browser UI development with a simulated runtime
 ```
 
-This package recipe targets the supported Ubuntu 24.04 baseline. Release-tool tests (`scripts/test-release-tools.sh`, also run by `make test`) require the `7z` command supplied by `p7zip-full` there. Newer Ubuntu distributions may instead supply it through `7zip` (Ubuntu 26.04 uses `sudo apt-get install 7zip xdg-utils` for these two prerequisites); that package-name guidance does not expand the supported release baseline. Install the distribution package, including its codecs, rather than copying a standalone executable onto `PATH`.
+For mobile builds, use `make android-release` or `make wear-performance` after the documented toolchain setup. The phone release is unsigned without local signing configuration; Wear performance builds use a development signature. These commands do not install applications.
 
-Copy [`config.example.toml`](config.example.toml) to `${XDG_CONFIG_HOME:-$HOME/.config}/voxgolem/config.toml` (or set `VOXGOLEM_CONFIG_PATH`). When using Local Fast or Local Quality on any platform, also create a non-empty `SOUL.md` beside that config; copying the example is therefore a config-only setup step, and the required soul text must be supplied separately. Missing local assets or `SOUL.md` disable only the local response capability. XDG defaults are `~/.config/voxgolem`, `~/.local/share/voxgolem`, `~/.local/state/voxgolem`, and `~/.cache/voxgolem`. Relative paths resolve beside the config. Keep model files external; there is no model downloader.
-
-The separate desktop OpenCode provider still uses its existing CLI login/auth state. VoxGolem's ChatGPT device-code connection owns its own credentials and renewal for direct Custom requests; it does not change OpenCode's login. Custom endpoints are experimental, especially private endpoints; inspect the endpoint and auth configuration before use. Never put secrets in examples or source control.
-
-### Standalone local llama.cpp runtime
-
-Local chat and completion use an external `llama-server` bundle, not another application project. `scripts/build-local-llama.sh` builds pinned llama.cpp `b10054` (`ac2557cb24def295888ef47f1a35b401d978c510`) with CUDA and stages the executable, colocated libraries, licence and checksum manifest under `${XDG_DATA_HOME:-$HOME/.local/share}/voxgolem/runtimes/llama.cpp/b10054/`.
+## ✅ Testing
 
 ```bash
-LLAMA_SOURCE=/absolute/path/to/pinned/llama.cpp \
-CUDAToolkit_ROOT=/absolute/path/to/cuda \
-LLAMA_CUDA_ARCHITECTURES=86 \
-scripts/build-local-llama.sh
+make test                 # deterministic frontend and Rust checks
+make test-benchmark       # shared controller tests; no device access
+make test-app-benchmark   # offline desktop benchmark tooling tests
+make android-assistant-test
+make android-capture-test
+make wear-test
 ```
 
-The source must be clean and pinned; the script does not download source or models, install drivers, or overwrite an existing runtime. It requires Git, CMake, Ninja and patchelf; `PATCHELF` can select an explicit executable. Staged ELF library paths are normalized to exactly `$ORIGIN`, without build-cache or current-directory entries. Architecture 86 targets RTX 30-series GPUs; select the actual hardware architecture for another machine. `LLAMA_BUILD_JOBS`, `LLAMA_BUILD_DIR` and `LLAMA_RUNTIME_DIR` override bounded build concurrency and external output paths. Keep all runtime library files and symlinks together. Point both `[llama_cpp].server_path` and `[completion].server_path` at the staged `bin/llama-server`, and configure models separately. Existing `auto`, `cuda` and `cpu` inference policies remain unchanged.
+Mobile native checks need the [documented Tauri/Gradle bootstrap](crates/voice-android/README.md). The [benchmark guide](tools/benchmark/README.md) distinguishes offline tests, live provider work and target-runtime measurements.
 
-Run `python3 scripts/test_build_local_llama.py` for synthetic build-boundary, no-clobber publication and bundle-preservation checks; these do not compile CUDA or run models.
+Automated tests and builds cover software behavior and compatibility. Microphone, audible output, GPU, Windows runtime and physical phone/watch acceptance require matching target-runtime checks.
 
-## Commands
+## 📦 Releases / Artifacts
+
+[GitHub Releases](https://github.com/git-blame-dev/vox-golem/releases) hosts published downloads. Source can be ahead of the latest release.
+
+The desktop release workflow builds Linux ZIP/AppImage and Windows NSIS packages with updater signatures and checksums. Updater signatures are separate from Windows Authenticode signing; Windows packages may trigger SmartScreen. Models, system GPU libraries, credentials and user data stay external.
 
 ```bash
-make app          # run the native Linux app
-make test         # deterministic frontend and Rust checks
-make app-smoke    # bounded Linux startup-ready smoke check
-make dist         # build and stage native binary
-make update-bundle                    # build and verify an unsigned, generated-version AppImage
-make update-bundle-smoke              # run the built AppImage startup check
-make pc-dist      # cross-build and stage the lightweight Windows payload on Linux
-make pc-installer # build and verify the Windows NSIS installer on Linux
+make dist          # stage Linux files in dist/VoxGolem/
+make update-bundle # build a local AppImage; unsigned without signing configuration
+make pc-installer  # cross-build the Windows NSIS installer on Linux
 ```
 
-`make app-smoke` proves only that the zero-asset Tauri shell reaches its startup marker (shell setup); it does not prove providers, models, voice, completion, or TTS, which require their own runtime checks.
+See the [updater guide](docs/technical-guide.md#signed-application-updates) for signing, idle installation and failure behavior.
 
-### Search and model benchmarks
+## ⚠️ Limitations
 
-```bash
-make test-search-bench # deterministic WebService components and parked legacy diagnostics; no live calls
-cargo run --locked -p vox-golem --example search_bench -- --mode live
-cargo run --locked -p vox-golem --example search_bench -- --mode live --with-llm --model luna-none --repetitions 3
-```
+- This is not an entirely offline system: Custom/OpenCode backends and web tools use configured services. Wear Data Layer can route through Google servers.
+- On-device mobile recognition depends on installed language/provider support. Allowing fallback can permit network speech processing.
+- Desktop history does not synchronize with phone/Wear. Credentials use a separate channel from conversation replication.
+- Local voice/model capabilities require external assets. Neural speech latency depends on the configured service and model.
+- Saved wake clips and voice-note recordings are local user data with separate storage policies; diagnostic retention does not prune recordings.
+- Build success and earlier demos do not establish current physical-device, Windows, acoustic or production-performance acceptance.
 
-Live mode without `--with-llm` exercises explicit anonymous WebService Search components and session prewarm only, not automatic model tool selection. Explicit model coverage uses the same managed sign-in credential as desktop; it never starts sign-in or imports another account's credentials. Select `luna-none` or `sol-high`. One repetition is the default, with one to three repetitions supported: six arithmetic/coding/lookup/page-read/mixed/history prompts per repetition, at most 18 logical requests, using the same bounded automatic tool loop with Web permission and a 600-second matrix request budget. A logical request can contain multiple model rounds and search/page-read calls and consumes the selected provider's allowance.
+## 🧯 Troubleshooting
 
-Requested coverage that fails or is skipped produces a nonzero exit instead of an all-green report. First-visible-text timing excludes whitespace; an unobserved callback has no invented time. Partial evidence and fallback remain explicit. These are native backend callback/completion measurements, not painted pixels, audible output, semantic/citation-quality validation, or physical Android/Wear/Windows acceptance. Synthetic fixture latency is not live search or model latency.
-
-The deterministic suite exercises decoding, fallback, empty-page gaps, page metadata and
-prewarm-deadline behavior through synthetic WebService operations. Its frozen 132-case
-normalizer/classifier diagnostic is explicitly parked research, not production routing
-or semantic-quality acceptance. Anonymous live rows exercise explicit Search components,
-not the model-led application entry. Read counters count submitted URLs, not fetch operations.
-These are source CLI benchmark components, not phone delivery or runtime acceptance.
-
-### Parked local embedding-router benchmark
-
-The same example has an isolated encoder-only mode. It starts one owned CPU `llama-server` on an ephemeral IPv4 loopback port, retains the model/runtime across the suite, and sends embeddings directly to the existing BGE classifier head. It does not run MCP search, load Custom-provider configuration or credentials, contact an answer model, download artifacts, or fall back to lexical classification.
-
-```sh
-make encoder-bench ENCODER_SERVER=/absolute/path/to/llama-server ENCODER_MODEL=/absolute/path/to/bge-small-en-v1.5-q8_0.gguf
-make encoder-bench ENCODER_SERVER=/absolute/path/to/llama-server ENCODER_MODEL=/absolute/path/to/bge-small-en-v1.5-q8_0.gguf ENCODER_BENCH_FLAGS="--encoder-input literal --cases crates/core/tests/fixtures/router_cases_development_v2.json --repetitions 3"
-```
-
-Default `--encoder-input legacy` applies the parked legacy normalizer to the frozen 132-case fixture. `literal` preserves the current question verbatim and, when present, adds explicitly labelled prior user context. These are separately reported research input versions, not production paths or equivalently validated pipelines. Use the compatible BGE-small model/tokenizer/native pooling and existing 384-dimensional head; a different encoder or input representation needs its own compatibility and quality evaluation. This command does not provision a mobile encoder. The optional early-lookup experiment is parked after failed qualification (88.33% / 89.17%); those fixture results establish neither population quality nor application runtime benefit.
-
-`router_cases_development_v2.json` adds 32 synthetic development cases covering weather, economic evidence, rules, comparisons, mixed requests, supplied text, conversation and verification. It is not an untouched holdout, a training set, or proof that an answer model supports the expected claims. The original 132 cases remain unchanged. Record the source revision, server/model hashes and input version alongside measured reports; successful inference alone does not validate the full tokenizer/pooling/head compatibility unit.
-
-Coverage and quality are separate: unavailable artifacts or failed inference produce incomplete coverage and a nonzero exit; completing every inference does not certify quality. The report includes exact labels, top-two coverage (not "safe routing"), retrieval-axis accuracy and a confusion matrix. No new acceptance threshold is implied. Startup timing observes server health readiness, including the existing readiness-poll interval; first-inference and subsequent warm timings include local HTTP, encoder and head work. These are host/runtime measurements, not Android/Wear app latency, total resident memory, supported-answer quality or painted pixels. Existing finite server/startup timeouts are not production routing cancellation guarantees.
-
-Run `make test-search-bench` for network-free benchmark regressions and the existing deterministic search suite. Its normalizer parity row is not real encoder inference; missing encoder assets must not be counted as a passed encoder benchmark.
-
-For the narrower early-retrieval opportunity task, use the independently annotated 60-case development fixture:
-
-```sh
-make encoder-bench ENCODER_SERVER=/absolute/path/to/llama-server ENCODER_MODEL=/absolute/path/to/bge-small-en-v1.5-q8_0.gguf ENCODER_BENCH_FLAGS="--encoder-task early-lookup --encoder-input literal --cases crates/core/tests/fixtures/retrieval_opportunities_v1.json --repetitions 3"
-```
-
-Its [annotation rubric](crates/core/tests/fixtures/retrieval_opportunities_v1.md) distinguishes a useful bounded `early_lookup` opportunity from normal `model_led` execution. Model-led does not deny web access. This fixture uses `expected` decisions rather than historical F/S/C/R gold labels; selecting the wrong task fails validation. The unchanged head is scored under both predeclared diagnostic projections: S-only and S-or-R. The report separates true/missed/unnecessary lookups, precision, recall and coverage; neither policy is automatically selected or trained from the results. Completing inference is not a quality gate or evidence that either policy reduces final-answer latency.
-
-Opportunity timing includes text formatting from the supplied prompt/context, local HTTP, encoder and head. It excludes fixture parsing, canonical-history projection, queue/IPC and startup. Correct-within-250-ms counts retain all requested attempts in their denominator, but remain host-component diagnostics—not phone routing acceptance. Observed p50/p95/max describe completed samples only; failures/skips remain explicit. No source-level command handling, model switching or application routing is changed by this benchmark.
-
-For an explicitly authorized frozen-encoder head experiment, `--encoder-features /absolute/external/features.json` exports embeddings and labels from synthetic opportunity fixtures without reporting prediction metrics. It requires literal input, the early-lookup task, one repetition, valid case IDs/families and a new destination outside the source repository. Vectors are sensitive derived data even without prompt text: use synthetic fixtures only, keep the export outside Git, and do not publish it. Unix exports are mode 0600. No download or fitting happens implicitly.
-
-The [NumPy-only head experiment tool](tools/router-head/README.md) fits exactly three fixed ridge candidates on training data, selects on disjoint calibration data, and evaluates a frozen artifact through a separate command. Held-out data must not select parameters or be read by the fitting command. `make test-router-head` runs its synthetic unit tests using an existing NumPy installation; it does not install packages or start model training on project data. Learned head files remain experimental artifacts, not production routing updates or proof of end-to-end speedup.
-
-For repeatable synthetic wake-word accuracy checks, run `make wakeword-bench WAKE_WORD_MODEL=/path/to/hey_livekit.onnx`. The [benchmark guide](tools/wakeword-bench/README.md) describes corpus generation, calibration/holdout evaluation, artifact verification, and the limits of artificial speech tests.
-
-When the microphone is active, VoxGolem saves up to 0.8 seconds of pre-trigger wake audio for each new detection as a local PCM16 WAV; older 0.5-, 0.55-, 0.7-, 0.75-, 1.5- and three-second clips remain playable. This tight window can truncate a slowly spoken wake phrase, so review recordings before using them for training. Clips are grouped by the detecting model filename and a local content-derived revision ID. The revision ID distinguishes replaced model bytes with the same filename; it is not a cryptographic checksum and may change with Rust toolchain versions. In Settings → Wake clips, you can pause saving, choose an absolute local save directory, browse clips in pages, play them, label them true/false wakes, or delete them. Clips start unreviewed: the detector's model name is a prediction, not proof of what was said. The default folder is `wake-clips` beside your local VoxGolem configuration (`%APPDATA%\VoxGolem\wake-clips` on Windows); the selected directory is stored locally in `wake-clips.json`. No storage quota or automatic deletion is applied. Save failures appear as a notice without stopping the microphone. Recordings, models, and runtime settings are local user data and stay out of Git.
-
-After a wake, `initial_silence_timeout_ms` allows 2,500 ms by default for the first VAD-detected speech. If none arrives, VoxGolem returns to wake-word waiting without transcribing or playing the processing cue. Once VAD detects speech, `silence_timeout_ms` ends the utterance after 750 ms by default without another speech detection. Both values are configurable in `config.toml`; VAD detects speech activity, not speaker identity, so confirm the timing with your microphone and speaker setup.
-
-The staged native binary is `dist/VoxGolem/vox-golem`. Windows cross-builds require cargo-xwin 0.23.0, LLVM/Clang 19 or newer, NSIS, cabextract, and 7-Zip. They do not require a Windows runner.
-
-CI runs `make test` plus separate Ubuntu 24.04 Linux and Windows artifact jobs on pull requests and non-main branches. Main pushes use the self-contained release workflow instead of rebuilding those unsigned CI packages: tests run first, then the pinned Tauri action builds Linux and Windows sequentially before the draft is validated and published. Keeping validation and release workflows separate avoids a privileged cross-workflow handoff while preventing duplicate main package builds. The Linux job retains the small AppDir post-processing step needed to include GStreamer appsink and build-produced ONNX provider libraries without recompiling the executable; the Linux ZIP reuses that same executable. The Windows bundle uses Tauri's native resource mapping and pre-bundle staging. Exact package allowlists reject system NVIDIA runtimes, models, and user data. CI cannot prove microphone, WebView/WSLg, GPU, model, TTS, speaker, real Windows behavior, or a signed in-app update; perform those runtime checks manually. Inference policy `auto` prefers CUDA when usable and otherwise falls back to CPU; `cuda` requires CUDA and `cpu` forces CPU.
-
-## Signed application updates
-
-Pushes to protected `main` publish one complete GitHub release containing the Linux ZIP, signed x86_64 AppImage, signed Windows 11 x64 NSIS installer, both detached updater signatures, a two-platform `latest.json`, and `SHA256SUMS`. Publication fails if either platform artifact is missing; once a draft exists, a failed run leaves it available for a rerun to replace and complete, while an already-published release is verified and left unchanged. Packaged AppImage and NSIS builds check and download in the background by default. Verified downloads also install automatically by default, but only while VoxGolem is fully idle; installation never interrupts recording, prompts, responses, TTS, model work, startup, or application shutdown. A busy app retains the verified download and offers **Restart and update** and **Later**. Later frees the in-memory download and defers background updates for the current session. Automatic download and automatic installation are independent persisted settings. Manual **Check** reports availability and leaves downloading to **Download**. **Retry** repeats the failed check, download, or installation while preserving any retained update.
-
-The maintained Tauri updater verifies every downloaded AppImage or NSIS installer with the public key embedded in `tauri.conf.json`; signature verification cannot be disabled. Verified downloads remain only in memory until installation or **Later** discards them. On Linux, installation replaces the AppImage and relaunches automatically. On Windows, VoxGolem first excludes normal activity and shuts down model, audio, completion, and OpenCode services before launching NSIS. If the installer cannot be launched, the app honestly requires a restart and keeps normal runtime operations blocked rather than reconstructing services. Upstream installation errors do not imply an atomic rollback; use the surfaced error and reinstall the signed package manually if necessary. Updates cover only application package files, never user models, configuration, credentials, or system GPU libraries.
-
-Release versions use `YYYY.M.D-N`, where `N` advances beyond the highest canonical draft or published release ordinal reserved for that UTC date. A rerun reuses the sole canonical release already targeting the same source commit, including after the date changes. Linux and Windows artifacts and the release tag use the same version and source SHA.
-
-Maintainers must store the matching private key outside the repository and configure it as the GitHub Actions secret `TAURI_SIGNING_PRIVATE_KEY`. If the key is password-protected, also configure `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. For example, an authorized maintainer can provision the key without printing it:
-
-```bash
-gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/vox-golem-updater.key
-```
-
-Back up the private key securely. Losing it prevents installed copies from accepting future updates. Do not rotate the embedded public key without a staged migration signed by the old key, and never commit or log the private key.
-
-Telemetry is enabled by default, configurable off, local, rotating, and metadata-only; it excludes prompt/audio contents, predictions, answers, URLs, credentials, and raw errors. Voice input and provider traffic remain user data; review the provider and prefetch settings before enabling transmission.
+- **Missing capability:** check the configuration and external assets for that platform; start with the [setup guide](docs/technical-guide.md#wsl2wslg-setup).
+- **Provider unavailable:** check sign-in and the selected backend. Authentication success does not guarantee model access.
+- **Desktop speech unavailable:** check the [Neural service configuration](docs/technical-guide.md#desktop-speech) and installed voices.
+- **Android native check fails before tests:** complete the [phone scaffold/build bootstrap](crates/voice-android/README.md).
+- **Need detailed operational behavior:** use the [technical guide](docs/technical-guide.md), [phone guide](apps/android-tauri/README.md) and [Wear guide](apps/wear/README.md).
